@@ -1,0 +1,4 @@
+name = "grok-provider"
+version = "0.1.0"
+entry = "grok_provider:register"
+description = "xAI Grok via its OpenAI-compatible endpoint (https://api.x.ai/v1)"

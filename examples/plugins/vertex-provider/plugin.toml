@@ -1,0 +1,4 @@
+name = "vertex-provider"
+version = "0.1.0"
+entry = "vertex_provider:register"
+description = "Google Vertex AI (Gemini) native streamGenerateContent dialect, stdlib only"

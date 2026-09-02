@@ -1,0 +1,6 @@
+name = "credential-guard"
+version = "0.1.0"
+entry = "credential_guard:register"
+description = "Stdlib-only credential storage and leak prevention: never in a prompt, never in a log"
+requires = ["picoagent>=0.1"]
+skills = ["skills"]

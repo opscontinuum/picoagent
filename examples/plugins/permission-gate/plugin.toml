@@ -1,0 +1,6 @@
+name = "permission-gate"
+version = "0.1.0"
+entry = "permission_gate:register"
+description = "Ask before destructive shell commands; deny writes to protected paths; /yolo toggle"
+requires = ["picoagent>=0.1"]
+skills = ["skills"]

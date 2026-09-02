@@ -1,0 +1,4 @@
+name = "compaction"
+version = "0.1.0"
+entry = "compaction:register"
+description = "Summarise older conversation when context grows; /compact command; overflow recovery"

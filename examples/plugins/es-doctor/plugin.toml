@@ -1,0 +1,6 @@
+name = "es-doctor"
+version = "0.1.0"
+entry = "es_doctor:register"
+description = "Elasticsearch diagnostics: cluster health, log digging, Beats/Elastic Agent metrics, and log<->metric<->APM correlation"
+requires = ["picoagent>=0.1"]
+skills = ["skills"]
