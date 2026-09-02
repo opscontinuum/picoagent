@@ -36,7 +36,8 @@ DEFAULTS: dict[str, Any] = {
     # both are read-only conventions, so nothing else has to change.
     "context_files": ["AGENTS.md", ".picoagent/AGENTS.md"],
     "skill_dirs": ["skills", ".picoagent/skills", ".agents/skills"],
-    "plugins": {"enabled": []},
+    "plugins": {"enabled": []},   # also: [plugins].rewrite maps a url prefix to a mirror
+    "upgrade": {"check_on_startup": False, "app_repo": ""},
     "frontend": "plain",
 }
 

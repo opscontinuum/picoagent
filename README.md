@@ -89,6 +89,57 @@ when you run `/model list`). Point `base_url` at a local or on-prem endpoint and
 to anything else. `plugin add` runs `git clone`/`git fetch` against whatever git host you name,
 which can be an internal server.
 
+## Keeping plugins up to date
+
+```bash
+picoagent upgrade check     # what is behind, changing nothing
+picoagent upgrade           # fast-forward every outdated plugin
+picoagent upgrade <name>    # just one
+```
+
+Everything goes through `git` itself - `ls-remote`, `fetch`, `merge --ff-only` - never a
+host's API, so it works the same against GitHub, GitLab, Gitea, Bitbucket Server, a bare SSH
+remote, or a `file://` path on a shared mount. No tokens, no host-specific code.
+
+An upgrade **never approves itself**. Fast-forwarding a plugin changes its trust fingerprint,
+so the next run reports it as `CHANGED` and shows you the incoming commits before you accept.
+Upgrading and trusting are separate acts on purpose.
+
+It also refuses rather than resolving: a checkout with uncommitted changes, or one that has
+diverged from its remote, is left alone and reported. Losing an edit someone was mid-way
+through, to apply an upgrade they hadn't asked for yet, is the worse outcome.
+
+**picoagent itself is only reported on, never modified.** A git checkout, a pip install and a
+distro package upgrade differently, and guessing wrong breaks the install - so it tells you how
+far behind you are and prints the command for how you actually installed it.
+
+```toml
+[upgrade]
+check_on_startup = false                          # opt-in; costs a round trip per plugin
+app_repo = "git:git.internal.corp/mirrors/picoagent@main"   # enables the app check
+```
+
+### Internal git servers
+
+Specs take any URL form, including SSH, which is the usual shape for an internal server:
+
+```toml
+[plugins]
+enabled = [
+  "git:git.internal.corp/team/permission-gate@v0.1.0",
+  "git@git.internal.corp:team/some-plugin.git@main",
+  "file:///srv/mirrors/picoagent-tools@main",
+]
+```
+
+To retarget upstream specs at a mirror without editing each one - which is what an air-gapped
+site actually needs - map a url prefix:
+
+```toml
+[plugins.rewrite]
+"github.com/opscontinuum" = "git.internal.corp/mirrors/opscontinuum"
+```
+
 ## Plugin trust (and what happens when a plugin changes)
 
 Plugin code runs with your full privileges, so nothing loads until you've approved it. The

@@ -36,7 +36,9 @@ from .api import PluginAPI
 from .manifest import Manifest
 
 log = logging.getLogger("picoagent.plugins")
-_GIT_SPEC = re.compile(r"^(?:git:|https?://|git@)")
+# file:// counts: an air-gapped site may mirror plugins onto a shared mount rather than
+# run a git server, and git treats such a path as a remote like any other.
+_GIT_SPEC = re.compile(r"^(?:git:|https?://|git@|ssh://|file://)")
 
 
 # ------------------------------------------------------------------------ locations
@@ -50,27 +52,81 @@ def plugins_dir(cfg: dict, project: bool = False) -> Path:
 def resolve_source(spec: str, cfg: dict, project: bool = False) -> Path:
     """Turn a plugin spec into a local directory, cloning git sources on first use."""
     if _GIT_SPEC.match(spec):
-        return _clone_or_update(spec, plugins_dir(cfg, project))
+        rewrites = cfg.get("plugins", {}).get("rewrite") or {}
+        return _clone_or_update(spec, plugins_dir(cfg, project), rewrites)
     path = Path(spec).expanduser()
     return path if path.is_absolute() else Path(cfg["_cwd"]) / path
 
 
-def _clone_or_update(spec: str, dest_root: Path) -> Path:
-    """Clone ``spec`` (``git:host/user/repo@ref``) under ``dest_root`` and check out ``ref``."""
-    url, _, ref = spec.partition("@")
+def parse_spec(spec: str, rewrites: dict[str, str] | None = None) -> tuple[str, str]:
+    """Split a git spec into ``(url, ref)``. ``ref`` is ``""`` when none was given.
+
+    Splitting on the *last* ``@`` rather than the first, because SSH remotes contain one:
+    ``git@host:team/repo.git@main`` has two, and taking the first produced the url ``git``
+    and a ref of everything else - so SSH specs, the usual form for an internal server,
+    could never work. A trailing segment containing ``/`` or ``:`` is part of the address
+    rather than a ref, which is what distinguishes ``git@host:team/repo.git`` (no ref) from
+    ``git@host:team/repo.git@v1`` (ref ``v1``).
+
+    ``rewrites`` maps a url prefix to a replacement, so a site can point every spec at an
+    internal mirror without editing each one.
+    """
+    url, separator, ref = spec.rpartition("@")
+    if not separator or "/" in ref or ":" in ref:
+        url, ref = spec, ""
     url = url.removeprefix("git:")
-    if not url.startswith(("http", "git@")):
+    for prefix, replacement in (rewrites or {}).items():
+        if url.startswith(prefix):
+            url = replacement + url[len(prefix):]
+            break
+    if not url.startswith(("http://", "https://", "git@", "ssh://", "file://", "/")):
         url = "https://" + url
-    name = url.rstrip("/").split("/")[-1].removesuffix(".git")
-    dest = dest_root / name
+    return url, ref
+
+
+def checkout_name(url: str) -> str:
+    """Directory name for a cloned plugin: the repository name, however the url spells it."""
+    return url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git")
+
+
+def _clone_or_update(spec: str, dest_root: Path, rewrites: dict[str, str] | None = None) -> Path:
+    """Clone ``spec`` under ``dest_root`` and move it to ``ref``.
+
+    Fast-forwards rather than only checking out. ``git checkout <branch>`` on a branch that
+    already exists locally does nothing with what ``fetch`` just retrieved, so a plugin
+    tracking a branch stayed frozen at the commit it was first cloned at - there was no
+    upgrade path at all. Merging with ``--ff-only`` moves it, and refuses rather than
+    inventing a merge commit if the checkout has diverged.
+    """
+    url, ref = parse_spec(spec, rewrites)
+    dest = dest_root / checkout_name(url)
     dest_root.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        subprocess.run(["git", "-C", str(dest), "fetch", "--tags", "-q"], check=False)
-    else:
+    if not dest.exists():
         subprocess.run(["git", "clone", "-q", url, str(dest)], check=True)
+    else:
+        subprocess.run(["git", "-C", str(dest), "fetch", "--tags", "-q"], check=False)
     if ref:
         subprocess.run(["git", "-C", str(dest), "checkout", "-q", ref], check=True)
+    fast_forward(dest)
     return dest
+
+
+def fast_forward(root: Path) -> None:
+    """Move a checkout to whatever its upstream now points at, when that is safe.
+
+    Only when the branch has an upstream, the tree is clean, and the move is a fast-forward.
+    Anything else is left alone: a plugin the user has edited, or a branch that has diverged,
+    is not something to silently rewrite during a routine load.
+    """
+    if subprocess.run(["git", "-C", str(root), "status", "--porcelain"],
+                      capture_output=True, text=True).stdout.strip():
+        return
+    upstream = subprocess.run(["git", "-C", str(root), "rev-parse", "--abbrev-ref", "@{u}"],
+                              capture_output=True, text=True)
+    if upstream.returncode != 0:
+        return                       # detached HEAD or a tag: nothing to follow
+    subprocess.run(["git", "-C", str(root), "merge", "--ff-only", "-q", upstream.stdout.strip()],
+                   check=False)
 
 
 def install_deps(manifest: Manifest) -> None:
