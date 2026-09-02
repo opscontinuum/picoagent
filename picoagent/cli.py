@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,7 @@ from .core.tools import BUILTIN_TOOLS
 from .frontends.plain import PlainFrontend
 from .frontends.print import PrintFrontend
 from .plugins import loader
+from .plugins import upgrade as upgrade_mod
 
 
 # ---------------------------------------------------------------------------- wiring
@@ -133,6 +135,7 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
     rt.frontend = PrintFrontend(json_mode=args.json) if headless else PlainFrontend()
     report = loader.load_all(rt, extra_paths=args.extension, allow_untrusted=args.dangerously_trust_all)
     _report_skipped(report)
+    report_available_upgrades(rt)
     return rt
 
 
@@ -173,13 +176,86 @@ async def run_agent(args: argparse.Namespace) -> int:
     return 0
 
 
+def upgrade_command(args: argparse.Namespace) -> int:
+    """``picoagent upgrade [check|<name>|--all]``.
+
+    Plugins are updated; picoagent itself is only reported on, because a git checkout and a
+    pip install upgrade differently and guessing wrong breaks the install.
+    """
+    cfg = load_config(Path(args.cwd or ".").resolve())
+    statuses = upgrade_mod.check_plugins(cfg)
+
+    app = upgrade_mod.check_app(cfg)
+    if app:
+        print(app.describe())
+        if app.outdated:
+            print(f"  to upgrade picoagent yourself: {upgrade_mod.app_upgrade_hint(app)}")
+    elif not cfg.get("upgrade", {}).get("app_repo"):
+        print("picoagent: not checked (set [upgrade].app_repo in config.toml to enable)")
+
+    if not statuses:
+        print("no git-sourced plugins configured")
+        return 0
+    for status in statuses:
+        print(status.describe())
+
+    if args.ucmd == "check":
+        return 0
+
+    targets = [s for s in statuses if s.outdated and (args.ucmd in (None, "all") or s.name == args.ucmd)]
+    if args.ucmd and args.ucmd not in (None, "all") and not any(s.name == args.ucmd for s in statuses):
+        print(f"no configured plugin named {args.ucmd!r}")
+        return 1
+    if not targets:
+        print("nothing to upgrade")
+        return 0
+
+    print()
+    failed = False
+    for status in targets:
+        changed, message = upgrade_mod.upgrade(status)
+        print(("upgraded " if changed else "skipped  ") + message)
+        failed |= not changed
+    return 1 if failed else 0
+
+
+def report_available_upgrades(rt: Runtime) -> None:
+    """Opt-in startup notice. Off unless ``[upgrade].check_on_startup`` is true.
+
+    Off by default because it costs a network round trip per configured plugin at launch, and
+    an air-gapped install should not reach for a remote it was never going to use. Failures
+    are reported as unreachable rather than raised: an upgrade check must never stop a session
+    from starting.
+    """
+    if not rt.cfg.get("upgrade", {}).get("check_on_startup"):
+        return
+    outdated = [s for s in upgrade_mod.check_plugins(rt.cfg) if s.outdated]
+    app = upgrade_mod.check_app(rt.cfg)
+    if app and app.outdated:
+        outdated.append(app)
+    for status in outdated:
+        sys.stderr.write(f"picoagent: {status.describe()}\n")
+    if outdated:
+        sys.stderr.write("picoagent: run `picoagent upgrade` to update plugins.\n")
+
+
 def plugin_command(args: argparse.Namespace) -> int:
     """``picoagent plugin add|trust|list``."""
     cfg = load_config(Path(".").resolve())
     trust = loader.TrustStore(Path(cfg["_user_dir"]))
     if args.pcmd == "add":
-        root = loader.resolve_source(args.spec, cfg, project=args.project)
-        manifest = loader.Manifest.load(root)
+        try:
+            root = loader.resolve_source(args.spec, cfg, project=args.project)
+        except subprocess.CalledProcessError:
+            print(f"could not fetch {args.spec} (unreachable, or the ref does not exist)")
+            return 1
+        try:
+            manifest = loader.Manifest.load(root)
+        except (FileNotFoundError, KeyError) as exc:
+            # A repository that isn't a plugin is a normal mistake, not a crash. Say which
+            # file is missing and where it was looked for.
+            print(f"{root} is not a plugin: {exc}")
+            return 1
         loader.install_deps(manifest)
         print(f"installed {manifest.name} {manifest.version} -> {root}\n")
         # Same consent path as `plugin trust`: `add` on an already-installed plugin is an
@@ -188,8 +264,12 @@ def plugin_command(args: argparse.Namespace) -> int:
         config_file = (Path(".picoagent") if args.project else Path(cfg["_user_dir"])) / "config.toml"
         print(f'\nEnable it by adding to {config_file}:\n[plugins]\nenabled = ["{args.spec}"]')
     elif args.pcmd == "trust":
-        return trust_command(loader.Manifest.load(Path(args.spec).expanduser().resolve()), trust,
-                             assume_yes=args.yes)
+        try:
+            manifest = loader.Manifest.load(Path(args.spec).expanduser().resolve())
+        except (FileNotFoundError, KeyError) as exc:
+            print(f"not a plugin directory: {exc}")
+            return 1
+        return trust_command(manifest, trust, assume_yes=args.yes)
     elif args.pcmd == "list":
         for directory in (loader.plugins_dir(cfg), loader.plugins_dir(cfg, project=True)):
             for path in sorted(directory.iterdir()) if directory.is_dir() else []:
@@ -257,6 +337,9 @@ def build_parser() -> argparse.ArgumentParser:
     plugin.add_argument("pcmd", choices=["add", "trust", "list"])
     plugin.add_argument("spec", nargs="?", help="git:host/user/repo@ref or a local path")
     plugin.add_argument("--project", action="store_true", help="install under the project instead of the user dir")
+    upgrade_p = sub.add_parser("upgrade", help="check for and apply plugin updates")
+    upgrade_p.add_argument("ucmd", nargs="?",
+                           help="'check' to only report, a plugin name, or omit for all")
     plugin.add_argument("-y", "--yes", action="store_true",
                         help="skip the trust confirmation prompt (scripting; you are accepting the code unseen)")
     return ap
@@ -267,4 +350,6 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(name)s: %(message)s")
     if args.cmd == "plugin":
         sys.exit(plugin_command(args))
+    if args.cmd == "upgrade":
+        sys.exit(upgrade_command(args))
     sys.exit(asyncio.run(run_agent(args)))
