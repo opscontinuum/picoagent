@@ -167,3 +167,41 @@ class TruncateAndRegistryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfinementTests(unittest.TestCase):
+    """`confine_to_project` is off by default because a coding agent legitimately edits
+    sibling repos and files outside its start directory. On, it refuses them."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "inside.txt").write_text("in\n")
+        self.outside = Path(tempfile.mkdtemp()) / "outside.txt"
+        self.outside.write_text("out\n")
+
+    def test_absolute_outside_path_is_allowed_by_default(self):
+        r = run(ReadTool().execute({"path": str(self.outside)}, tool_ctx(self.tmp)))
+        self.assertFalse(r.is_error, r.content)
+
+    def test_confinement_refuses_an_outside_absolute_path(self):
+        r = run(ReadTool().execute({"path": str(self.outside)},
+                                   tool_ctx(self.tmp, confine_to_project=True)))
+        self.assertTrue(r.is_error)
+        self.assertIn("outside the project", r.content)
+
+    def test_confinement_refuses_dot_dot_traversal(self):
+        r = run(ReadTool().execute({"path": "../escape.txt"},
+                                   tool_ctx(self.tmp, confine_to_project=True)))
+        self.assertTrue(r.is_error)
+        self.assertIn("outside the project", r.content)
+
+    def test_confinement_still_allows_paths_inside(self):
+        r = run(ReadTool().execute({"path": "inside.txt"},
+                                   tool_ctx(self.tmp, confine_to_project=True)))
+        self.assertFalse(r.is_error, r.content)
+
+    def test_write_is_refused_as_a_result_not_an_exception(self):
+        r = run(WriteTool().execute({"path": str(self.outside), "content": "x"},
+                                    tool_ctx(self.tmp, confine_to_project=True)))
+        self.assertTrue(r.is_error)
+        self.assertEqual(self.outside.read_text(), "out\n", "the file must not have been written")

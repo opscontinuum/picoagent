@@ -25,6 +25,9 @@ Configuration (``[plugins.es-doctor]`` or env vars)::
     url = "https://es.example.com:9200"     # ELASTICSEARCH_URL
     api_key = "base64=="                      # ELASTICSEARCH_API_KEY  (sent as `Authorization: ApiKey`)
     username = "elastic"; password = "..."    # or basic auth
+    ca_cert = "/etc/pki/es-ca.pem"            # trust this CA (a self-signed cluster's
+                                              # secure answer; prefer over verify_tls=false)
+    verify_tls = true                         # false disables cert AND hostname checks
     allow_destructive = false
     logs_index = "logs-*,filebeat-*"          # override the default patterns if your naming differs
     metrics_index = "metrics-*,metricbeat-*"
@@ -34,6 +37,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import os
 import re
@@ -47,6 +51,8 @@ from typing import Any
 
 from picoagent.core.tools import truncate
 from picoagent.core.types import ToolResult
+
+log = logging.getLogger("es_doctor")
 
 # ------------------------------------------------------------------ Elastic knowledge
 # Beats and Elastic Agent write ECS documents into these data streams. Keeping the names in
@@ -90,11 +96,25 @@ es_correlate (errors vs cpu/memory/latency, same window, same host/service) -> r
 class ESClient:
     """Minimal REST client. Raises ``ESError`` with the server's message on non-2xx."""
 
-    def __init__(self, url: str, api_key: str = "", username: str = "", password: str = "", verify_tls: bool = True):
+    def __init__(self, url: str, api_key: str = "", username: str = "", password: str = "",
+                 verify_tls: bool = True, ca_cert: str = ""):
+        """``ca_cert`` is the secure answer to a self-signed cluster: trust that CA rather than
+        nobody. ``verify_tls=False`` remains as a last resort, but it disables certificate *and*
+        hostname checking, which makes the connection interceptable by anything on the path -
+        so it is the wrong tool for the common case it tends to get used for.
+        """
         self.url = url.rstrip("/")
         self._auth = (f"ApiKey {api_key}" if api_key
                       else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode() if username else "")
-        self._ctx = None if verify_tls else ssl._create_unverified_context()
+        if ca_cert:
+            self._ctx = ssl.create_default_context(cafile=ca_cert)
+        elif verify_tls:
+            self._ctx = None                       # urllib's default: verified
+        else:
+            log.warning("es-doctor: TLS verification is OFF for %s. Anything on the network path "
+                        "can read and alter this traffic, including credentials. Prefer ca_cert.",
+                        self.url)
+            self._ctx = ssl._create_unverified_context()
 
     def request(self, method: str, path: str, body: dict | None = None) -> Any:
         req = urllib.request.Request(self.url + (path if path.startswith("/") else "/" + path), method=method,
@@ -489,7 +509,8 @@ def register(api):
     es = ESClient(url=cfg.get("url") or os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200"),
                   api_key=cfg.get("api_key") or os.environ.get("ELASTICSEARCH_API_KEY", ""),
                   username=cfg.get("username", ""), password=cfg.get("password", ""),
-                  verify_tls=cfg.get("verify_tls", True))
+                  verify_tls=cfg.get("verify_tls", True),
+                  ca_cert=cfg.get("ca_cert", ""))
     settings = Settings(logs_index=cfg.get("logs_index", DEFAULT_LOGS_INDEX), metrics_index=cfg.get("metrics_index", DEFAULT_METRICS_INDEX),
                         traces_index=cfg.get("traces_index", DEFAULT_TRACES_INDEX), allow_destructive=bool(cfg.get("allow_destructive", False)))
 

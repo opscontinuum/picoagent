@@ -34,6 +34,9 @@ DEFAULTS: dict[str, Any] = {
     # Interop with other harnesses' context/skill locations is off. Add "CLAUDE.md" and
     # ".claude/skills" back to these lists (or set them in config.toml) to re-enable it -
     # both are read-only conventions, so nothing else has to change.
+    # Off by default: a coding agent legitimately edits sibling repos and files outside the
+    # directory it started in. On, read/write/edit refuse anything outside the project.
+    "confine_to_project": False,
     "context_files": ["AGENTS.md", ".picoagent/AGENTS.md"],
     "skill_dirs": ["skills", ".picoagent/skills", ".agents/skills"],
     "plugins": {"enabled": []},   # also: [plugins].rewrite maps a url prefix to a mirror
