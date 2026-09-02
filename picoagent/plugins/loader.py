@@ -13,10 +13,14 @@ Because registrations override by name, a project-level plugin beats a user-leve
 Trust
 -----
 Plugin code runs with your full privileges, so nothing loads until you've said yes.
-``picoagent plugin add`` shows the manifest and asks; the answer is stored as a hash
-of ``plugin.toml`` + the entry module in ``~/.picoagent/trust.json``. If either file
-changes (a new version, or something tampered with it) the hash no longer matches
-and the plugin is skipped with a warning until you trust it again.
+``picoagent plugin add`` shows the manifest and asks; the answer is stored in
+``~/.picoagent/trust.json`` as a hash over *every file in the plugin directory*. If any of
+them changes - a new version, an edit, or something tampered with - the hash no longer
+matches and the plugin is skipped with a warning until you trust it again.
+
+Hashing the whole directory rather than just the entry module is deliberate: the entry
+imports its siblings, so a narrower fingerprint let ``helper.py`` be rewritten while the
+plugin still reported *trusted*.
 """
 from __future__ import annotations
 
@@ -137,12 +141,33 @@ def install_deps(manifest: Manifest) -> None:
 
 # ------------------------------------------------------------------------ trust
 
+#: Never part of a fingerprint: build artefacts and VCS metadata that a plugin ships without
+#: meaning to, and that change without the plugin changing.
+_UNTRUSTED_NOISE = {"__pycache__", ".git", ".hg", ".svn", ".mypy_cache", ".pytest_cache"}
+
+
 def plugin_files(manifest: Manifest) -> list[Path]:
-    """The files a trust decision covers: the manifest and the entry module."""
-    files = [manifest.root / "plugin.toml"]
-    entry = manifest.entry_path()
-    if entry.exists():
-        files.append(entry)
+    """Every file a trust decision covers - the whole plugin directory, not just the entry.
+
+    Fingerprinting only ``plugin.toml`` and the entry module left a hole wide enough to drive
+    a plugin through: the entry module imports its siblings, so rewriting ``helper.py`` changed
+    what executed while the fingerprint still matched and the plugin still reported *trusted*.
+    Every multi-module plugin in ``examples/`` was affected, which is most of them.
+
+    Skills are included too. They are not executed, but they are injected into the model's
+    prompt, and text that steers the model is as much a part of what the user approved as code
+    that runs. A README is included for the same reason it is cheap to: the alternative is a
+    rule about which files matter, and that rule is what failed the first time.
+    """
+    files = []
+    for path in sorted(manifest.root.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part in _UNTRUSTED_NOISE for part in path.relative_to(manifest.root).parts):
+            continue
+        if path.suffix in (".pyc", ".pyo"):
+            continue
+        files.append(path)
     return files
 
 
@@ -156,7 +181,8 @@ def plugin_fingerprint(manifest: Manifest) -> str:
 
 def plugin_file_hashes(manifest: Manifest) -> dict[str, str]:
     """Per-file digests, so a re-approval can say *which* file moved, not just that one did."""
-    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in plugin_files(manifest)}
+    return {str(path.relative_to(manifest.root)).replace("\\", "/"): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in plugin_files(manifest)}
 
 
 def plugin_commit(root: Path) -> str | None:
