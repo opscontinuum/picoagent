@@ -798,14 +798,18 @@ APPENDICES: tuple[Block, ...] = (
 #: NIST SP 800-34 Rev. 1 Appendix B, transcribed at one heading level deeper than NIST prints
 #: it, because it is nested inside FedRAMP's "Appendix L Business Impact Analysis".
 #:
-#: **[unverified]** Which Appendix B paragraphs are italic (guidance, to be deleted) and which
-#: are regular (intended to remain) could not be read back from the PDF's text layer. The
-#: conservative reading is used: only the paragraphs that describe the document itself, the
-#: three numbered BIA steps, and the MTD/RTO/RPO definitions are reproduced. Every paragraph
-#: that instructs the author ("Working directly with mission/business process owners...",
-#: "Include a description of...", "Data collection can be accomplished through...") is dropped,
-#: on the same rule that drops FedRAMP's instruction boxes. If that reading is wrong it errs
-#: towards emitting less, never towards emitting something the source does not say.
+#: The italic/regular split **has** been read back from the PDF, by extracting Appendix B
+#: (pages B-1..B-4) with span-level font names: italic guidance is ``TimesNewRomanPS-ItalicMT``,
+#: text intended to remain is ``TimesNewRomanPSMT``. An earlier note here said this could not be
+#: determined and erred towards emitting less; that guess was wrong in both directions, and four
+#: regular paragraphs NIST intends to keep were being dropped while one italic sentence NIST
+#: tells the author to delete was being emitted. Both are fixed.
+#:
+#: What is reproduced is NIST's **content**, not its layout. NIST prints the impact categories
+#: as a list and numbers its top-level headings "1." / "2." / "3."; this renders them as a table
+#: and without the trailing period, because the required thing is that the information is
+#: present and correct. Nothing here may state something NIST does not say - that rule is
+#: absolute, and a sentence spliced together from two different NIST sentences broke it once.
 BIA_BLOCKS: tuple[Block, ...] = (
     Heading(2, "1 Overview"),
     Para("This Business Impact Analysis (BIA) is developed as part of the contingency planning process "
@@ -842,17 +846,25 @@ BIA_BLOCKS: tuple[Block, ...] = (
     Heading(2, "3 BIA Data Collection"),
 
     Heading(3, "3.1 Determine Process and System Criticality"),
+    Para("Step one of the BIA process - Working with input from users, managers, mission/business "
+         "process owners, and other internal or external points of contact (POC), identify the "
+         "specific mission/business processes that depend on or support the information system."),
     Table("", ("Mission/Business Process", "Description"), (), "bia.processes",
           (("{insert}", "{insert}"),)),
 
     Heading(4, "3.1.1 Identify Outage Impacts and Estimated Downtime"),
-    Para("Impact categories and values for assessing category impact:"),
+    Para("The following impact categories represent important areas for consideration in the "
+         "event of a disruption or impact."),
+    Para("Impact values for assessing category impact:"),
     Table("", ("Impact category", "Severe", "Moderate", "Minimal"), (), "bia.impact_categories",
           (("{insert category name}", "{insert value}", "{insert value}", "{insert value}"),)),
     Para("The table below summarizes the impact on each mission/business process if {cso.name} were "
          "unavailable, based on the following criteria:"),
     Table("", ("Mission/Business Process", "Impact"), (), "bia.process_impacts",
           (("{insert}", "{insert}"),), "bia.impact_categories"),
+    Para("Working directly with mission/business process owners, departmental staff, managers, and "
+         "other stakeholders, estimate the downtime factors for consideration as a result of a "
+         "disruptive event."),
     Para("Maximum Tolerable Downtime (MTD). The MTD represents the total amount of time "
          "leaders/managers are willing to accept for a mission/business process outage or disruption and "
          "includes all impact considerations. Determining MTD is important because it could leave "
@@ -868,9 +880,7 @@ BIA_BLOCKS: tuple[Block, ...] = (
          "system outage, to which mission/business process data must be recovered (given the most recent "
          "backup copy of the data) after an outage."),
     Para("The table below identifies the MTD, RTO, and RPO (as applicable) for the organizational "
-         "mission/business processes that rely on {cso.name}. Values for MTDs and RPOs are expected to "
-         "be specific time frames, identified in hourly increments (i.e., 8 hours, 36 hours, 97 hours, "
-         "etc.)."),
+         "mission/business processes that rely on {cso.name}."),
     Table("", ("Mission/Business Process", "MTD", "RTO", "RPO"), (), "bia.downtime",
           (("{insert}", "{insert}", "{insert}", "{insert}"),)),
     Para("{bia.downtime_drivers}"),
@@ -888,6 +898,11 @@ BIA_BLOCKS: tuple[Block, ...] = (
     Para("The table below lists the order of recovery for {cso.name} resources. The table also "
          "identifies the expected time for recovering the resource following a “worst case” (complete "
          "rebuild/repair or replacement) disruption."),
+    Para("Recovery Time Objective (RTO) - RTO defines the maximum amount of time that a system "
+         "resource can remain unavailable before there is an unacceptable impact on other system "
+         "resources, supported mission/business processes, and the MTD. Determining the information "
+         "system resource RTO is important for selecting appropriate technologies that are best "
+         "suited for meeting the MTD."),
     Table("", ("Priority", "System Resource/Component", "Recovery Time Objective"), (), "bia.priorities",
           (("{insert}", "{insert}", "{insert}"),)),
     Para("{bia.alternate_strategies}"),
