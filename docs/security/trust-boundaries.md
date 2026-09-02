@@ -34,6 +34,13 @@ graph TB
     class untrusted danger
 ```
 
+The fingerprint covers **every file in the plugin directory**, not just the entry module.
+It used to cover only `plugin.toml` and the entry, which was a hole rather than a
+simplification: the entry imports its siblings, so rewriting `helper.py` changed what
+executed while the plugin still reported *trusted*. Every multi-module plugin was affected.
+Skills are covered too - they are not executed, but they are injected into the model's prompt,
+and text that steers the model is part of what was approved.
+
 The load-time trust decision is the only boundary around plugin code. There is no sandbox: an
 approved plugin can do anything the user can. That is why the approval flow shows what changed
 rather than silently re-approving, and why declining leaves the plugin unloaded.
