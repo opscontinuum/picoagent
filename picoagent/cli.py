@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import subprocess
 import sys
@@ -39,16 +40,45 @@ def session_dir(cfg: dict, cwd: Path) -> Path:
 
 
 def open_session(cfg: dict, cwd: Path, resume: str | None) -> Session:
-    """Create a fresh session, or resume ``last``/a given file."""
+    """Create a fresh session, or resume ``last``/a given file.
+
+    A ``-r`` path is checked before it is opened. The session log is *appended* to, so
+    pointing ``-r`` at an arbitrary file would append JSON lines to it - harmless when a
+    person types it, less so when picoagent is invoked by something else (its own shell tool
+    can invoke picoagent). Requiring the file to be an existing session, or a new ``.jsonl``,
+    costs nothing and removes the footgun.
+    """
     directory = session_dir(cfg, cwd)
     if resume is None:
         return Session(directory / f"{int(time.time())}.jsonl", cwd)
-    if resume != "last":
-        path = Path(resume)
-    else:
+    if resume == "last":
         existing = Session.list(directory)
         path = existing[0] if existing else directory / f"{int(time.time())}.jsonl"
+        return Session(path, cwd, resume=path.exists())
+
+    path = Path(resume).expanduser()
+    if path.exists() and not looks_like_session(path):
+        raise SystemExit(f"{path} is not a picoagent session file; refusing to append to it")
+    if not path.exists() and path.suffix != ".jsonl":
+        raise SystemExit(f"{path} does not exist and is not a .jsonl path; refusing to create it")
     return Session(path, cwd, resume=path.exists())
+
+
+def looks_like_session(path: Path) -> bool:
+    """True when ``path``'s first line is a picoagent session header.
+
+    Cheap and specific: a session log always opens with a ``kind: header`` entry, so one line
+    is enough to tell a real session from an unrelated file that happens to end in .jsonl.
+    """
+    try:
+        with path.open() as handle:
+            first = handle.readline()
+    except OSError:
+        return False
+    try:
+        return json.loads(first).get("kind") == "header"
+    except (ValueError, AttributeError):
+        return False
 
 
 def register_core(rt: Runtime) -> None:

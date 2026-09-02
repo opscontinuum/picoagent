@@ -75,6 +75,30 @@ Dotted arrows are paths that were closed deliberately, each because it was reach
 | A gateway echoes the key back in a 401 body | Provider error text is scrubbed before it reaches the terminal or the `--json` stream |
 | A key typed into a slash command | Slash commands short-circuit before `session.append_message`, so they are never recorded |
 
+## Confining file access
+
+`read`, `write` and `edit` take a path from the model. By default any path resolves -
+absolute ones and `..` traversal included - so the agent can reach anything the user can.
+
+That is deliberate rather than an oversight. A coding agent legitimately edits sibling
+repositories, files under `~/.config`, and things outside whatever directory it happened to
+start in; confining it by default would break ordinary work. The boundary is the toolset, not
+the path string.
+
+Deployments that need the harder rule can turn it on:
+
+```toml
+confine_to_project = true   # read/write/edit refuse anything outside the project directory
+```
+
+With it on, a path resolving outside `cwd` comes back as a refused tool result rather than an
+exception, so the model can see why and adjust. It is off by default because switching it on
+is a real behavioural change, and on where an environment requires it.
+
+This does not confine the `shell` tool, which runs commands as the user and can reach any file
+the user can. Restricting that means not granting `shell` (`api.set_active_tools`) or gating it
+with `permission-gate`.
+
 ## Known limits
 
 Stated plainly, because a control that is oversold is worse than one that is absent.

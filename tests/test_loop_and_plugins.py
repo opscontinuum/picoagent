@@ -206,3 +206,43 @@ class LoadReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResumePathTests(unittest.TestCase):
+    """`-r` appends to the file it is given, so it is checked before being opened."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        import os
+        os.environ["PICOAGENT_HOME"] = str(self.tmp / "home")
+        from picoagent.core.config import load_config
+        self.cfg = load_config(self.tmp)
+
+    def _open(self, resume):
+        from picoagent import cli
+        return cli.open_session(self.cfg, self.tmp, resume)
+
+    def test_an_unrelated_existing_file_is_refused(self):
+        victim = self.tmp / "important.conf"
+        victim.write_text("export PATH=/usr/bin\n")
+        with self.assertRaises(SystemExit):
+            self._open(str(victim))
+        self.assertEqual(victim.read_text(), "export PATH=/usr/bin\n", "must not be appended to")
+
+    def test_a_non_jsonl_new_path_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self._open(str(self.tmp / "notes.txt"))
+
+    def test_a_new_jsonl_path_is_allowed(self):
+        session = self._open(str(self.tmp / "fresh.jsonl"))
+        self.assertTrue(session.path.exists())
+
+    def test_a_real_session_file_resumes(self):
+        first = self._open(str(self.tmp / "s.jsonl"))
+        again = self._open(str(first.path))
+        self.assertEqual(again.path, first.path)
+        self.assertTrue(again.entries, "an existing session should load its entries")
+
+    def test_default_and_last_still_work(self):
+        self.assertTrue(self._open(None).path.suffix == ".jsonl")
+        self.assertTrue(self._open("last").path.suffix == ".jsonl")

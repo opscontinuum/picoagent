@@ -77,13 +77,34 @@ def spill_to_tempfile(text: str) -> str:
         return fh.name
 
 
+class PathRefused(Exception):
+    """A model-supplied path fell outside the project while confinement was on."""
+
+
 def resolve_path(ctx: ToolContext, raw: str) -> Path:
     """Turn a model-supplied path into an absolute one.
 
     Strips a leading ``@`` (some models copy it from ``@file`` mentions) and expands ``~``.
+
+    By default any path resolves, including absolute ones and ``..`` traversal. That is not an
+    oversight: a coding agent legitimately edits sibling repositories, ``~/.config``, and files
+    outside whatever directory it happens to have started in, and confining it would break
+    ordinary work. The boundary around an agent is the tools it is given - see
+    docs/security/trust-boundaries.md - with permission-gate for protected paths.
+
+    Deployments that need the harder rule can set ``confine_to_project = true``, which refuses
+    anything resolving outside ``ctx.cwd``. Off by default because turning it on breaks real
+    workflows; available because some environments must have it.
     """
     path = Path(os.path.expanduser(raw.lstrip("@")))
-    return path if path.is_absolute() else ctx.cwd / path
+    resolved = (path if path.is_absolute() else ctx.cwd / path)
+    if not ctx.config.get("confine_to_project"):
+        return resolved
+    root = ctx.cwd.resolve()
+    candidate = resolved.resolve() if resolved.exists() else Path(os.path.normpath(resolved))
+    if candidate != root and root not in candidate.parents:
+        raise PathRefused(f"{candidate} is outside the project ({root}) and confine_to_project is on")
+    return candidate
 
 
 _file_locks: dict[str, asyncio.Lock] = {}
@@ -111,7 +132,10 @@ class ReadTool:
         "limit": {"type": "integer", "description": "number of lines"}}, "required": ["path"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
-        path = resolve_path(ctx, args["path"])
+        try:
+            path = resolve_path(ctx, args["path"])
+        except PathRefused as exc:
+            return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
         if not path.exists():
             return ToolResult(ctx.tool_call_id, f"File not found: {path}", is_error=True)
         if path.is_dir():
@@ -140,7 +164,10 @@ class WriteTool:
                   "required": ["path", "content"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
-        path = resolve_path(ctx, args["path"])
+        try:
+            path = resolve_path(ctx, args["path"])
+        except PathRefused as exc:
+            return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
         async with file_lock(path):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(args["content"])
@@ -157,7 +184,10 @@ class EditTool:
         "replace_all": {"type": "boolean"}}, "required": ["path", "old_text", "new_text"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
-        path = resolve_path(ctx, args["path"])
+        try:
+            path = resolve_path(ctx, args["path"])
+        except PathRefused as exc:
+            return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
         if not path.exists():
             return ToolResult(ctx.tool_call_id, f"File not found: {path}", is_error=True)
         old, new, replace_all = args["old_text"], args["new_text"], bool(args.get("replace_all"))
