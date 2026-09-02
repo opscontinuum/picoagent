@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from helpers import CaptureFrontend, ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT
+from picoagent.core.tools import PathRefused
 from picoagent.plugins import loader
 from picoagent.testing.fake_iac import (AWS_SAMPLE_TF, OCI_SAMPLE_TF, SAMPLE_ANSWERS,
                                         write_cloudformation_json, write_sample_project,
@@ -580,3 +581,56 @@ class CommandTests(PluginBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfinementTests(unittest.TestCase):
+    """iscp-author must honour confine_to_project exactly as the built-in tools do.
+
+    It previously returned absolute paths unchecked, so a deployment that switched confinement
+    on still had this plugin reading and writing outside the project while read/write/edit
+    refused - the one behaviour such a deployment cannot tolerate.
+    """
+
+    def setUp(self):
+        self.proj = Path(tempfile.mkdtemp())
+        self.outside = Path(tempfile.mkdtemp())
+        (self.outside / "main.tf").write_text('resource "aws_instance" "x" {}\n')
+
+    def test_absolute_outside_path_is_allowed_when_confinement_is_off(self):
+        """The default must not change: a Terraform repo often sits beside the docs repo."""
+        ctx = tool_ctx(self.proj, confine_to_project=False)
+        self.assertEqual(iscp_author._resolve_inside(ctx, str(self.outside / "main.tf")),
+                         self.outside / "main.tf")
+
+    def test_absolute_outside_path_is_refused_when_confinement_is_on(self):
+        ctx = tool_ctx(self.proj, confine_to_project=True)
+        with self.assertRaises(PathRefused):
+            iscp_author._resolve_inside(ctx, str(self.outside / "main.tf"))
+
+    def test_relative_escape_is_refused_whether_or_not_confinement_is_on(self):
+        """A usability guard, not a security one - an injection can write an absolute path."""
+        for confine in (False, True):
+            with self.subTest(confine=confine):
+                with self.assertRaises(ValueError):
+                    iscp_author._resolve_inside(tool_ctx(self.proj, confine_to_project=confine),
+                                                "../escape")
+
+    def test_a_path_inside_the_project_still_resolves_under_confinement(self):
+        ctx = tool_ctx(self.proj, confine_to_project=True)
+        self.assertEqual(iscp_author._resolve_inside(ctx, "docs/out"), self.proj / "docs/out")
+
+    def test_a_nul_byte_is_rejected_as_a_value_error_the_tools_catch(self):
+        """A NUL used to escape the tool as an unhandled ValueError from path.exists().
+
+        It is raised here rather than returned because both call sites catch ValueError and
+        PathRefused and turn them into error results - asserted by the next test.
+        """
+        with self.assertRaises(ValueError):
+            iscp_author._resolve_inside(tool_ctx(self.proj), "out\x00")
+
+    def test_both_call_sites_convert_a_refusal_into_an_error_result(self):
+        """The convention is: expected failures return an error result, bugs raise."""
+        import inspect
+        source = inspect.getsource(iscp_author)
+        self.assertEqual(source.count("except (ValueError, PathRefused) as exc:"), 2,
+                         "every _resolve_inside call site must catch both refusal types")
