@@ -13,8 +13,10 @@ Tools
                       the top error messages inside the spike
   es_search           raw query DSL passthrough for anything the helpers don't cover
   es_request          raw REST call; destructive ones are blocked unless ``allow_destructive = true``
+  es_shards, es_recovery, es_nodes, es_hot_threads, es_ilm, es_snapshots, es_index_inspect,
+  es_templates, es_slowlog - the cluster-administration half, in ``es_admin.py``
 Skills
-  es-triage, es-log-dig, es-correlate - runbooks the model reads when relevant
+  es-triage, es-log-dig, es-correlate and six administration runbooks - see ``skills/``
 Command
   /es                 quick cluster summary for the human
 
@@ -35,31 +37,19 @@ Configuration (``[plugins.es-doctor]`` or env vars)::
 """
 from __future__ import annotations
 
-import base64
 import json
-import logging
 import math
 import os
 import re
-import ssl
-import urllib.error
 import urllib.parse
-import urllib.request
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
-from picoagent.core.tools import truncate
-from picoagent.core.types import ToolResult
-
-log = logging.getLogger("es_doctor")
+from es_client import (DEFAULT_LOGS_INDEX, DEFAULT_METRICS_INDEX, DEFAULT_TRACES_INDEX,
+                       ESClient, ESError, Settings, _ESTool, result, text_table)
 
 # ------------------------------------------------------------------ Elastic knowledge
-# Beats and Elastic Agent write ECS documents into these data streams. Keeping the names in
-# one place means a user with legacy indices only has to override three config keys.
-DEFAULT_LOGS_INDEX = "logs-*,filebeat-*"
-DEFAULT_METRICS_INDEX = "metrics-*,metricbeat-*"
-DEFAULT_TRACES_INDEX = "traces-apm*,apm-*"
+# Beats and Elastic Agent write ECS documents into these data streams; the default patterns
+# live in es_client.py, so a user with legacy indices overrides three config keys.
 
 #: Friendly names -> ECS / Beats metric fields.
 METRIC_ALIASES = {
@@ -89,51 +79,6 @@ You have es_* tools. Data from Beats and Elastic Agent follows ECS (Elastic Comm
   system.filesystem.used.pct, docker.*, kubernetes.*; APM: transaction.duration.us, transaction.name
 Workflow for "why is X broken": es_cluster_health -> es_logs (errors, narrow time window) ->
 es_correlate (errors vs cpu/memory/latency, same window, same host/service) -> read matching skill."""
-
-
-# ------------------------------------------------------------------ client
-
-class ESClient:
-    """Minimal REST client. Raises ``ESError`` with the server's message on non-2xx."""
-
-    def __init__(self, url: str, api_key: str = "", username: str = "", password: str = "",
-                 verify_tls: bool = True, ca_cert: str = ""):
-        """``ca_cert`` is the secure answer to a self-signed cluster: trust that CA rather than
-        nobody. ``verify_tls=False`` remains as a last resort, but it disables certificate *and*
-        hostname checking, which makes the connection interceptable by anything on the path -
-        so it is the wrong tool for the common case it tends to get used for.
-        """
-        self.url = url.rstrip("/")
-        self._auth = (f"ApiKey {api_key}" if api_key
-                      else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode() if username else "")
-        if ca_cert:
-            self._ctx = ssl.create_default_context(cafile=ca_cert)
-        elif verify_tls:
-            self._ctx = None                       # urllib's default: verified
-        else:
-            log.warning("es-doctor: TLS verification is OFF for %s. Anything on the network path "
-                        "can read and alter this traffic, including credentials. Prefer ca_cert.",
-                        self.url)
-            self._ctx = ssl._create_unverified_context()
-
-    def request(self, method: str, path: str, body: dict | None = None) -> Any:
-        req = urllib.request.Request(self.url + (path if path.startswith("/") else "/" + path), method=method,
-                                     data=json.dumps(body).encode() if body is not None else None,
-                                     headers={"Content-Type": "application/json", **({"Authorization": self._auth} if self._auth else {})})
-        try:
-            with urllib.request.urlopen(req, timeout=60, context=self._ctx) as resp:
-                return json.loads(resp.read() or b"null")
-        except urllib.error.HTTPError as exc:
-            raise ESError(f"HTTP {exc.code} {method} {path}: {exc.read().decode(errors='replace')[:800]}") from exc
-        except (urllib.error.URLError, OSError) as exc:
-            raise ESError(f"cannot reach {self.url}: {exc}") from exc
-
-    def search(self, index: str, body: dict) -> dict:
-        return self.request("POST", f"/{urllib.parse.quote(index, safe='*,-.')}/_search", body)
-
-
-class ESError(Exception):
-    pass
 
 
 # ------------------------------------------------------------------ query helpers
@@ -219,36 +164,7 @@ def fmt(value: float | None, digits: int = 3) -> str:
     return "-" if value is None else (f"{value:.{digits}f}" if isinstance(value, float) else str(value))
 
 
-def result(ctx, text: str, is_error: bool = False, **details) -> ToolResult:
-    body, cut = truncate(text, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
-    return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=is_error, details=details)
-
-
 # ------------------------------------------------------------------ tools
-
-@dataclass
-class Settings:
-    logs_index: str = DEFAULT_LOGS_INDEX
-    metrics_index: str = DEFAULT_METRICS_INDEX
-    traces_index: str = DEFAULT_TRACES_INDEX
-    allow_destructive: bool = False
-
-
-class _ESTool:
-    """Base: holds the client and turns ESError into an error ToolResult."""
-
-    def __init__(self, es: ESClient, settings: Settings):
-        self.es, self.settings = es, settings
-
-    async def execute(self, args: dict, ctx) -> ToolResult:
-        try:
-            return self.run(args, ctx)
-        except ESError as exc:
-            return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
-
-    def run(self, args: dict, ctx) -> ToolResult:  # pragma: no cover - overridden
-        raise NotImplementedError
-
 
 class ClusterHealthTool(_ESTool):
     name = "es_cluster_health"
@@ -405,7 +321,7 @@ class CorrelateTool(_ESTool):
                 row += [fmt(p50 / 1000, 0) if p50 else "-", apm["fail"].get(k, 0)]
             rows.append(row)
 
-        lines = [f"errors vs metrics per {interval}, {len(keys)} buckets", _table(header, rows), "", "Correlation of error count with:"]
+        lines = [f"errors vs metrics per {interval}, {len(keys)} buckets", text_table(header, rows), "", "Correlation of error count with:"]
         for m in metrics:
             r = pearson(errors, [metric_series[m].get(k) for k in keys])
             lines.append(f"  {m:40} r={fmt(r, 2)} {_strength(r)}")
@@ -471,12 +387,6 @@ def _strength(r: float | None) -> str:
     return f"{label} {'positive' if r > 0 else 'negative'}"
 
 
-def _table(header: list[str], rows: list[list]) -> str:
-    widths = [max(len(str(x)) for x in col) for col in zip(header, *rows)]
-    line = lambda cells: "  ".join(str(c).ljust(w) for c, w in zip(cells, widths))  # noqa: E731
-    return "\n".join([line(header), line(["-" * w for w in widths])] + [line(r) for r in rows])
-
-
 class SearchTool(_ESTool):
     name = "es_search"
     description = "Raw Elasticsearch query DSL: POST /<index>/_search with the given body. Use for anything es_logs/es_metrics can't express."
@@ -505,6 +415,8 @@ def is_destructive(method: str, path: str) -> bool:
 # ------------------------------------------------------------------ registration
 
 def register(api):
+    import es_admin       # sibling module; the loader puts the plugin root on sys.path
+
     cfg = api.plugin_config()
     es = ESClient(url=cfg.get("url") or os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200"),
                   api_key=cfg.get("api_key") or os.environ.get("ELASTICSEARCH_API_KEY", ""),
@@ -516,7 +428,9 @@ def register(api):
 
     for tool_class in (ClusterHealthTool, IndicesTool, LogsTool, MetricsTool, CorrelateTool, SearchTool, RequestTool):
         api.register_tool(tool_class(es, settings))
-    api.register_system_prompt_section("es-doctor", lambda: PROMPT_NOTE)
+    for tool_class in es_admin.TOOL_CLASSES:
+        api.register_tool(tool_class(es, settings))
+    api.register_system_prompt_section("es-doctor", lambda: PROMPT_NOTE + "\n" + es_admin.ES_ADMIN_PROMPT_NOTE)
 
     async def guard(event, rt):
         """Block destructive es_request calls unless the user opted in."""
