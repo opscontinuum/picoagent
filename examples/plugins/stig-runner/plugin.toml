@@ -1,0 +1,7 @@
+name = "stig-runner"
+version = "0.1.0"
+entry = "stig_runner:register"
+description = "DISA STIG checklist runner: read and write CKL with byte-level fidelity, gather repository evidence for Application Security and Development STIG rules, and record determinations a human approves"
+requires = ["picoagent>=0.1"]
+python_deps = []
+skills = ["skills"]
