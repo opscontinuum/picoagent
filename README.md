@@ -45,6 +45,50 @@ def register(api):
     api.register_command("hello", lambda args, rt: _hi(args), "say hi")
 ```
 
+## What files picoagent reads
+
+Relevant if you're deploying somewhere that has to account for every file an agent touches.
+Two config keys control everything picoagent reads on its own initiative:
+
+```toml
+context_files = ["AGENTS.md", ".picoagent/AGENTS.md"]        # always-on instructions
+skill_dirs    = ["skills", ".picoagent/skills", ".agents/skills"]
+```
+
+Those are the defaults, and they are the complete list. **No vendor-specific paths are read.**
+Other harnesses' conventions (`CLAUDE.md`, `.claude/skills`) are deliberately *not* in the
+defaults — see the comment above the lists in `picoagent/core/config.py`. Anything else the
+agent reads, it reads because the model called the `read` tool and you can see that in the
+session log.
+
+Both keys are plain lists, and a value in `config.toml` **replaces** the default rather than
+merging with it. So you can narrow or disable them:
+
+```toml
+# read nothing implicitly - only files the model explicitly opens with a tool
+context_files = []
+skill_dirs    = []
+
+# or pin to exactly what you allow
+context_files = ["AGENTS.md"]
+skill_dirs    = ["/opt/approved-skills"]
+```
+
+To re-enable interop with another harness's files, add its paths back:
+
+```toml
+context_files = ["AGENTS.md", ".picoagent/AGENTS.md", "CLAUDE.md"]
+skill_dirs    = ["skills", ".picoagent/skills", ".agents/skills", ".claude/skills"]
+```
+
+Both are read-only conventions — nothing else in picoagent changes either way.
+
+Network reads are separately bounded: the core makes exactly one kind of outbound request,
+`POST {base_url}/chat/completions` to whichever server you configure (plus `GET {base_url}/models`
+when you run `/model list`). Point `base_url` at a local or on-prem endpoint and it never talks
+to anything else. `plugin add` runs `git clone`/`git fetch` against whatever git host you name,
+which can be an internal server.
+
 ## Plugin trust (and what happens when a plugin changes)
 
 Plugin code runs with your full privileges, so nothing loads until you've approved it. The
