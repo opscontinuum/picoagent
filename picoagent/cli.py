@@ -189,11 +189,28 @@ def _report_skipped(report: loader.LoadReport) -> None:
             sys.stderr.write(f"picoagent: plugin '{name}' failed to load ({reason}); see --verbose.\n")
 
 
+async def warn_about_ignored_project_keys(rt) -> None:
+    """Say so when the repository's config tried to set something only the user may set.
+
+    Dropping these silently would leave two people confused for different reasons: whoever
+    wrote the project config wondering why it did nothing, and whoever cloned the repository
+    never learning it tried to point their API key somewhere else.
+    """
+    ignored = rt.cfg.get("_ignored_project_keys") or []
+    if not ignored:
+        return
+    await rt.events.emit("notice", {
+        "text": f"ignored {', '.join(ignored)} from this repository's .picoagent/config.toml - "
+                "these are read from your own config only. See docs/security/trust-boundaries.md"},
+        rt)
+
+
 # ---------------------------------------------------------------------------- commands
 
 async def run_agent(args: argparse.Namespace) -> int:
     rt = build_runtime(args)
     agent = AgentLoop(rt)
+    await warn_about_ignored_project_keys(rt)
     await rt.events.emit("session_start", {"resume": bool(args.resume)}, rt)
     try:
         if args.prompt:
