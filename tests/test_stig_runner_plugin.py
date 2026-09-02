@@ -567,3 +567,55 @@ class NoNetworkTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ControlCharacterTests(unittest.TestCase):
+    """Evidence is pasted from terminals, and terminals emit bytes XML cannot hold.
+
+    Before this was fixed, `stig_save in_place=true` replaced the assessor's own checklist
+    with a file that neither stig_load nor STIG Viewer could open - their work, gone.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "c.ckl"
+        self.path.write_bytes(build_ckl(rules=3))
+        self.original = self.path.read_bytes()
+        self.vuln = ckl.load(self.path).rules[0].vuln_num
+
+    def test_ansi_colour_codes_from_a_log_excerpt_are_refused(self):
+        checklist = ckl.load(self.path)
+        with self.assertRaises(ckl.CklError) as caught:
+            checklist.set_status(self.vuln, "Open",
+                                 finding_details="grep hit \x1b[31mFAIL\x1b[0m")
+        self.assertIn("U+001B", str(caught.exception))
+
+    def test_every_unrepresentable_character_is_refused_and_the_file_is_untouched(self):
+        for payload in ("form\x0cfeed", "nul\x00byte", "surrogate\ud800half", "mark\ufffehere"):
+            with self.subTest(payload=payload):
+                checklist = ckl.load(self.path)
+                with self.assertRaises(ckl.CklError):
+                    checklist.set_status(self.vuln, "Open", finding_details=payload)
+                self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_asset_fields_are_checked_too(self):
+        checklist = ckl.load(self.path)
+        with self.assertRaises(ckl.CklError):
+            checklist.set_asset(HOST_NAME="host\x00name")
+
+    def test_tabs_newlines_and_markup_characters_still_round_trip(self):
+        """The check must not cost assessors ordinary multi-line evidence."""
+        checklist = ckl.load(self.path)
+        checklist.set_status(self.vuln, "Open", finding_details="line1\n\tindent & <tag>")
+        checklist.write(self.path)
+        self.assertEqual(ckl.load(self.path).rules[0].finding_details, "line1\n\tindent & <tag>")
+
+    def test_write_refuses_to_replace_a_good_file_with_unparseable_bytes(self):
+        """Defence in depth: even if a future serialisation bug produces bad XML, in_place
+        must not destroy the original. Simulated by corrupting to_bytes directly."""
+        checklist = ckl.load(self.path)
+        checklist.to_bytes = lambda: b"<VULN><unclosed>"
+        with self.assertRaises(ckl.CklError) as caught:
+            checklist.write(self.path)
+        self.assertIn("unchanged", str(caught.exception))
+        self.assertEqual(self.path.read_bytes(), self.original)
+        self.assertFalse((self.tmp / "c.ckl.tmp").exists(), "temp file must be cleaned up")

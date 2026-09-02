@@ -205,11 +205,23 @@ class Checklist:
                           self.trailing_newline)
 
     def write(self, path: Path) -> Path:
-        """Write to ``path`` via a temp file and ``os.replace``, so a crash cannot truncate it."""
+        """Write to ``path`` via a temp file and ``os.replace``, so a crash cannot truncate it.
+
+        The temp file is parsed before it replaces anything. The atomic rename guarantees the
+        write is not *torn*; it does not guarantee the bytes are a checklist, and ``in_place``
+        aims this at the assessor's own file. A serialisation bug must not cost them their work,
+        so a file that will not parse is discarded and the original left alone.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".tmp")
         temp.write_bytes(self.to_bytes())
+        try:
+            ET.parse(temp)
+        except ET.ParseError as exc:
+            temp.unlink(missing_ok=True)
+            raise CklError(f"refusing to write {path}: the serialised checklist is not "
+                           f"well-formed XML ({exc}). The file on disk is unchanged.") from exc
         os.replace(temp, path)
         self.dirty = 0
         return path
@@ -217,8 +229,30 @@ class Checklist:
 
 # --------------------------------------------------------------------------- parsing
 
+# XML 1.0 Char production. Everything else - NUL, form feed, the ESC that starts an ANSI colour
+# code - cannot be represented in an XML document at all, not even as a character reference.
+_XML_SAFE = re.compile("[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]")
+
+
+def _reject_unrepresentable(tag: str, value: str) -> None:
+    """Refuse text XML cannot hold, before it reaches the tree.
+
+    Assessors paste evidence out of terminals, and a grep hit from a colour-highlighted log
+    carries ESC bytes. Serialising those produces a file that is not well-formed, and
+    :meth:`Checklist.write` would then replace the assessor's checklist with it.
+    """
+    found = _XML_SAFE.search(value)
+    if found is None:
+        return
+    char = found.group()
+    raise CklError(
+        f"{tag} contains {char!r} (U+{ord(char):04X}), which XML cannot represent. "
+        "Terminal output often carries these - strip control characters from pasted evidence.")
+
+
 def _set_text(parent: ET.Element, tag: str, value: str) -> None:
     """Assign one child's text, creating nothing. A missing child means the file is not a CKL."""
+    _reject_unrepresentable(tag, value)
     child = parent.find(tag)
     if child is None:
         raise CklError(f"expected a <{tag}> element under <{parent.tag}>")
