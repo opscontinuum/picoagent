@@ -1,0 +1,7 @@
+name = "iscp-author"
+version = "0.1.0"
+entry = "iscp_author:register"
+description = "FedRAMP contingency planning: interview-driven SSP Appendix G ISCP, NIST SP 800-34 BIA, recovery runbooks and a configuration-item inventory from Terraform/CloudFormation"
+python_deps = []
+requires = ["picoagent>=0.1"]
+skills = ["skills"]
