@@ -394,3 +394,46 @@ class ServerlessTests(EsAdminBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AllocationExplainWordingTests(unittest.TestCase):
+    """The 400 a healthy cluster returns changed wording in ES 7.16.
+
+    The plugin matched "unassigned shard", which only appears in the <=7.15 text, and the fake
+    served that same old text - so the tests agreed with each other and with no cluster anyone
+    still runs. Against a real 7.16+ healthy cluster, es_shards explain=true reported an HTTP
+    400 error instead of "nothing is unassigned".
+    """
+
+    import sys as _sys
+    _sys.path.insert(0, str(ROOT / "examples/plugins/es-doctor"))
+    import es_admin as _es_admin
+
+    def test_both_the_old_and_current_wording_read_as_healthy(self):
+        for label, message in [
+                ("<=7.15", "unable to find any unassigned shards to explain [Request[x=true]]"),
+                ("7.16+", "unable to find any shards to explain [Request[x=true]] in the routing table")]:
+            with self.subTest(version=label):
+                self.assertTrue(self._es_admin._is_nothing_to_explain(message))
+
+    def test_an_unrelated_400_is_still_a_real_error(self):
+        self.assertFalse(self._es_admin._is_nothing_to_explain("index_not_found_exception"))
+        self.assertFalse(self._es_admin._is_nothing_to_explain("illegal_argument_exception: bad shard"))
+
+    def test_the_fake_serves_the_current_wording(self):
+        """Otherwise the fake silently re-pins the bug it was meant to catch."""
+        import inspect
+        from picoagent.testing import fake_es
+        source = inspect.getsource(fake_es)
+        self.assertIn("unable to find any shards to explain", source)
+        self.assertNotIn("unable to find any unassigned shards to explain", source)
+
+    def test_the_circuit_breaker_key_matches_elasticsearch(self):
+        """ES calls it inflight_requests; the fake invented in_flight_requests."""
+        breakers = build_cluster()["node_stats"]
+        found = set()
+        for node in breakers.get("nodes", {}).values():
+            found |= set(node.get("breakers", {}))
+        if found:
+            self.assertIn("inflight_requests", found)
+            self.assertNotIn("in_flight_requests", found)

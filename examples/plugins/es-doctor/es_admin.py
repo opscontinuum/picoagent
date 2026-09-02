@@ -103,6 +103,22 @@ PENDING_TASK_WARN_SECONDS = 30  # a cluster-state task queued this long means a 
 
 # ------------------------------------------------------------------ small helpers
 
+def _is_nothing_to_explain(message: str) -> bool:
+    """True for the 400 a healthy cluster returns when no shard needs explaining.
+
+    Matched on the two fragments both wordings share, because the message changed in 7.16:
+
+    * <=7.15  "unable to find any unassigned shards to explain [...]"
+    * 7.16+   "unable to find any shards to explain [...] in the routing table"
+
+    The old check looked for "unassigned shard", which appears only in the first. Against any
+    currently supported cluster a perfectly healthy answer therefore surfaced as an HTTP 400
+    error rather than "nothing is unassigned" - and the fake reproduced the old wording, so
+    the tests agreed with each other and with nothing else.
+    """
+    return "unable to find any" in message and "to explain" in message
+
+
 def _quote(index: str) -> str:
     return urllib.parse.quote(index, safe="*,-.")
 
@@ -245,7 +261,7 @@ class ShardsTool(_AdminTool):
         try:
             explain = self.es.request("POST", f"/_cluster/allocation/explain?include_disk_info={disk}", body)
         except ESError as exc:
-            if "unassigned shard" in str(exc):
+            if _is_nothing_to_explain(str(exc)):
                 # A healthy cluster answers 400 here. "Nothing is unassigned" is the answer.
                 return ["Allocation explain: no unassigned shards to explain - "
                         "every shard the cluster wants allocated is allocated."]
