@@ -52,13 +52,19 @@ class ESClient:
                       else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode() if username else "")
         if ca_cert:
             self._ctx = ssl.create_default_context(cafile=ca_cert)
+            self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         elif verify_tls:
-            self._ctx = None                       # urllib's default: verified
+            self._ctx = ssl.create_default_context()
+            self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         else:
             log.warning("es-doctor: TLS verification is OFF for %s. Anything on the network path "
                         "can read and alter this traffic, including credentials. Prefer ca_cert.",
                         self.url)
-            self._ctx = ssl._create_unverified_context()
+            # Public API rather than ssl._create_unverified_context(): same result, and this
+            # spells out exactly which two checks are being given up.
+            self._ctx = ssl.create_default_context()
+            self._ctx.check_hostname = False
+            self._ctx.verify_mode = ssl.CERT_NONE
 
     def request(self, method: str, path: str, body: dict | None = None, raw: bool = False) -> Any:
         """``raw=True`` returns the decoded body unparsed - ``_nodes/hot_threads`` answers plain
