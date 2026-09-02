@@ -347,3 +347,48 @@ class _DummyOpenAI:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArgumentNameCoverageTests(unittest.TestCase):
+    """The guard must not depend on tools naming their path argument "path".
+
+    An audit found stig_evidence takes ``repo`` and so walked the credentials directory
+    untouched. ``root``, ``directory`` and ``target`` were equally free. Enumerating argument
+    names is the same mistake as enumerating tools, one level down.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.creds = cg.credentials_path(self.tmp)
+        self.creds.parent.mkdir(parents=True, exist_ok=True)
+        cg.write_credential(self.creds, "openai", "sk-secret")
+
+    def _rt(self):
+        class FakeRt:
+            cfg = {"_user_dir": str(self.tmp)}
+        return FakeRt()
+
+    def guard(self, name, args):
+        return run(cg.guard_tool_call({"name": name, "args": args}, self._rt()))
+
+    def test_any_argument_naming_the_credentials_file_is_blocked(self):
+        for argument in ("path", "repo", "root", "directory", "target", "src", "wherever"):
+            with self.subTest(argument=argument):
+                self.assertTrue(self.guard("some_tool", {argument: str(self.creds)}),
+                                f"{argument!r} let the credentials file through")
+
+    def test_a_path_inside_a_list_argument_is_blocked(self):
+        self.assertTrue(self.guard("some_tool", {"paths": ["README.md", str(self.creds)]}))
+
+    def test_a_recursive_tool_pointed_at_the_containing_directory_is_blocked(self):
+        self.assertTrue(self.guard("stig_evidence", {"repo": str(self.creds.parent)}))
+
+    def test_unrelated_arguments_are_still_allowed(self):
+        self.assertIsNone(self.guard("stig_set", {"status": "Open",
+                                                  "finding_details": "reviewed, looks fine"}))
+        self.assertIsNone(self.guard("read", {"path": "some/other/file.py"}))
+
+    def test_non_string_arguments_do_not_raise(self):
+        """Arguments are model output: ints, bools, dicts and None must not crash the guard."""
+        self.assertIsNone(self.guard("t", {"n": 5, "ok": True, "d": {"a": 1}, "z": None,
+                                           "items": [1, 2, None]}))
