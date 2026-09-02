@@ -33,9 +33,12 @@ class EsDoctorBase(unittest.TestCase):
 
 class RegistrationTests(EsDoctorBase):
     def test_registers_tools_skills_command_and_prompt_section(self):
-        for name in ("es_cluster_health", "es_indices", "es_logs", "es_metrics", "es_correlate", "es_search", "es_request"):
+        for name in ("es_cluster_health", "es_indices", "es_logs", "es_metrics", "es_correlate", "es_search", "es_request",
+                     "es_shards", "es_recovery", "es_nodes", "es_hot_threads", "es_ilm", "es_snapshots",
+                     "es_index_inspect", "es_templates", "es_slowlog"):
             self.assertIsNotNone(self.rt.tools.get(name), name)
-        for skill in ("es-triage", "es-log-dig", "es-correlate"):
+        for skill in ("es-triage", "es-log-dig", "es-correlate", "es-unassigned-shards", "es-slow-cluster",
+                      "es-node-pressure", "es-ilm-and-retention", "es-snapshot-and-restore", "es-mappings-and-templates"):
             self.assertEqual(self.rt.skills.get(skill).source, "plugin:es-doctor")
         self.assertIsNotNone(self.rt.commands.get("es"))
         prompt = self.rt.prompt.build()

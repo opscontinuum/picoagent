@@ -1,11 +1,20 @@
 # es-doctor
 
-An Elasticsearch / Elastic Stack diagnostics plugin for picoagent. It gives the agent a
-working knowledge of how Beats and Elastic Agent lay data out (ECS fields, `logs-*`,
-`metrics-*`, `traces-apm*` data streams), tools to dig through it, and a correlation tool
-that puts log errors, host metrics and APM latency on the same timeline.
+An Elasticsearch / Elastic Stack plugin for picoagent, in two halves.
 
-No client library: everything is plain HTTP through the standard library.
+The **data** half gives the agent a working knowledge of how Beats and Elastic Agent lay data
+out (ECS fields, `logs-*`, `metrics-*`, `traces-apm*` data streams), tools to dig through it,
+and a correlation tool that puts log errors, host metrics and APM latency on the same
+timeline.
+
+The **administration** half looks at the cluster itself the way an administrator does:
+shards and why they are unassigned, node heap/disk/breaker pressure, thread-pool rejections,
+hot threads, index lifecycle management, snapshots, index internals, templates and the slow
+log. Six runbook skills turn those tools into procedures.
+
+No client library: everything is plain HTTP through the standard library. Everything reads,
+with exactly one exception (`es_slowlog enable|disable`, three named settings, after you
+confirm); every other write goes through `es_request` and its `allow_destructive` gate.
 
 ## Install
 
@@ -39,9 +48,42 @@ api_key = "..."                          # or ELASTICSEARCH_API_KEY; username/pa
 | `es_search` | raw query DSL |
 | `es_request` | raw REST; DELETE, `_delete_by_query`, `_close`, settings changes etc. are blocked unless `allow_destructive = true` |
 
-Three skills tell the model *how* to use them: `es-triage` (unhealthy cluster),
-`es-log-dig` (wide-to-narrow log investigation), `es-correlate` (reading the correlation
-table and telling cause from symptom). `/es` prints a one-line cluster summary for you.
+### Cluster administration
+
+| Tool | Purpose |
+|---|---|
+| `es_shards` | shard table with unassigned shards first and their reasons, counts by state, shards per node; `explain=true` runs the allocation explain for one shard and prints every decider |
+| `es_recovery` | active and recent recoveries (snapshot restores, relocations, replica builds) with stage and percentage, grouped by type |
+| `es_nodes` | heap, GC, CPU, load, disk and circuit breakers with thresholds flagged; `view=thread_pools` for queue depth and rejections, `view=breakers`, `view=tasks` for long-running tasks and a backed-up master queue |
+| `es_hot_threads` | `_nodes/hot_threads` passed through as plain text; `type=cpu|wait|block|mem` |
+| `es_ilm` | ILM status, per-index phase/action/step, indices stuck in ERROR with the failing step and its reason, count of unmanaged indices; `policy=` summarises a policy |
+| `es_snapshots` | repositories, recent snapshots and their state, progress of a running snapshot, SLM policies with last success and failure; `verify=true` asks first |
+| `es_index_inspect` | one index in depth: the settings that matter, mapping size against the field limit, doc/store/segment/merge/search/cache stats |
+| `es_templates` | index, component and legacy templates; `simulate_index=` resolves which template an index name wins and what overlaps it; flags data streams with no template |
+| `es_slowlog` | show or set the three slow-log warn thresholds, and look for slow-log events that were shipped in |
+
+Nine skills tell the model *how* to use all of this. `es-triage` is the entry point and
+routes to the rest: `es-unassigned-shards`, `es-slow-cluster`, `es-node-pressure`,
+`es-ilm-and-retention`, `es-snapshot-and-restore`, `es-mappings-and-templates` for the
+cluster, and `es-log-dig` / `es-correlate` for the data in it. `/es` prints a one-line
+cluster summary for you.
+
+### What it will not do
+
+No SSH and no log-file access: everything is an API call. No restore, reroute, ILM
+retry/move, index deletion or settings change other than the three slow-log keys - those
+remain `es_request` plus `allow_destructive`, and the skills say so at every branch. No
+Kibana, Fleet or Watcher APIs, no cross-cluster search or CCR, no security diagnostics, and
+no "auto-fix" mode: the tools gather evidence and the user decides.
+
+### Versions
+
+Targets Elasticsearch 7.10+ and 8.x. `_index_template`, `_component_template` and
+`_simulate_index` exist from 7.8, `_slm` from 7.4, `_ilm/explain` from 6.6. Elasticsearch 9.0
+removed the `?time` and `?local` query parameters from the cat APIs; this plugin never sent
+either, and none of the cat columns it asks for were removed. On Elastic Cloud Serverless
+most administration endpoints return 400 or 404 - the tool hands that back as an error
+result rather than raising, and the skills note what serverless does not expose.
 
 ## Try it without a cluster
 
@@ -54,6 +96,18 @@ ELASTICSEARCH_URL=http://localhost:9200 picoagent -e examples/plugins/es-doctor
 The fake holds a checkout service whose `db connection pool exhausted` errors, nginx
 upstream timeouts, CPU, memory and APM latency all spike together for five minutes.
 `es_correlate` on that window reports r≈0.99 for CPU and latency and names the spike.
+
+It also serves a canned *cluster* for the administration tools: three nodes, one of them
+over the heap and disk thresholds with a tripped breaker and a rejecting search pool; two
+unassigned shards with different reasons and different deciders; a relocating shard; an ILM
+policy stuck on a rollover-alias mismatch; three snapshots (SUCCESS, PARTIAL, IN_PROGRESS)
+and an SLM policy that failed last night; overlapping templates and a data stream with no
+template. Try `why is my cluster yellow?` or `is anything stuck in ILM?`.
+
+Every response shape it serves was copied from the Elasticsearch reference rather than
+invented, because a fake with made-up field names makes the tools wrong in production while
+the tests stay green. The pages are listed in the docstrings of `build_cluster` and
+`es_admin.py`.
 
 ## Sample correlation output
 
@@ -73,3 +127,18 @@ Top error messages during the spike:
      25  db connection pool exhausted: timeout acquiring connection
      12  upstream timed out (N: Connection timed out) while reading response
 ```
+
+## Layout
+
+```
+plugin.toml
+es_client.py    ESClient, ESError, Settings, the tool base class and the two output helpers
+es_doctor.py    the data tools (logs, metrics, correlation, search, raw request) and register()
+es_admin.py     the nine cluster-administration tools
+skills/         nine runbooks
+```
+
+`es_client.py` exists because the plugin loader imports the entry module under a mangled
+name and rebuilds it on every load: a sibling that imported `ESError` from `es_doctor`
+would get a second, unrelated class, and `except ESError` would silently stop catching.
+A module both sides import by its plain name keeps one identity.
