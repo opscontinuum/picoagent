@@ -143,6 +143,8 @@ See `examples/plugins/`: `permission-gate`, `compaction`, `grok-provider`, `vert
 | [docs/plugin-authoring.md](docs/plugin-authoring.md) | write tools, providers, commands, frontends |
 | [docs/events-reference.md](docs/events-reference.md) | know every lifecycle event and what handlers may return |
 | [docs/testing-and-conventions.md](docs/testing-and-conventions.md) | run/extend the tests, follow the code style |
+| [docs/engineering/](docs/engineering/) | see the diagrams: modules, request lifecycle, data model, plugin trust flow |
+| [docs/security/](docs/security/) | trust boundaries, and where a credential can and cannot travel |
 | `harness-research-and-design.md` (separate file) | see the Claude Code / Codex / Pi / OpenCode research this distils |
 
 ## Tests
