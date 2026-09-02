@@ -5,6 +5,10 @@
 The core is a loop that sends a conversation to a model, runs the tools the model asks for,
 and repeats; everything else attaches to that loop through events.
 
+Diagrams for everything below live in [engineering/](engineering/): module dependencies and
+the override model, the request lifecycle, the data model, and the plugin trust flow. Security
+boundaries are in [security/trust-boundaries.md](security/trust-boundaries.md).
+
 ## The pieces
 
 ```
