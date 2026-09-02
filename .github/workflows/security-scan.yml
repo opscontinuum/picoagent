@@ -1,0 +1,141 @@
+# Static analysis of what actually ships, following the pattern already in use
+# on elasticsearch-oci-s3-workaround.
+#
+# The distinction that pattern is built around applies here too: every
+# credential-shaped string a scanner finds in this repository lives under
+# tests/, and tests/ is not part of the installed package. Scanning the whole
+# working tree produces a report about a tree nobody receives, full of findings
+# in fixtures nobody runs.
+#
+# picoagent has no bundling step - `pip install .` ships the picoagent/ package
+# directory as-is - so the scan is pointed at that plus the example plugins,
+# which are real code people load. There is no archive to unpack first.
+name: security scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+
+      # The suite is the gate. Standard library only, no network, nothing to
+      # install.
+      - name: Run the test suite
+        run: python3 -m unittest discover -s tests -q
+
+      - name: Assemble what ships
+        run: |
+          mkdir -p scan
+          cp -r picoagent examples scan/
+          echo "SCAN_ROOT=scan" >> "$GITHUB_ENV"
+
+      # A scanner that walked nothing reports exactly what a clean codebase
+      # reports. This has already happened once on a sibling project: a
+      # whole-tree Trivy run returned zero findings, reproducibly, while a
+      # split scan of the same tree found real ones. Count the files first and
+      # fail loudly rather than reading silence as safety.
+      - name: Refuse to scan an empty corpus
+        run: |
+          count=$(find "$SCAN_ROOT" -name '*.py' | wc -l)
+          echo "python files to scan: $count"
+          if [ "$count" -lt 25 ]; then
+            echo "::error::only $count python files found; the copy step is wrong"
+            exit 1
+          fi
+
+      - name: Bandit
+        run: |
+          pip install --quiet --only-binary :all: bandit==1.9.4
+          bandit --version
+          bandit -r "$SCAN_ROOT" -f json -o bandit_raw.json --severity-level low || true
+          python3 -c "
+          import json
+          d = json.load(open('bandit_raw.json'))
+          m = d['metrics']['_totals']
+          print('bandit: %d loc, high=%s medium=%s low=%s' % (
+              m['loc'], m['SEVERITY.HIGH'], m['SEVERITY.MEDIUM'], m['SEVERITY.LOW']))
+          assert m['loc'] > 0, 'bandit scanned zero lines'
+          "
+
+      # Rulesets are named rather than resolved with --config=auto, so the set
+      # that ran is readable from this file and a registry change cannot
+      # quietly alter a scan.
+      - name: Semgrep
+        run: |
+          pip install --quiet --only-binary :all: semgrep==1.175.0
+          semgrep --version
+          semgrep scan --config=p/python --config=p/secrets \
+            --json --output=semgrep_raw.json --metrics=off "$SCAN_ROOT" || true
+          python3 -c "
+          import json
+          d = json.load(open('semgrep_raw.json'))
+          scanned = len(d.get('paths', {}).get('scanned', []))
+          print('semgrep: %d files scanned, %d findings' % (scanned, len(d.get('results', []))))
+          assert scanned > 0, 'semgrep scanned zero files'
+          "
+
+      # Pinned by tag rather than tracking master: whatever master points at
+      # that day would otherwise run with this workflow's permissions, and a
+      # tag is something Dependabot can see where a branch is not.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: scan
+          format: json
+          output: trivy_raw.json
+          scanners: secret,misconfig,vuln
+          exit-code: "0"
+
+      # picoagent declares no third-party runtime dependencies, so the vuln
+      # scanner has nothing to resolve. That is the expected result rather than
+      # a broken scan, and saying so here means a future reader does not have
+      # to rediscover it. Recorded as evidence in its own right.
+      - name: Record the dependency surface
+        run: |
+          python3 - <<'PY'
+          import tomllib, json
+          with open("pyproject.toml", "rb") as fh:
+              declared = tomllib.load(fh)["project"].get("dependencies", [])
+          print(f"declared runtime dependencies: {len(declared)} {declared}")
+          json.dump({"declared_runtime_dependencies": declared}, open("dependencies.json", "w"))
+          PY
+
+      # Redact before anything is uploaded. Scanners quote what they matched,
+      # and an artifact is a second copy of that with none of the context that
+      # explains why it was harmless.
+      - name: Redact scan artifacts
+        run: |
+          python3 - <<'PY'
+          import glob, re
+          MARKER = re.compile(r"-*(?:BEGIN|END)\s+[A-Z ]*PRIVATE KEY-*[*]*")
+          BLOB = re.compile(r"(?:[A-Za-z0-9+/]{60,}={0,2}\s*){2,}")
+          for path in glob.glob("*_raw.json"):
+              text = open(path).read()
+              text = MARKER.sub("<<<Redacted: private key detected here>>>", text)
+              text = BLOB.sub("<<<Redacted>>>", text)
+              open(path, "w").write(text)
+              print("redacted", path)
+          PY
+          grep -lE "BEGIN [A-Z ]*PRIVATE KEY" *_raw.json && exit 1 || echo "no key material in artifacts"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: scan-${{ github.sha }}
+          path: |
+            bandit_raw.json
+            semgrep_raw.json
+            trivy_raw.json
+            dependencies.json

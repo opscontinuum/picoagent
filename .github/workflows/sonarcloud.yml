@@ -1,0 +1,108 @@
+# SonarQube Cloud analysis, following the pattern already in use on
+# elasticsearch-oci-s3-workaround.
+#
+# The project key and organization are public identifiers, not secrets, so they
+# are literals below. One thing is needed that cannot be committed:
+#
+#   SONAR_TOKEN   repository secret. SonarQube Cloud > avatar > My account >
+#                 Security, https://sonarcloud.io/account/security/
+#
+# Until it is set the analysis step is skipped and the job reports green, so a
+# red check here means the analysis failed rather than that nobody has signed
+# up yet.
+name: SonarCloud analysis
+
+# Manual only, deliberately. SonarQube Cloud refuses a CI analysis while
+# Automatic Analysis is enabled for the project: the scanner exits 3 and the
+# job goes red. If Automatic Analysis is turned off for this project, restore
+# the push and pull_request triggers; nothing else needs to change.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read       # for actions/checkout
+  pull-requests: read  # lets SonarCloud decorate pull requests with results
+
+jobs:
+  Analysis:
+    runs-on: ubuntu-latest
+
+    # Read once here so the gate below can test it. The secrets context is not
+    # available to a job-level `if`, which is what makes this shape necessary.
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+    steps:
+      - name: Decide whether SonarCloud is configured
+        id: gate
+        run: |
+          if [ -z "$SONAR_TOKEN" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SONAR_TOKEN is not set, so there is nothing to authenticate with. Skipping the analysis. Set it under Settings > Secrets and variables > Actions > Secrets."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          # Sonar attributes a line to the commit that wrote it. Without full
+          # history it sees one commit and blames everything on it.
+          fetch-depth: 0
+
+      - name: Analyze with SonarCloud
+        if: steps.gate.outputs.ready == 'true'
+        # sonarcloud-github-action is archived. This is its named replacement,
+        # v8.2.1, pinned by commit.
+        uses: SonarSource/sonarqube-scan-action@22918119ff8e1ca75a623e15c8296b6ea4fbe28f
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          # picoagent/ is the shipped package and examples/ are real plugins
+          # people load, so findings in both are worth acting on. .github is
+          # maintained code too.
+          #
+          # docs/ is prose and diagrams. tests/ is declared as tests rather
+          # than sources on purpose: it contains credential-shaped fixtures
+          # ("sk-abc123", "sk-supersecret-1234") that exist precisely to be
+          # matched by the code under test. Listing them as sources reports
+          # planted strings as committed secrets, and a dashboard that cries
+          # wolf stops being read.
+          args: >
+            -Dsonar.projectKey=opscontinuum_picoagent
+            -Dsonar.organization=opscontinuum
+            -Dsonar.projectName=picoagent
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.python.version=3.11
+            -Dsonar.sources=picoagent,examples,.github
+            -Dsonar.tests=tests
+            -Dsonar.qualitygate.wait=true
+          projectBaseDir: .
+
+      # The scanner writes the analysis it just submitted, so the export below
+      # is tied to this run rather than to whatever happened to be newest.
+      - name: Export the findings this analysis produced
+        if: always() && steps.gate.outputs.ready == 'true'
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mkdir -p sonar-export
+          key=opscontinuum_picoagent
+          curl -sS -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/issues/search?componentKeys=$key&ps=500&resolved=false" \
+            -o sonar-export/issues.json
+          curl -sS -u "$SONAR_TOKEN:" \
+            "https://sonarcloud.io/api/measures/component?component=$key&metricKeys=bugs,vulnerabilities,code_smells,security_hotspots,ncloc,duplicated_lines_density,new_violations" \
+            -o sonar-export/measures.json
+          for f in issues measures; do
+            sha256sum "sonar-export/$f.json" > "sonar-export/$f.json.sha256"
+          done
+          python3 -c "import json;print('unresolved issues:', json.load(open('sonar-export/issues.json'))['total'])"
+
+      - name: Keep the export with the run
+        if: always() && steps.gate.outputs.ready == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sonar-findings-${{ github.sha }}
+          path: sonar-export/
+          retention-days: 90
