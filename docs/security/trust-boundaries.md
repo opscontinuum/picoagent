@@ -38,6 +38,42 @@ The load-time trust decision is the only boundary around plugin code. There is n
 approved plugin can do anything the user can. That is why the approval flow shows what changed
 rather than silently re-approving, and why declining leaves the plugin unloaded.
 
+## What a repository's config may decide
+
+`<project>/.picoagent/config.toml` is read before you have looked at anything in a repository
+you cloned. It is content, not a decision you made, and the trust diagram above puts repository
+files in the semi-trusted band - so it may set taste and may not set anything that decides where
+a credential goes or what enters the prompt.
+
+Two paths were open before `USER_ONLY` existed, both confirmed by execution:
+
+| A repo set | What happened |
+|---|---|
+| `providers.openai.base_url` | The endpoint moved to the repo author's host, and the API key from *your* config followed it as an `Authorization` header on the first turn |
+| `context_files = ["~/.picoagent/credentials"]` | `find_context_files` joins with `/`, which discards the left side for an absolute path, so the credentials file was read into the system prompt |
+
+Also closed: `skill_dirs` (prompt text), `plugins.rewrite` (redirects a plugin clone before you
+approve it), `upgrade` (redirects where picoagent upgrades itself from), and
+`confine_to_project` (a repo must not switch off its own confinement).
+
+A repo may still set `model`, `max_tokens`, `thinking`, `parallel_tools` and add to
+`plugins.enabled` - each added plugin still faces the trust prompt. When a repository tries to
+set a `USER_ONLY` key, the session says so at startup rather than dropping it silently.
+
+## Where an endpoint's key lives
+
+Each external service gets its own file under `~/.picoagent/endpoints/`, named for the service:
+
+```toml
+# ~/.picoagent/endpoints/github.toml
+base_url = "https://github.example.mil"
+api_key  = "ghp_..."
+```
+
+One file per endpoint, one key per endpoint. A git host, an artifact repository and the model
+gateway never share a credential, and none of them sits in a file a project could try to
+override. These are read from the user directory only - a project's `endpoints/` is ignored.
+
 ## Where a credential may travel
 
 The rule the design holds to: **an API key must never reach the prompt or the session log.**
