@@ -9,52 +9,52 @@ next. That is the whole extension mechanism: there are no other hooks.
 sequenceDiagram
     actor User
     participant FE as Frontend
-    participant Loop as AgentLoop
+    participant Agent as AgentLoop
     participant Bus as EventBus
     participant Prov as Provider
     participant Tools as ToolRegistry
     participant Sess as Session
 
-    User->>Loop: handle_input(text)
+    User->>Agent: handle_input(text)
 
     alt text is a slash command
-        Loop->>Loop: commands.parse()
-        Loop-->>FE: notice(result)
-        Note over Loop,Sess: no model call, and nothing<br/>is written to the session
+        Agent->>Agent: commands.parse()
+        Agent-->>FE: notice(result)
+        Note over Agent,Sess: no model call, and nothing<br/>is written to the session
     else ordinary prompt
-        Loop->>Bus: input
-        Bus-->>Loop: text, or "handled" to stop here
-        Loop->>Loop: skills.expand()
-        Loop->>Loop: prompt.build() + skills.prompt_section()
-        Loop->>Bus: before_agent_start
-        Bus-->>Loop: system prompt, optional injected message
-        Loop->>Sess: append user message
+        Agent->>Bus: input
+        Bus-->>Agent: text, or "handled" to stop here
+        Agent->>Agent: skills.expand()
+        Agent->>Agent: prompt.build() + skills.prompt_section()
+        Agent->>Bus: before_agent_start
+        Bus-->>Agent: system prompt, optional injected message
+        Agent->>Sess: append user message
 
         loop until the model stops calling tools
-            Loop->>Bus: turn_start
-            Loop->>Bus: context
-            Bus-->>Loop: history (compaction rewrites it here)
-            Loop->>Prov: stream(system, messages, tools)
+            Agent->>Bus: turn_start
+            Agent->>Bus: context
+            Bus-->>Agent: history (compaction rewrites it here)
+            Agent->>Prov: stream(system, messages, tools)
             Prov-->>FE: text and thinking deltas
-            Prov-->>Loop: assembled tool calls
+            Prov-->>Agent: assembled tool calls
 
             opt the model asked for tools
-                Loop->>Bus: tool_call, once per call in order
-                Bus-->>Loop: allow, rewrite args, or block
-                Loop->>Tools: execute (parallel; file edits serialise)
-                Tools-->>Loop: ToolResult per call
-                Loop->>Bus: tool_result
-                Bus-->>Loop: patched content
-                Loop-->>FE: tool_result
-                Loop->>Sess: append tool results
+                Agent->>Bus: tool_call, once per call in order
+                Bus-->>Agent: allow, rewrite args, or block
+                Agent->>Tools: execute in parallel, file edits serialise
+                Tools-->>Agent: ToolResult per call
+                Agent->>Bus: tool_result
+                Bus-->>Agent: patched content
+                Agent-->>FE: tool_result
+                Agent->>Sess: append tool results
             end
 
-            Loop->>Bus: turn_end
+            Agent->>Bus: turn_end
         end
 
-        Loop->>Bus: agent_end
-        Loop-->>Loop: queued follow-ups? run again
-        Loop->>Bus: agent_settled
+        Agent->>Bus: agent_end
+        Agent-->>Agent: queued follow-ups? run again
+        Agent->>Bus: agent_settled
     end
 ```
 
