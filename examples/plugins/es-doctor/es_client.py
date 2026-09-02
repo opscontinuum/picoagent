@@ -50,19 +50,17 @@ class ESClient:
         self.url = url.rstrip("/")
         self._auth = (f"ApiKey {api_key}" if api_key
                       else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode() if username else "")
-        if ca_cert:
-            self._ctx = ssl.create_default_context(cafile=ca_cert)
-            self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        elif verify_tls:
-            self._ctx = ssl.create_default_context()
-            self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        else:
+        # One context, built secure, then weakened only on the explicit opt-out. Written this
+        # way so the protocol floor is set on every path - including the insecure one, where
+        # giving up certificate checking is no reason to also accept TLS 1.0.
+        self._ctx = ssl.create_default_context(cafile=ca_cert) if ca_cert else ssl.create_default_context()
+        self._ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        if not ca_cert and not verify_tls:
             log.warning("es-doctor: TLS verification is OFF for %s. Anything on the network path "
                         "can read and alter this traffic, including credentials. Prefer ca_cert.",
                         self.url)
             # Public API rather than ssl._create_unverified_context(): same result, and this
             # spells out exactly which two checks are being given up.
-            self._ctx = ssl.create_default_context()
             self._ctx.check_hostname = False
             self._ctx.verify_mode = ssl.CERT_NONE
 
