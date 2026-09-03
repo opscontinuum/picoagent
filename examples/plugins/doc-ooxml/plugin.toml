@@ -1,0 +1,7 @@
+name = "doc-ooxml"
+version = "0.1.0"
+entry = "doc_ooxml:register"
+description = "Read .docx and .xlsx as evidence with the standard library alone: confirm a quotation resolves to a heading or a cell before citing it, tell a Word template's italic instructions from its content, and see which sections are still empty"
+requires = ["picoagent>=0.1"]
+python_deps = []
+skills = ["skills"]

@@ -190,6 +190,7 @@ In `examples/plugins/`. All are standard-library only except `doc-pdf`, which is
 | `es-doctor` | Elasticsearch administration and troubleshooting over the API - digs through Beats/Elastic Agent logs and correlates them with metrics and APM |
 | `stig-runner` | Runs a DISA ASD STIG from a `.ckl` against a repository, with a human deciding every determination |
 | `iscp-author` | Interview-driven FedRAMP ISCP, BIA and DR runbooks, with a provenance-checked renderer |
+| `doc-ooxml` | Reads `.docx` and `.xlsx` as evidence: confirms a quotation resolves to a heading or a cell, tells a Word template's italic instructions from its content, and shows which sections are still empty. Standard library only |
 | `doc-pdf` | Reads a PDF as evidence: confirms a quotation resolves to a page before it is cited. **Needs PyMuPDF (AGPL-3.0 or commercial)** |
 
 ## Companion plugin repos
