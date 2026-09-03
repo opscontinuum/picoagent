@@ -128,7 +128,58 @@ A reasonable split is to seed the routine fields and reconcile the load-bearing 
 assignment, MTD, business owner - since those are exactly where a human's wrong assumption is
 expensive. Decide before building the discovery layer; it is cheaper now than later.
 
-## 6. What exists today
+## 6. Document ingestion is several plugins, not one
+
+> "keep them as separate plugins(tools)"
+> - 2026-09-03, rejecting a proposal to bundle OOXML reading, PDF reading and the instrument
+> cache into a single plugin.
+
+Reading a document is three different problems with three different costs, and bundling them
+would force every user to pay all three. The split:
+
+| Plugin | Reads | `python_deps` | Network |
+|---|---|---|---|
+| `doc-ooxml` | `.docx` paragraphs and heading levels, `.xlsx` sheets and cells | none - `zipfile` + `xml.etree` | none |
+| `doc-pdf` | Page-boundary-preserving text, with span-level font attribution | one PDF library | none |
+| `instrument-cache` | Fetches a pinned instrument once, verifies its hash, serves it from disk | none | the only plugin with egress |
+
+Three things follow from the split, and they are the reason for it.
+
+**The dependency question stays in one place.** Everything except PDF is stdlib: OOXML is a zip of
+XML parts, so `.docx` and `.xlsx` need nothing beyond `zipfile` and `xml.etree` (verified
+2026-09-03 against the FedRAMP ISCP template and the Rev. 5 baseline workbook - 793 paragraphs and
+all seven sheet names, including the `High Baseline` sheet the audit skill cites). PDF is the sole
+format that needs a third-party package, so `doc-pdf` becomes the first plugin with a non-empty
+`python_deps`, and the only one. A site that cannot accept that dependency loses PDF and keeps
+everything else.
+
+**Licence risk is contained.** The audit skill names PyMuPDF, which is AGPL-3.0 or commercial.
+That is a question a federal or DoD site has to answer deliberately rather than inherit, and it
+should be answerable by declining one plugin. `pdfplumber` (MIT, on `pdfminer.six`) is the
+licence-clean substitute that keeps both properties `iscp-author` actually depends on - page
+boundaries and per-character font names, the latter being how NIST's italic guidance text is told
+apart from template body text. Benchmark before committing.
+
+**Air-gapped operation becomes a deployment choice, not a rewrite.** `instrument-cache` owns the
+only network egress in the set, against a pinned allowlist with hash verification, so the
+instruments can be fetched on a connected host and the populated cache directory shipped inward.
+Every other plugin then runs with no network at all. This is what the owner's standing constraint
+requires - tools "need to not rely on public API's if possible as some security postures wont
+allow it" (2026-08) - and a single bundled plugin could not satisfy it, because denying the plugin
+to block egress would also remove the ability to read a Word file.
+
+*(Inference.)* `doc-ooxml` is not only for the audit path. A customer's existing contingency plan
+usually lives in Word, not markdown, so the same plugin is what lets `iscp-author` ingest what an
+organisation already has instead of assuming a greenfield repository. The `itscp-compliance-audit`
+skill in `opscontinuum/oci-itscp` currently hardcodes a list of `.md` paths as its scope; that
+limit is a consequence of having no ingestion plugin, not a deliberate boundary.
+
+**Not decided:** whether extracted text is cached alongside the source in `instrument-cache` or
+re-extracted per run. Re-extraction is simpler and keeps the cache a pure byte store; caching the
+dump is faster and is what the audit skill's "grep every quote against the extracted source text"
+check reads from.
+
+## 7. What exists today
 
 | Component | Does |
 |---|---|
@@ -137,5 +188,6 @@ expensive. Decide before building the discovery layer; it is cheaper now than la
 | `examples/plugins/stig-runner` | Runs a DISA ASD STIG from a CKL file against a repository, human-gated |
 | `opscontinuum/oci-itscp` | The worked ITSCP reference: Oracle EBS on Exadata, Ashburn to Phoenix |
 
-Not built: COOP generation, Ansible ingestion, the dependency-edge extraction, the SLI and alert
-catalogue artefacts, and the discovery-to-interview reconciliation.
+Not built: the three ingestion plugins of section 6, COOP generation, Ansible ingestion, the
+dependency-edge extraction, the SLI and alert catalogue artefacts, and the discovery-to-interview
+reconciliation.
