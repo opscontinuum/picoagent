@@ -9,6 +9,7 @@ what the data looks like, and how plugins get loaded. Narrative lives in
 | [system-overview.md](system-overview.md) | What are the modules, which way do dependencies point, and how does an override win? |
 | [request-lifecycle.md](request-lifecycle.md) | What happens between typing a prompt and getting an answer, and where can a plugin intervene? |
 | [data-model.md](data-model.md) | What are the core types, and why is a session a tree rather than a list? |
+| [continuity-tooling.md](continuity-tooling.md) | What are the continuity plugins for, how do ISCP/ITSCP/COOP differ, and where is this going? |
 | [plugin-lifecycle.md](plugin-lifecycle.md) | How does a plugin get discovered, trusted, loaded, and what happens when its code changes? |
 
 Diagrams are [Mermaid](https://mermaid.js.org/) in fenced blocks, which GitHub renders
