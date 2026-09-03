@@ -128,7 +128,102 @@ A reasonable split is to seed the routine fields and reconcile the load-bearing 
 assignment, MTD, business owner - since those are exactly where a human's wrong assumption is
 expensive. Decide before building the discovery layer; it is cheaper now than later.
 
-## 6. What exists today
+## 6. Document ingestion is several plugins, not one
+
+> "keep them as separate plugins(tools)"
+> - 2026-09-03, rejecting a proposal to bundle OOXML reading, PDF reading and the instrument
+> cache into a single plugin.
+
+Reading a document is three different problems with three different costs, and bundling them
+would force every user to pay all three. The split:
+
+| Plugin | Reads | `python_deps` | Network |
+|---|---|---|---|
+| `doc-ooxml` | `.docx` paragraphs and heading levels, `.xlsx` sheets and cells | none - `zipfile` + `xml.etree` | none |
+| `doc-pdf` | Page-boundary-preserving text, with span-level font attribution | one PDF library | none |
+| `instrument-cache` | Fetches a pinned instrument once, verifies its hash, serves it from disk | none | the only plugin with egress |
+
+Three things follow from the split, and they are the reason for it.
+
+**The dependency question stays in one place.** Everything except PDF is stdlib: OOXML is a zip of
+XML parts, so `.docx` and `.xlsx` need nothing beyond `zipfile` and `xml.etree` (verified
+2026-09-03 against the FedRAMP ISCP template and the Rev. 5 baseline workbook - 793 paragraphs and
+all seven sheet names, including the `High Baseline` sheet the audit skill cites). PDF is the sole
+format that needs a third-party package, so `doc-pdf` becomes the first plugin with a non-empty
+`python_deps`, and the only one. A site that cannot accept that dependency loses PDF and keeps
+everything else.
+
+**Licence risk is contained.** The audit skill names PyMuPDF, which is AGPL-3.0 or commercial.
+That is a question a federal or DoD site has to answer deliberately rather than inherit, and it
+should be answerable by declining one plugin. `pdfplumber` (MIT, on `pdfminer.six`) is the
+licence-clean substitute that keeps both properties `iscp-author` actually depends on - page
+boundaries and per-character font names, the latter being how NIST's italic guidance text is told
+apart from template body text. Benchmark before committing.
+
+**Air-gapped operation becomes a deployment choice, not a rewrite.** `instrument-cache` owns the
+only network egress in the set, against a pinned allowlist with hash verification, so the
+instruments can be fetched on a connected host and the populated cache directory shipped inward.
+Every other plugin then runs with no network at all. This is what the owner's standing constraint
+requires - tools "need to not rely on public API's if possible as some security postures wont
+allow it" (2026-08) - and a single bundled plugin could not satisfy it, because denying the plugin
+to block egress would also remove the ability to read a Word file.
+
+*(Inference.)* `doc-ooxml` is not only for the audit path. A customer's existing contingency plan
+usually lives in Word, not markdown, so the same plugin is what lets `iscp-author` ingest what an
+organisation already has instead of assuming a greenfield repository. The `itscp-compliance-audit`
+skill in `opscontinuum/oci-itscp` currently hardcodes a list of `.md` paths as its scope; that
+limit is a consequence of having no ingestion plugin, not a deliberate boundary.
+
+**Not decided:** whether extracted text is cached alongside the source in `instrument-cache` or
+re-extracted per run. Re-extraction is simpler and keeps the cache a pure byte store; caching the
+dump is faster and is what the audit skill's "grep every quote against the extracted source text"
+check reads from.
+
+## 7. Proposed: generate the Record of Changes from git
+
+> "I merged #6 in iscp but i would think we would pull the record of changes directly out of
+> git from the main PR's"
+> - 2026-09-03
+
+*(Proposed, not built.)* `opscontinuum/oci-itscp` PR #6 added a Record of Changes as a
+hand-maintained table. The objection is the same principle as section 2: a plan should not
+restate by hand what the system already records. Every change to that plan arrives as a pull
+request merged to `main`, so the repository already holds the authoritative change history -
+and a hand-kept table is a second copy that will drift from it.
+
+**What git already carries.** A squash merge produces one commit per PR on `main` whose subject
+ends `(#N)`, with an author and an author date. That supplies three of the four columns the
+FedRAMP ISCP template's Revision History asks for - Date, Description, Author - leaving only
+**Version**, which git does not carry until something assigns it. A tag per released revision of
+the plan is the obvious source; deriving it from a count of merges is not, because a revision
+number that changes when someone fixes a typo is not a revision number.
+
+**What a generator must not silently drop.** A record of changes is an approved artefact, not a
+commit log with different column headings. Two things distinguish them and both have to be
+handled deliberately rather than by default:
+
+1. **Not every merge is a plan change.** CI configuration, README wording and tooling commits are
+   not revisions of the plan. The generator needs an explicit rule for what counts - a path
+   filter over the plan's own scope is the honest one, since it is checkable, unlike a
+   convention that depends on people writing the right commit subject.
+2. **Approval is a separate fact from merge.** Who merged a PR is not who approved the plan
+   revision. Where a signature is required, the generated table is the *candidate* and the
+   approval is recorded against it, not inferred from the merge.
+
+**Generate, but commit the output.** The generated table is written into the plan and checked in,
+not produced on demand. A contingency plan has to be readable during the disruption it covers,
+when the repository host, the network and the tooling are all things that may be unavailable -
+the same reason NIST requires outage-assessment personnel to be able to work "in the event the
+plan is inaccessible". A plan whose change history only exists as the output of a command is a
+plan with a dependency on the thing that just failed.
+
+*(Inference.)* This generalises past the record of changes. The same argument applies to any
+section that restates something the repository already holds - the configuration-item inventory
+`iac_inventory.py` already derives from Terraform is the existing example of the pattern, and the
+tier table, the interconnection list and the drill history are candidates. The rule worth keeping
+is: derive it, commit the derivation, and let the audit trail be the diff.
+
+## 8. What exists today
 
 | Component | Does |
 |---|---|
@@ -137,5 +232,6 @@ expensive. Decide before building the discovery layer; it is cheaper now than la
 | `examples/plugins/stig-runner` | Runs a DISA ASD STIG from a CKL file against a repository, human-gated |
 | `opscontinuum/oci-itscp` | The worked ITSCP reference: Oracle EBS on Exadata, Ashburn to Phoenix |
 
-Not built: COOP generation, Ansible ingestion, the dependency-edge extraction, the SLI and alert
+Not built: the three ingestion plugins of section 6, the record-of-changes generator of
+section 7, COOP generation, Ansible ingestion, the dependency-edge extraction, the SLI and alert
 catalogue artefacts, and the discovery-to-interview reconciliation.
