@@ -179,7 +179,51 @@ re-extracted per run. Re-extraction is simpler and keeps the cache a pure byte s
 dump is faster and is what the audit skill's "grep every quote against the extracted source text"
 check reads from.
 
-## 7. What exists today
+## 7. Proposed: generate the Record of Changes from git
+
+> "I merged #6 in iscp but i would think we would pull the record of changes directly out of
+> git from the main PR's"
+> - 2026-09-03
+
+*(Proposed, not built.)* `opscontinuum/oci-itscp` PR #6 added a Record of Changes as a
+hand-maintained table. The objection is the same principle as section 2: a plan should not
+restate by hand what the system already records. Every change to that plan arrives as a pull
+request merged to `main`, so the repository already holds the authoritative change history -
+and a hand-kept table is a second copy that will drift from it.
+
+**What git already carries.** A squash merge produces one commit per PR on `main` whose subject
+ends `(#N)`, with an author and an author date. That supplies three of the four columns the
+FedRAMP ISCP template's Revision History asks for - Date, Description, Author - leaving only
+**Version**, which git does not carry until something assigns it. A tag per released revision of
+the plan is the obvious source; deriving it from a count of merges is not, because a revision
+number that changes when someone fixes a typo is not a revision number.
+
+**What a generator must not silently drop.** A record of changes is an approved artefact, not a
+commit log with different column headings. Two things distinguish them and both have to be
+handled deliberately rather than by default:
+
+1. **Not every merge is a plan change.** CI configuration, README wording and tooling commits are
+   not revisions of the plan. The generator needs an explicit rule for what counts - a path
+   filter over the plan's own scope is the honest one, since it is checkable, unlike a
+   convention that depends on people writing the right commit subject.
+2. **Approval is a separate fact from merge.** Who merged a PR is not who approved the plan
+   revision. Where a signature is required, the generated table is the *candidate* and the
+   approval is recorded against it, not inferred from the merge.
+
+**Generate, but commit the output.** The generated table is written into the plan and checked in,
+not produced on demand. A contingency plan has to be readable during the disruption it covers,
+when the repository host, the network and the tooling are all things that may be unavailable -
+the same reason NIST requires outage-assessment personnel to be able to work "in the event the
+plan is inaccessible". A plan whose change history only exists as the output of a command is a
+plan with a dependency on the thing that just failed.
+
+*(Inference.)* This generalises past the record of changes. The same argument applies to any
+section that restates something the repository already holds - the configuration-item inventory
+`iac_inventory.py` already derives from Terraform is the existing example of the pattern, and the
+tier table, the interconnection list and the drill history are candidates. The rule worth keeping
+is: derive it, commit the derivation, and let the audit trail be the diff.
+
+## 8. What exists today
 
 | Component | Does |
 |---|---|
@@ -188,6 +232,6 @@ check reads from.
 | `examples/plugins/stig-runner` | Runs a DISA ASD STIG from a CKL file against a repository, human-gated |
 | `opscontinuum/oci-itscp` | The worked ITSCP reference: Oracle EBS on Exadata, Ashburn to Phoenix |
 
-Not built: the three ingestion plugins of section 6, COOP generation, Ansible ingestion, the
-dependency-edge extraction, the SLI and alert catalogue artefacts, and the discovery-to-interview
-reconciliation.
+Not built: the three ingestion plugins of section 6, the record-of-changes generator of
+section 7, COOP generation, Ansible ingestion, the dependency-edge extraction, the SLI and alert
+catalogue artefacts, and the discovery-to-interview reconciliation.
