@@ -178,7 +178,19 @@ developing a plugin, when re-approving after every edit would be noise.
 
 ## Example plugins
 
-See `examples/plugins/`: `permission-gate`, `compaction`, `grok-provider`, `vertex-provider`, and `es-doctor` (an Elasticsearch diagnostics plugin that digs through Beats/Elastic Agent logs and correlates them with metrics and APM - a worked example of a domain-specific plugin).
+In `examples/plugins/`. All are standard-library only except `doc-pdf`, which is the only plugin in the repository that declares a `python_deps`.
+
+| Plugin | Does |
+|---|---|
+| `permission-gate` | Holds protected paths behind a user prompt |
+| `compaction` | Summarises the conversation when the context window fills |
+| `credential-guard` | Keeps credential files out of tool reads and out of the prompt |
+| `keyring-secrets` | Stores provider keys in the OS keyring instead of a config file |
+| `grok-provider`, `vertex-provider` | Additional model providers |
+| `es-doctor` | Elasticsearch administration and troubleshooting over the API - digs through Beats/Elastic Agent logs and correlates them with metrics and APM |
+| `stig-runner` | Runs a DISA ASD STIG from a `.ckl` against a repository, with a human deciding every determination |
+| `iscp-author` | Interview-driven FedRAMP ISCP, BIA and DR runbooks, with a provenance-checked renderer |
+| `doc-pdf` | Reads a PDF as evidence: confirms a quotation resolves to a page before it is cited. **Needs PyMuPDF (AGPL-3.0 or commercial)** |
 
 ## Companion plugin repos
 

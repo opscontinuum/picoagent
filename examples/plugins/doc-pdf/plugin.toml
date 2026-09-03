@@ -1,0 +1,7 @@
+name = "doc-pdf"
+version = "0.1.0"
+entry = "doc_pdf:register"
+description = "Read a PDF as evidence: confirm a quotation resolves to a page before citing it, pin the edition by hash, and tell a document's italic guidance apart from its regular-type content"
+requires = ["picoagent>=0.1"]
+python_deps = ["pymupdf>=1.24"]
+skills = ["skills"]
