@@ -303,9 +303,9 @@ def _node_stats() -> dict:
                 "fielddata": {"limit_size_in_bytes": 12 * gigabyte, "limit_size": "12gb",
                               "estimated_size_in_bytes": 8 * gigabyte, "estimated_size": "8gb",
                               "overhead": 1.03, "tripped": fielddata_tripped},
-                "in_flight_requests": {"limit_size_in_bytes": 30 * gigabyte, "limit_size": "30gb",
-                                       "estimated_size_in_bytes": 1024, "estimated_size": "1kb",
-                                       "overhead": 2.0, "tripped": 0},
+                "inflight_requests": {"limit_size_in_bytes": 30 * gigabyte, "limit_size": "30gb",
+                                      "estimated_size_in_bytes": 1024, "estimated_size": "1kb",
+                                      "overhead": 2.0, "tripped": 0},
                 "parent": {"limit_size_in_bytes": 28 * gigabyte, "limit_size": "28gb",
                            "estimated_size_in_bytes": int(28 * gigabyte * heap_pct / 100),
                            "estimated_size": f"{int(28 * heap_pct / 100)}gb",
@@ -939,8 +939,12 @@ class ESHandler(BaseHTTPRequestHandler):
         found = explains.get(key) or explains.get("_default")
         if found is None:
             return {"error": {"type": "illegal_argument_exception",
-                              "reason": "unable to find any unassigned shards to explain "
-                                        "[ClusterAllocationExplainRequest[useAnyUnassignedShard=true]]"},
+                              # 7.16 dropped "unassigned" from this message and it has stayed
+                              # that way through 8.x and 9.x. Serving the <=7.15 wording made
+                              # the plugin's matcher look correct against a version nobody runs.
+                              "reason": "unable to find any shards to explain "
+                                        "[ClusterAllocationExplainRequest[useAnyUnassignedShard=true]] "
+                                        "in the routing table"},
                     "status": 400}, 400
         return found, 200
 

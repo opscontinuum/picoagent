@@ -51,7 +51,7 @@ from typing import Any
 import iac_inventory
 import iscp_questions
 import iscp_render
-from picoagent.core.tools import file_lock, truncate
+from picoagent.core.tools import PathRefused, file_lock, resolve_path, truncate
 from picoagent.core.types import ToolResult
 
 log = logging.getLogger("iscp_author")
@@ -322,10 +322,11 @@ class ImportCIsTool(_ISCPTool):
 
     def run(self, args, ctx):
         try:
-            path = _resolve_inside(ctx.cwd, args["path"])
-        except ValueError as exc:
+            path = _resolve_inside(ctx, args["path"])
+            missing = not path.exists()
+        except (ValueError, PathRefused) as exc:
             return result(ctx, str(exc), is_error=True)
-        if not path.exists():
+        if missing:
             return result(ctx, f"{path} does not exist", is_error=True)
 
         kind = args.get("kind") or _guess_kind(path)
@@ -388,22 +389,30 @@ def _guess_kind(path: Path) -> str:
         else "terraform_json"
 
 
-def _resolve_inside(cwd: Path, raw: str) -> Path:
-    """Resolve a model-supplied path, refusing ``..`` escapes out of the project.
+def _resolve_inside(ctx, raw: str) -> Path:
+    """Resolve a model-supplied path, refusing ``..`` escapes and honouring confinement.
 
-    An absolute path the user themselves configured is allowed - a Terraform repository often
-    sits beside the documentation repository - but a relative path may not climb out, because
-    that is the shape a prompt injection in a scanned file would take.
+    Two separate rules, easily confused:
+
+    * The relative-escape refusal below is a **usability** guard, not a security boundary. A
+      tool argument is model output, and an injection can write an absolute path as easily as
+      ``../..`` - so refusing only the relative form stops a mistake, not an attacker.
+    * ``confine_to_project`` is the security boundary, and it is enforced by delegating to the
+      core :func:`resolve_path`. This plugin used to return absolute paths unchecked, so with
+      confinement switched on it still read and wrote outside the project while the built-in
+      tools refused - the one behaviour a deployment that sets that flag cannot tolerate.
     """
-    candidate = Path(os.path.expanduser(raw.strip()))
-    if candidate.is_absolute():
-        return candidate
-    resolved = Path(os.path.normpath(cwd / candidate))
-    root = Path(os.path.normpath(cwd))
-    if resolved != root and root not in resolved.parents:
-        raise ValueError(f"{raw!r} resolves outside the project ({root}); pass an absolute path if "
-                         f"you meant a sibling repository")
-    return resolved
+    text = raw.strip()
+    if "\x00" in text:
+        raise ValueError("path contains a NUL byte")
+    candidate = Path(os.path.expanduser(text))
+    if not candidate.is_absolute():
+        resolved = Path(os.path.normpath(ctx.cwd / candidate))
+        root = Path(os.path.normpath(ctx.cwd))
+        if resolved != root and root not in resolved.parents:
+            raise ValueError(f"{raw!r} resolves outside the project ({root}); pass an absolute "
+                             f"path if you meant a sibling repository")
+    return resolve_path(ctx, text)
 
 
 class RenderTool(_ISCPTool):
@@ -427,8 +436,8 @@ class RenderTool(_ISCPTool):
             return result(ctx, f"unknown document(s): {', '.join(unknown)}; choose from "
                                f"{', '.join(iscp_render.DOCUMENTS)}", is_error=True)
         try:
-            out = _resolve_inside(ctx.cwd, args.get("output_dir") or self.output_dir)
-        except ValueError as exc:
+            out = _resolve_inside(ctx, args.get("output_dir") or self.output_dir)
+        except (ValueError, PathRefused) as exc:
             return result(ctx, str(exc), is_error=True)
 
         report = iscp_render.render_all(data["answers"], self.cis(data), documents)

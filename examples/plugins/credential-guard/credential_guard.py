@@ -257,11 +257,23 @@ def _resolve(raw: str) -> Path | None:
         return None
 
 
-_PATH_ARGS = ("path", "file", "filename", "filepath")
-
-
 def _path_arguments(args: dict) -> list[str]:
-    return [str(args[name]) for name in _PATH_ARGS if args.get(name)]
+    """Every string argument, because guarding a list of *names* is the same mistake as
+    guarding a list of tools.
+
+    This used to check ("path", "file", "filename", "filepath"). An audit found that
+    ``stig_evidence`` takes ``repo``, so it walked the credentials directory untouched - and
+    ``root``, ``directory`` and ``target`` were equally free. Enumerating argument names means
+    every new tool is a fresh chance to pick a name nobody listed. Resolving a string that is
+    not a path is harmless: it will not equal a protected file.
+    """
+    found: list[str] = []
+    for value in args.values():
+        if isinstance(value, str) and value:
+            found.append(value)
+        elif isinstance(value, (list, tuple)):
+            found.extend(item for item in value if isinstance(item, str) and item)
+    return found
 
 
 def _targets_protected_file(args: dict, protected: list[Path]) -> bool:
@@ -281,13 +293,14 @@ def _would_recurse_into_protected(args: dict, protected: list[Path]) -> bool:
     directory and walks it, so pointing it at ``~/.picoagent`` (or any ancestor) dumped the
     credentials file's contents into a tool result without ever naming the file.
     """
-    target = _resolve(args.get("path") or ".")
-    if target is None:
-        return False
-    for path in protected:
-        resolved = _resolve(str(path))
-        if resolved is not None and target in resolved.parents:
-            return True
+    for raw in _path_arguments(args) or ["."]:
+        target = _resolve(raw)
+        if target is None:
+            continue
+        for path in protected:
+            resolved = _resolve(str(path))
+            if resolved is not None and target in resolved.parents:
+                return True
     return False
 
 
@@ -302,7 +315,7 @@ def _shell_command_targets_protected(args: dict, protected: list[Path]) -> bool:
 #: Tools that walk a directory rather than opening one file, so pointing them at a *containing*
 #: directory is enough to surface a protected file. Plugins adding their own recursive tool
 #: should list it under [plugins.credential-guard] recursive_tools.
-_RECURSIVE_TOOLS = ("grep_search",)
+_RECURSIVE_TOOLS = ("grep_search", "stig_evidence")
 
 
 async def guard_tool_call(event: dict, rt) -> dict | None:
