@@ -6,7 +6,8 @@ installed from a git repo or local path, and any core piece (tools, provider, fr
 overridden by a plugin registering the same name.
 
 ```
-pip install -e .
+python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -e .                                      # no third-party deps to pull in
 export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
 export PICOAGENT_API_KEY=...                           # optional
 export PICOAGENT_MODEL=qwen2.5-coder:32b
@@ -17,6 +18,10 @@ picoagent -e examples/plugins/permission-gate -e examples/plugins/compaction
 picoagent plugin add git:github.com/you/some-plugin@v0.1.0
 picoagent plugin list
 ```
+
+The venv is not boilerplate: on Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python a bare `pip install -e .`
+fails with `externally-managed-environment` (PEP 668). [docs/getting-started.md](docs/getting-started.md#install)
+covers that error, the `pipx` route, and a missing `python3 -m venv`.
 
 Config (`~/.picoagent/config.toml`, then `.picoagent/config.toml` in the project):
 
