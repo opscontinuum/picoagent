@@ -22,9 +22,57 @@ in `picoagent/testing/fakes.py`.
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
 | `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident) |
+| `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
 
 `tests/helpers.py` has the fixtures: `make_runtime`, `ScriptedProvider`, `CaptureFrontend`,
 and the `text()` / `call()` shorthands for scripting model turns.
+
+## Running the live Ollama tests
+
+`tests/test_ollama_e2e.py` is the one file here that talks to a real model. Everything else drives
+`ScriptedProvider` or a fake HTTP server, which proves the loop's logic but never the wire. These
+tests run picoagent's own `OpenAICompatProvider` against a running Ollama, with the built-in tools
+writing into a temp directory, so they catch the class of bug a fake cannot have: a request body the
+server rejects, tool-call fragments reassembled wrongly, an SSE frame shape we never modelled.
+
+They are off unless you switch them on:
+
+```bash
+export PICOAGENT_E2E_OLLAMA=1
+export PICOAGENT_E2E_OLLAMA_URL=http://localhost:11434
+export PICOAGENT_E2E_OLLAMA_MODEL=devstral:24b
+python -m unittest discover -s tests -v
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PICOAGENT_E2E_OLLAMA` | unset | the switch; unset, `0` or `false` skips every test in the file |
+| `PICOAGENT_E2E_OLLAMA_URL` | `http://localhost:11434` | Ollama's root, not the `/v1` path |
+| `PICOAGENT_E2E_OLLAMA_MODEL` | `devstral:24b` | must be a tool-calling model |
+| `PICOAGENT_E2E_TIMEOUT` | `180` | wall clock for one agent run, in seconds |
+| `PICOAGENT_E2E_MAX_TURNS` | `8` | bound on model/tool round trips in one run |
+
+Opt-in rather than autodetect, so `discover` stays offline and fast by default and CI is unaffected
+on a machine that happens to be running Ollama.
+
+**The assertions are on side effects and protocol, never on the model's prose.** A live model words
+things differently every run, so asserting on wording buys flakiness and proves nothing. What is
+deterministic is what the tools did: a file exists on disk, a tool result carries a token the tool
+itself read, a `shell` call ran. A green run means the wiring works. It is not a quality benchmark,
+and a model too weak to emit tool calls fails these tests correctly.
+
+Three things can be missing, and each skips with its own fix rather than one flat "not available":
+the switch is off, the server is unreachable, or the model is not pulled. Skip means the
+infrastructure is absent. Failure means it was present and picoagent or the model misbehaved.
+
+`AgentLoop._turns` runs until the model stops calling tools, bounded only by `rt.abort`. A scripted
+provider always runs out of script, so the rest of the suite needs no cap. A live model can keep
+calling tools, which would hang a run rather than fail it, so `PICOAGENT_E2E_MAX_TURNS` and
+`PICOAGENT_E2E_TIMEOUT` impose the bound from the test side instead of changing core.
+
+Running from WSL against Ollama on a Windows host, `localhost` is the WSL instance and not the host.
+Use the gateway address from `ip route show default`, and start Ollama with `OLLAMA_HOST=0.0.0.0` so
+it listens beyond loopback.
 
 ## TDD workflow we follow
 
