@@ -27,6 +27,7 @@ Config (`~/.picoagent/config.toml`, then `.picoagent/config.toml` in the project
 
 ```toml
 model = "qwen2.5-coder:32b"
+temperature = 0.0          # optional; omit to use whatever the server defaults to
 [providers.openai]
 base_url = "http://localhost:11434/v1"
 api_key = ""

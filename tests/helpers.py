@@ -55,7 +55,7 @@ class ScriptedProvider:
         self.turns = turns
         self.calls: list[dict] = []
 
-    async def stream(self, *, system, messages, tools, model, max_tokens, thinking):
+    async def stream(self, *, system, messages, tools, model, max_tokens, thinking, temperature=None):
         self.calls.append({"system": system, "messages": messages, "tools": tools})
         turn = self.turns[min(len(self.calls) - 1, len(self.turns) - 1)]
         for ev in turn:

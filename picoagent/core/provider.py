@@ -34,7 +34,8 @@ class Provider(Protocol):
     name: str
 
     async def stream(self, *, system: str, messages: list[Message], tools: list[ToolSpec],
-                     model: str, max_tokens: int, thinking: str) -> AsyncIterator[StreamEvent]: ...
+                     model: str, max_tokens: int, thinking: str,
+                     temperature: float | None = None) -> AsyncIterator[StreamEvent]: ...
 
 
 # --------------------------------------------------------------------------- mapping
@@ -103,13 +104,16 @@ class OpenAICompatProvider:
         if name:
             self.name = name
 
-    def _request(self, system, messages, tools, model, max_tokens, thinking) -> urllib.request.Request:
+    def _request(self, system, messages, tools, model, max_tokens, thinking,
+                 temperature=None) -> urllib.request.Request:
         body: dict[str, Any] = {"model": model, "messages": to_openai_messages(system, messages),
                                 "max_tokens": max_tokens, "stream": True,
                                 "stream_options": {"include_usage": True}}
         if tools:
             body["tools"] = [{"type": "function", "function": {"name": t.name, "description": t.description,
                                                                 "parameters": t.parameters}} for t in tools]
+        if temperature is not None:
+            body["temperature"] = temperature        # `is not None`: 0.0 is a setting, not an absence
         if thinking in ("low", "medium", "high"):
             body["reasoning_effort"] = thinking      # servers that don't support it ignore the field
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream", **self._headers}
@@ -118,8 +122,9 @@ class OpenAICompatProvider:
         return urllib.request.Request(f"{self._base}/chat/completions", data=json.dumps(body).encode(),
                                       headers=headers, method="POST")
 
-    async def stream(self, *, system, messages, tools, model, max_tokens, thinking="off"):
-        request = self._request(system, messages, tools, model, max_tokens, thinking)
+    async def stream(self, *, system, messages, tools, model, max_tokens, thinking="off",
+                     temperature=None):
+        request = self._request(system, messages, tools, model, max_tokens, thinking, temperature)
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
         threading.Thread(target=self._read_sse, args=(request, queue, loop), daemon=True).start()

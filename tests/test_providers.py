@@ -179,5 +179,79 @@ class ProviderRoundTrip(unittest.TestCase):
             self.assertNotIn("additionalProperties", json.dumps(body2.get("tools")))
 
 
+class TemperatureTests(unittest.TestCase):
+    """`temperature` reaches each dialect's wire format, and is absent unless it is set.
+
+    Absence matters as much as presence: the default is ``None`` so an existing install keeps
+    whatever sampling its server already defaults to. Sending a value picked here would quietly
+    change behaviour for everyone who never asked for it.
+
+    0.0 is the value under test throughout because it is the one a naive ``if temperature:``
+    drops, and it is also the one anybody pinning sampling actually wants.
+    """
+
+    def _run(self, rt: Runtime, provider: str) -> None:
+        rt.provider_name = provider
+        asyncio.run(AgentLoop(rt).run("hello"))
+
+    def _vertex_runtime(self, directory: str, srv: FakeServer) -> Runtime:
+        rt = make_runtime(Path(directory))
+        os.environ["VERTEX_BASE_URL"], os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = srv.url, "ya29.test"
+        loader.load_plugin(ROOT / "examples/plugins/vertex-provider", rt,
+                           loader.TrustStore(Path(directory) / "home"), allow_untrusted=True)
+        return rt
+
+    def test_the_runtime_takes_temperature_from_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["PICOAGENT_HOME"] = str(Path(d) / "home")
+            cfg = load_config(Path(d), {"temperature": 0.2})
+            rt = Runtime(cfg, Path(d), Session(Path(d) / "s.jsonl", Path(d)))
+            self.assertEqual(rt.temperature, 0.2)
+
+    def test_the_default_leaves_temperature_unset(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["PICOAGENT_HOME"] = str(Path(d) / "home")
+            self.assertIsNone(load_config(Path(d), {})["temperature"])
+
+    def test_openai_omits_temperature_when_it_is_unset(self):
+        with tempfile.TemporaryDirectory() as d, FakeServer("openai") as srv:
+            rt = make_runtime(Path(d))
+            rt.providers.register(OpenAICompatProvider(base_url=srv.url + "/v1", api_key="k"))
+            self._run(rt, "openai")
+            self.assertNotIn("temperature", srv.requests[0]["body"])
+
+    def test_openai_sends_a_zero_temperature(self):
+        with tempfile.TemporaryDirectory() as d, FakeServer("openai") as srv:
+            rt = make_runtime(Path(d))
+            rt.temperature = 0.0
+            rt.providers.register(OpenAICompatProvider(base_url=srv.url + "/v1", api_key="k"))
+            self._run(rt, "openai")
+            self.assertEqual(srv.requests[0]["body"]["temperature"], 0.0)
+
+    def test_grok_sends_a_zero_temperature(self):
+        """Grok is the built-in client under another name, so the knob must ride along."""
+        with tempfile.TemporaryDirectory() as d, FakeServer("grok") as srv:
+            rt = make_runtime(Path(d))
+            rt.temperature = 0.0
+            os.environ["XAI_BASE_URL"], os.environ["XAI_API_KEY"] = srv.url + "/v1", "xai-test"
+            loader.load_plugin(ROOT / "examples/plugins/grok-provider", rt,
+                               loader.TrustStore(Path(d) / "home"), allow_untrusted=True)
+            self._run(rt, "grok")
+            self.assertEqual(srv.requests[0]["body"]["temperature"], 0.0)
+
+    def test_vertex_maps_temperature_into_generation_config(self):
+        with tempfile.TemporaryDirectory() as d, FakeServer("vertex") as srv:
+            rt = self._vertex_runtime(d, srv)
+            rt.temperature = 0.0
+            self._run(rt, "vertex")
+            self.assertEqual(srv.requests[0]["body"]["generationConfig"]["temperature"], 0.0)
+
+    def test_vertex_omits_temperature_when_it_is_unset(self):
+        with tempfile.TemporaryDirectory() as d, FakeServer("vertex") as srv:
+            rt = self._vertex_runtime(d, srv)
+            self._run(rt, "vertex")
+            self.assertNotIn("temperature", srv.requests[0]["body"]["generationConfig"])
+
+
 if __name__ == "__main__":
     unittest.main()

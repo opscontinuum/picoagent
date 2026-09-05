@@ -124,8 +124,11 @@ from picoagent.core.types import StreamEvent, ToolCall
 
 class MyProvider:
     name = "mine"
-    async def stream(self, *, system, messages, tools, model, max_tokens, thinking):
+    async def stream(self, *, system, messages, tools, model, max_tokens, thinking,
+                     temperature=None):
         ...                                   # map `messages` to your wire format
+        # `temperature` is None unless the user set it. Send it only when it is not None:
+        # 0.0 is a setting, not an absence, so `if temperature:` would drop it.
         yield StreamEvent("text", text="hello")
         yield StreamEvent("tool_call", tool_call=ToolCall("id1", "shell", {"command": "ls"}))
         yield StreamEvent("done", usage={"input": 10, "output": 5})
