@@ -158,7 +158,8 @@ def register_core_commands(rt: Runtime) -> None:
 def build_runtime(args: argparse.Namespace) -> Runtime:
     """Config -> session -> core registrations -> frontend -> plugins."""
     cwd = Path(args.cwd or ".").resolve()
-    cfg = load_config(cwd, {"model": args.model, "provider": args.provider, "thinking": args.thinking})
+    cfg = load_config(cwd, {"model": args.model, "provider": args.provider, "thinking": args.thinking,
+                            "temperature": args.temperature})
     rt = Runtime(cfg, cwd, open_session(cfg, cwd, args.resume))
     register_core(rt)
     headless = bool(args.prompt or args.json)
@@ -374,6 +375,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-m", "--model")
     ap.add_argument("--provider", help="provider name (built-in: openai; others from plugins)")
     ap.add_argument("--thinking", choices=["off", "low", "medium", "high"])
+    ap.add_argument("--temperature", type=float,
+                    help="sampling temperature (omit to use the server's own default)")
     ap.add_argument("-r", "--resume", nargs="?", const="last", help="resume last session or a session file")
     ap.add_argument("-e", "--extension", action="append", default=[], help="load a plugin dir (trusted for this run)")
     ap.add_argument("--dangerously-trust-all", action="store_true", help="skip the trust check for every plugin")

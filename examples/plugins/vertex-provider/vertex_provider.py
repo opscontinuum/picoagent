@@ -101,7 +101,8 @@ class VertexProvider:
             raise RuntimeError(f"no Vertex credentials: set GOOGLE_OAUTH_ACCESS_TOKEN or install gcloud ({exc})")
 
     # ------------------------------------------------------------------ request
-    def _request_body(self, system: str, messages: list[Message], tools, max_tokens: int, thinking: str) -> dict:
+    def _request_body(self, system: str, messages: list[Message], tools, max_tokens: int,
+                      thinking: str, temperature: float | None = None) -> dict:
         body: dict[str, Any] = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": to_gemini_contents(messages, {}),
@@ -111,6 +112,10 @@ class VertexProvider:
             body["tools"] = [{"functionDeclarations": [
                 {"name": t.name, "description": t.description, "parameters": clean_schema(t.parameters)}
                 for t in tools]}]
+        if temperature is not None:
+            # Gemini puts sampling in generationConfig, alongside maxOutputTokens.
+            # `is not None`: 0.0 is a setting, not an absence.
+            body["generationConfig"]["temperature"] = temperature
         budgets = {"low": 1024, "medium": 8192, "high": 24576}
         if thinking in budgets:
             body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": budgets[thinking], "includeThoughts": True}
@@ -120,7 +125,8 @@ class VertexProvider:
         return (f"{self._base}/v1/projects/{self.project}/locations/{self.location}"
                 f"/publishers/google/models/{model}:streamGenerateContent?alt=sse")
 
-    async def stream(self, *, system, messages, tools, model, max_tokens, thinking="off"):
+    async def stream(self, *, system, messages, tools, model, max_tokens, thinking="off",
+                     temperature=None):
         """Stream ``StreamEvent``s. The blocking HTTP read runs in a thread and feeds a queue."""
         try:
             token = self.access_token()
@@ -129,7 +135,8 @@ class VertexProvider:
             return
         request = urllib.request.Request(
             self._url(model), method="POST",
-            data=json.dumps(self._request_body(system, messages, tools, max_tokens, thinking)).encode(),
+            data=json.dumps(self._request_body(system, messages, tools, max_tokens, thinking,
+                                               temperature)).encode(),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"})
 
         queue: asyncio.Queue = asyncio.Queue()

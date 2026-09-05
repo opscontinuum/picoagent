@@ -15,8 +15,59 @@ behaviour comes from plugins you choose.
 
 ```bash
 git clone <your fork> picoagent && cd picoagent
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .            # registers the `picoagent` command
 ```
+
+With the venv active, `picoagent` is on your PATH. Without activating it, run
+`.venv/bin/picoagent` instead. There is nothing to download here: the package has no
+third-party dependencies, so the venv stays small and the install finishes in a second.
+
+### If pip says `externally-managed-environment`
+
+Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python all mark the system Python as
+externally managed (PEP 668), so pip refuses to install into it:
+
+```
+error: externally-managed-environment
+```
+
+The venv above is the fix, and it is why these instructions start with one.
+
+### If `python3 -m venv` fails
+
+On Debian and Ubuntu the venv module ships in a separate package, so creating the venv
+can fail before you ever get to pip:
+
+```bash
+sudo apt install python3-venv    # or python3-full, which the pip error suggests
+```
+
+If the error names a versioned package (`python3.12-venv`, say), install that one, then
+create the venv again.
+
+### Or install it with pipx
+
+If you want the `picoagent` command on your PATH permanently, without activating a venv
+every time, use pipx. It creates and manages the venv for you, and picoagent is a good
+fit for it: an application with a console-script entry point and no dependencies.
+
+```bash
+sudo apt install pipx    # or: brew install pipx
+pipx ensurepath          # puts pipx's bin directory on your PATH; start a new shell after this
+pipx install -e .        # from the repo root; -e keeps it editable
+```
+
+Older pipx versions want `--force` to reinstall over an existing copy:
+`pipx install -e . --force`.
+
+### Last resort: `--break-system-packages`
+
+`pip install -e . --break-system-packages` overrides the PEP 668 refusal. It writes into
+the Python your operating system depends on, where it can shadow or overwrite
+distro-installed packages and break system tools that rely on them. A venv or pipx costs
+one extra line and carries none of that risk.
 
 ## Point it at a model
 

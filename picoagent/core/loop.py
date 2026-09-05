@@ -58,6 +58,7 @@ class Runtime:
         self.model: str = cfg["model"]
         self.provider_name: str = cfg["provider"]
         self.thinking: str = cfg["thinking"]
+        self.temperature: float | None = cfg["temperature"]
         self.abort = asyncio.Event()              # set to cancel the current run
         # Messages queued by plugins/frontends: (deliver_as, text) where deliver_as is
         # "steer" (after the current tool batch), "follow_up" (after the agent finishes)
@@ -163,7 +164,8 @@ class AgentLoop:
         await rt.frontend.emit("assistant_start", {})
         async for chunk in provider.stream(system=context["system_prompt"], messages=context["messages"],
                                            tools=rt.tools.specs(), model=rt.model,
-                                           max_tokens=rt.cfg["max_tokens"], thinking=rt.thinking):
+                                           max_tokens=rt.cfg["max_tokens"], thinking=rt.thinking,
+                                           temperature=rt.temperature):
             if rt.abort.is_set():
                 break
             if chunk.type == "text":

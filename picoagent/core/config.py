@@ -31,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
     "provider": "openai",            # the built-in OpenAI-compatible client; others come from plugins
     "providers": {"openai": {}},     # per-provider overrides: base_url / api_key / headers
     "max_tokens": 8192,
+    "temperature": None,             # None leaves sampling to the server; 0.0 is a value, not "unset"
     "thinking": "off",               # off | low | medium | high - each provider maps this to its own knob
     "parallel_tools": True,          # run sibling tool calls concurrently (file edits are still serialised)
     "tool_output_max_bytes": 50_000, # tool output larger than this is truncated (Pi's limits)
