@@ -65,11 +65,11 @@ Three things can be missing, and each skips with its own fix rather than one fla
 the switch is off, the server is unreachable, or the model is not pulled. Skip means the
 infrastructure is absent. Failure means it was present and picoagent or the model misbehaved.
 
-Sampling is pinned to temperature 0 by a `DeterministicProvider` subclass in the test file, because
-picoagent has no temperature setting to configure. At the server's default temperature the same
-prompt makes the model call a tool on one run and answer from memory on the next, measured at four
-runs in five for one prompt. Temperature is not part of what these tests exercise, so pinning it
-removes variance without changing anything under test.
+Sampling is pinned with `runtime.temperature = 0.0`, the same `temperature` setting a user sets in
+`config.toml` or with `--temperature`. At the server's default temperature the same prompt makes the
+model call a tool on one run and answer from memory on the next, measured at four runs in five for
+one prompt. Temperature is not part of what these tests exercise, so pinning it removes variance
+without changing anything under test.
 
 Temperature 0 narrows the variance but does not remove it, so the prompts matter too. The
 observed failure is the model deciding it cannot use tools at all ("I don't have the capability to
