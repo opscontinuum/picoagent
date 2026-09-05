@@ -65,6 +65,21 @@ Three things can be missing, and each skips with its own fix rather than one fla
 the switch is off, the server is unreachable, or the model is not pulled. Skip means the
 infrastructure is absent. Failure means it was present and picoagent or the model misbehaved.
 
+Sampling is pinned to temperature 0 by a `DeterministicProvider` subclass in the test file, because
+picoagent has no temperature setting to configure. At the server's default temperature the same
+prompt makes the model call a tool on one run and answer from memory on the next, measured at four
+runs in five for one prompt. Temperature is not part of what these tests exercise, so pinning it
+removes variance without changing anything under test.
+
+Temperature 0 narrows the variance but does not remove it, so the prompts matter too. The
+observed failure is the model deciding it cannot use tools at all ("I don't have the capability to
+access or read files directly") and answering anyway. A prompt that leaves a plausible non-tool
+answer available invites that. Asking a question the model cannot answer without the file does not,
+which measured 5/5 against 4/5 for the same test on `devstral:24b`. Phrase new tests the same way.
+
+These are live-model tests, so treat a single failure as a model behaviour and a repeated one as a
+regression. Broken wiring fails every run; a model declining to call a tool does not.
+
 `AgentLoop._turns` runs until the model stops calling tools, bounded only by `rt.abort`. A scripted
 provider always runs out of script, so the rest of the suite needs no cap. A live model can keep
 calling tools, which would hang a run rather than fail it, so `PICOAGENT_E2E_MAX_TURNS` and

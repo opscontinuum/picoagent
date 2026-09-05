@@ -95,6 +95,27 @@ def require_live_ollama() -> None:
 
 # --------------------------------------------------------------------------- driving a live model
 
+class DeterministicProvider(OpenAICompatProvider):
+    """The real client with sampling pinned to temperature 0.
+
+    Sampling temperature is not part of what these tests exercise; the request body, tool-call
+    reassembly and tool execution are. At the server's default temperature the same prompt makes
+    the model call a tool on one run and answer from memory on the next, which turns a wiring
+    test into a coin flip. Pinning it removes that variance without changing anything under test:
+    the body still goes through ``_request`` unmodified in every other respect.
+
+    picoagent has no temperature setting to configure, hence the subclass rather than a config
+    key. Nothing else in the suite needs one, so the knob stays here rather than in core.
+    """
+
+    def _request(self, *args, **kwargs) -> urllib.request.Request:
+        request = super()._request(*args, **kwargs)
+        body = json.loads(request.data.decode("utf-8"))
+        body["temperature"] = 0
+        request.data = json.dumps(body).encode("utf-8")   # the setter drops the stale Content-length
+        return request
+
+
 def _cap_turns(runtime: Runtime) -> None:
     """Abort the run after :data:`MAX_TURNS` model/tool round trips.
 
@@ -116,7 +137,7 @@ def _cap_turns(runtime: Runtime) -> None:
 
 def live_runtime(tmp: Path) -> Runtime:
     """A Runtime wired exactly as the CLI wires it, pointing at the live server and a temp cwd."""
-    runtime = make_runtime(tmp, provider=OpenAICompatProvider(base_url=f"{URL}/v1", api_key="ollama"))
+    runtime = make_runtime(tmp, provider=DeterministicProvider(base_url=f"{URL}/v1", api_key="ollama"))
     runtime.provider_name = "openai"
     runtime.model = MODEL
     _cap_turns(runtime)
@@ -200,8 +221,11 @@ class ToolLoopTests(LiveOllamaTest):
 
     def test_the_model_reads_a_file(self):
         (self.tmp / "secret.txt").write_text("the passphrase is PICO_READ_7742\n")
-        frontend = self.agent("Use the read tool to read the file secret.txt in the current "
-                              "directory, then tell me what it says.")
+        # Phrased so the answer is impossible without the file. Asking it to "read secret.txt and
+        # tell me what it says" leaves a plausible non-tool reply available, and devstral takes it
+        # about one run in five ("I don't have the capability to access or read files directly").
+        frontend = self.agent("What is the passphrase stored in secret.txt in the current "
+                              "directory? Read the file, then quote the passphrase exactly.")
         self.assertNoErrors(frontend)
         self.assertCalled(frontend, "read")
         # The tool did the reading, so the token in its result is deterministic even though
