@@ -40,7 +40,7 @@ They are off unless you switch them on:
 ```bash
 export PICOAGENT_E2E_OLLAMA=1
 export PICOAGENT_E2E_OLLAMA_URL=http://localhost:11434
-export PICOAGENT_E2E_OLLAMA_MODEL=devstral:24b
+export PICOAGENT_E2E_OLLAMA_MODEL=llama3.2:3b
 python -m unittest discover -s tests -v
 ```
 
@@ -48,7 +48,7 @@ python -m unittest discover -s tests -v
 |---|---|---|
 | `PICOAGENT_E2E_OLLAMA` | unset | the switch; unset, `0` or `false` skips every test in the file |
 | `PICOAGENT_E2E_OLLAMA_URL` | `http://localhost:11434` | Ollama's root, not the `/v1` path |
-| `PICOAGENT_E2E_OLLAMA_MODEL` | `devstral:24b` | must be a tool-calling model |
+| `PICOAGENT_E2E_OLLAMA_MODEL` | `llama3.2:3b` | must emit *structured* tool calls (see below) |
 | `PICOAGENT_E2E_TIMEOUT` | `180` | wall clock for one agent run, in seconds |
 | `PICOAGENT_E2E_MAX_TURNS` | `8` | bound on model/tool round trips in one run |
 
@@ -64,6 +64,36 @@ and a model too weak to emit tool calls fails these tests correctly.
 Three things can be missing, and each skips with its own fix rather than one flat "not available":
 the switch is off, the server is unreachable, or the model is not pulled. Skip means the
 infrastructure is absent. Failure means it was present and picoagent or the model misbehaved.
+
+### Choosing the model
+
+The default is deliberately small. These tests check wiring, not model quality, so the right model
+is the cheapest one that drives the loop reliably. Four were measured by running this suite three
+times each:
+
+| Model | Size | Clean rounds | Round time |
+|---|---|---|---|
+| `llama3.2:3b` | 2.0 GB | 9/9 | 3-7s |
+| `qwen3:4b` | 2.5 GB | 3/3 | 42-56s |
+| `qwen2.5-coder:7b` | 4.7 GB | 0/3 | n/a |
+| `devstral:24b` | 14.3 GB | 3/3 | 20-24s |
+
+`qwen3:4b` is reliable but spends most of its time generating reasoning tokens, which buys nothing
+here. `devstral:24b` works and is four times slower than `llama3.2:3b` for the same signal.
+
+`qwen2.5-coder:7b` is the interesting one, and the reason the table says "must emit *structured*
+tool calls" rather than "must support tools". Ollama reports a `tools` capability for it, and it
+does understand the task: asked to read a file, it produces exactly the right call. It just
+produces it as text in the message body:
+
+```
+{"name": "read", "arguments": {"path": "secret.txt"}}
+```
+
+The OpenAI `tool_calls` field stays empty, so nothing can execute it. A capability flag is a claim
+about the model, not a guarantee about the wire format its template produces. If a model fails
+every tool test while the others pass, print the assistant text before assuming picoagent is at
+fault.
 
 Sampling is pinned with `runtime.temperature = 0.0`, the same `temperature` setting a user sets in
 `config.toml` or with `--temperature`. At the server's default temperature the same prompt makes the

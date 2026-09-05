@@ -10,7 +10,7 @@ Opt in explicitly::
 
     export PICOAGENT_E2E_OLLAMA=1
     export PICOAGENT_E2E_OLLAMA_URL=http://localhost:11434   # WSL -> Windows host: the gateway IP
-    export PICOAGENT_E2E_OLLAMA_MODEL=devstral:24b
+    export PICOAGENT_E2E_OLLAMA_MODEL=llama3.2:3b
     python -m unittest discover -s tests -v
 
 Without ``PICOAGENT_E2E_OLLAMA=1`` every test here skips, so ``discover`` stays offline and
@@ -44,9 +44,13 @@ from picoagent.core.provider import OpenAICompatProvider
 ENABLED = os.environ.get("PICOAGENT_E2E_OLLAMA", "").lower() not in ("", "0", "false", "no")
 #: Ollama's root. Not the ``/v1`` OpenAI-compatible path - both are derived from this.
 URL = os.environ.get("PICOAGENT_E2E_OLLAMA_URL", "http://localhost:11434").rstrip("/")
-#: Must be a tool-calling model. One that cannot emit tool calls fails these tests correctly.
-MODEL = os.environ.get("PICOAGENT_E2E_OLLAMA_MODEL", "devstral:24b")
-#: Wall clock for one agent run. A 24B model on a warm GPU answers well inside this.
+#: Must emit *structured* tool calls. The default is small on purpose: these tests check wiring,
+#: not model quality, so the right model is the cheapest one that drives the loop reliably.
+#: llama3.2:3b ran 9 rounds clean at ~5s each; devstral:24b needs ~22s to prove the same thing.
+MODEL = os.environ.get("PICOAGENT_E2E_OLLAMA_MODEL", "llama3.2:3b")
+#: Wall clock for one agent run. Generous on purpose: the default model needs a second or two,
+#: but the point of the ceiling is to fail a stuck run rather than to pace a healthy one, and a
+#: large model on a cold or CPU-bound server is exactly when you want the headroom.
 TIMEOUT = float(os.environ.get("PICOAGENT_E2E_TIMEOUT", "180"))
 #: Bound on model/tool round trips. See :func:`_cap_turns` for why this is not optional.
 MAX_TURNS = int(os.environ.get("PICOAGENT_E2E_MAX_TURNS", "8"))
@@ -65,7 +69,7 @@ def _installed_models() -> list[str]:
 
 
 def _matches(installed: str, wanted: str) -> bool:
-    """``devstral`` should match an installed ``devstral:latest``; a tagged name must match exactly."""
+    """``llama3.2`` should match an installed ``llama3.2:latest``; a tagged name must match exactly."""
     return installed == wanted or (":" not in wanted and installed.split(":")[0] == wanted)
 
 
