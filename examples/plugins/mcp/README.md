@@ -75,6 +75,31 @@ command = "python3"
 args = ["-m", "my_notes_server"]
 ```
 
+## Environment
+
+`command` is run as a child process with a pipe, so anything that starts a server works. Prefer a
+container when you have the choice:
+
+```toml
+[plugins.mcp.servers.everything]
+command = "docker"
+args = ["run", "-i", "--rm", "node:22-alpine", "npx", "-y", "@modelcontextprotocol/server-everything"]
+startup_timeout = 300   # --rm means a cold npm cache every start, so npx fetches the package again
+```
+
+`docker run -i` is a stdio command like any other, so a stdio-only client reaches any containerised
+server without needing a transport it does not have. Nothing has to be installed on the host, the
+server behaves the same on every machine, and cross-OS pipe problems go away.
+
+That last one is not hypothetical. On a WSL machine with no Linux Node installed, `npx` resolves
+through interop to the Windows binary (`/mnt/c/Program Files/nodejs/npx`). Running a server that way
+starts it under `CMD.EXE` in a UNC path it cannot use. The child comes up, the pipe is there, and
+the `initialize` handshake never completes. It looks exactly like a client bug and it is not one.
+Run `command -v npx` before assuming otherwise, and use a container if that path is on `/mnt/c`.
+
+The containerised form above is what `tests/test_mcp_live.py` drives against the reference server.
+It is opt-in, so it skips unless you set `PICOAGENT_E2E_MCP=1`.
+
 ## What the model sees
 
 Every tool is registered as `<server>_<tool>`: the `search` tool on the server you called

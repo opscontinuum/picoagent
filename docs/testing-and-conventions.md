@@ -23,6 +23,7 @@ in `picoagent/testing/fakes.py`.
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
 | `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident) |
 | `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
+| `test_mcp_live.py` | live end-to-end against a real MCP server in a container (opt-in, skipped by default) |
 
 `tests/helpers.py` has the fixtures: `make_runtime`, `ScriptedProvider`, `CaptureFrontend`,
 and the `text()` / `call()` shorthands for scripting model turns.
@@ -118,6 +119,63 @@ calling tools, which would hang a run rather than fail it, so `PICOAGENT_E2E_MAX
 Running from WSL against Ollama on a Windows host, `localhost` is the WSL instance and not the host.
 Use the gateway address from `ip route show default`, and start Ollama with `OLLAMA_HOST=0.0.0.0` so
 it listens beyond loopback.
+
+## Running the live MCP tests
+
+`tests/test_mcp_live.py` is the other opt-in file. The rest of the MCP suite runs against
+`picoagent/testing/fake_mcp.py`, a server written from the same reading of the specification as the
+client. That proves the two agree. It cannot prove either one matches the protocol, because a
+misreading would be a mistake both sides share and every test would agree with it. This file closes
+that gap by talking to a server nobody here wrote: `@modelcontextprotocol/server-everything`, the
+protocol's own reference server.
+
+```bash
+export PICOAGENT_E2E_MCP=1
+python -m unittest discover -s tests -v
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PICOAGENT_E2E_MCP` | unset | the switch; unset, `0` or `false` skips every test in the file |
+| `PICOAGENT_E2E_MCP_IMAGE` | `node:22-alpine` | the container the server runs in |
+| `PICOAGENT_E2E_MCP_PACKAGE` | `@modelcontextprotocol/server-everything` | the server `npx` runs |
+| `PICOAGENT_E2E_MCP_STARTUP_TIMEOUT` | `300` | seconds for the handshake and `tools/list` |
+| `PICOAGENT_E2E_MCP_TIMEOUT` | `60` | seconds for one `tools/call` |
+
+The startup budget is high because `--rm` throws the container away, so every run starts on a cold
+npm cache and `npx` fetches the package again. A warm image and a fast link finish the whole file in
+about 12 seconds; the ceiling is there to fail a stuck start rather than to pace a healthy one.
+
+Three things can be missing, and each skips with its own fix: the switch is off, Docker is not
+installed, or the daemon is not reachable. "You did not opt in", "Docker is not installed" and "the
+daemon is not running" send you to three different places, so they are never reported as one flat
+"not available".
+
+The assertions are on protocol facts and side effects: the handshake completed and recorded a
+negotiated revision, `tools/list` came back and its tools were registered, `everything_echo` ran and
+returned content the server produced, and the built-in `read` is still `ReadTool` afterwards. The
+count of tools the reference server ships is its business and moves with its version, so nothing
+asserts on it. Against version 2.0.0 the connection reports:
+
+```
+everything: mcp-servers/everything 2.0.0 (protocol 2024-11-05, running), 13 tools
+```
+
+Every container is stamped with a `picoagent-e2e-mcp=<run>` label, unique per connection. That is
+the one addition these tests make to the command a user would write, and it is what lets
+`ShutdownTests` assert that `session_end` left nothing running instead of assuming it. Each test
+also force-removes its own label on the way out, so a failed assertion still leaves the machine
+clean.
+
+### Why the server runs in a container
+
+The server is started as `docker run -i --rm ...`, which is a stdio command like any other, so a
+stdio-only client reaches any containerised server without gaining a transport. It also sidesteps a
+failure that costs an afternoon. On a WSL machine with no Linux Node installed, `npx` resolves
+through interop to the Windows binary under `/mnt/c`, which starts the server under `CMD.EXE` in a
+UNC path it cannot use. The child comes up, the pipe is there, and the `initialize` handshake never
+completes. It looks exactly like a client bug and it is not one. If you point these tests at a
+server on the host instead, check which `npx` you actually got first.
 
 ## TDD workflow we follow
 
