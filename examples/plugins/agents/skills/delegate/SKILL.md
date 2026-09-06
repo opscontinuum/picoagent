@@ -54,10 +54,15 @@ There are two bounds and only one of them is yours.
 
 - **Set `timeout` on the `shell` call.** Without it the default is 120 seconds, which is short
   for a real search. 300 to 600 suits a tree-wide investigation.
-- **You cannot bound the child's turns.** Core runs model-and-tool rounds until the model
+- **You cannot bound a subprocess child's turns.** Core runs model-and-tool rounds until the model
   replies without calling a tool. There is no turn cap. A small model can loop without making
   progress, editing and re-reading the same file for dozens of calls without changing it. The shell
-  timeout is the only thing that ends that.
+  timeout is the only thing that ends that, and it discards the output.
+
+If an `agent` tool is available, prefer it. It runs the child in this process with a real turn
+cap, so a child that loops is stopped at a turn count and you still get the text it produced.
+Use the subprocess route below when the child must outlive this turn, run somewhere else, or use
+a different model or config than this session.
 
 A timeout kills the child's whole process tree and returns `Command timed out after Ns` with
 **none** of its output. If losing the work would hurt, write the run to a file first:
