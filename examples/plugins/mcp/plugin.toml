@@ -1,0 +1,6 @@
+name = "mcp"
+version = "0.1.0"
+entry = "mcp_client:register"
+description = "Model Context Protocol client (stdio transport, protocol 2024-11-05): registers a server's tools as picoagent tools"
+python_deps = []
+requires = ["picoagent>=0.1"]
