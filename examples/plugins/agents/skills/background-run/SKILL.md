@@ -205,9 +205,16 @@ answers with exit code 127.
 
 **Keep N small. Three or four unless the user asks for more.** Each child is a full model run, so
 N children means N times the token spend and N concurrent requests against one endpoint, which is
-where rate limits and 429s begin. A local single-GPU server works through concurrent requests
-largely in sequence, so a large N there buys latency you do not get while multiplying the cost of
-being wrong. Children inherit your config and endpoint, so they all draw on the same budget.
+where rate limits and 429s begin. Children inherit your config and endpoint, so they all draw on
+the same budget.
+
+The speedup is smaller than it looks, and on a local server much smaller. Measured against a
+single-GPU Ollama on one machine: one child took 8.0 seconds, three fanned out took 18.1 seconds.
+Running them one after another would have taken about 24, so the fan-out saved roughly a quarter,
+not the two thirds that three-at-once suggests. The server accepts the requests concurrently and
+then works through the compute largely in sequence. Fan out because the work is genuinely
+independent and you want it off your context, not because you expect N times the speed. A hosted
+endpoint that serves requests in parallel does better, but measure it rather than assuming.
 
 **One child failing must not read as success.** Two habits cover it:
 
