@@ -46,6 +46,52 @@ class LoopTests(unittest.TestCase):
         run(AgentLoop(rt).run("x"))
         self.assertTrue(rt.frontend.tool_results()[0].is_error)
 
+    def test_a_missing_required_argument_names_itself(self):
+        """A model that omits a required argument must be told which one, not shown a KeyError.
+
+        Small models omit arguments regularly. `KeyError: 'path'` tells them nothing, so they
+        reissue the same malformed call and the loop livelocks. Observed against llama3.2:3b:
+        one run spent 21 tool calls without ever changing the file.
+        """
+        rt = self._rt([[call("edit", old_text="a", new_text="b")], [text("ok")]])
+        run(AgentLoop(rt).run("x"))
+        result = rt.frontend.tool_results()[0]
+        self.assertTrue(result.is_error)
+        self.assertIn("path", result.content, "the message must name the argument")
+        self.assertNotIn("KeyError", result.content,
+                         "a missing argument is not a bug; do not leak the exception")
+
+    def test_every_missing_argument_is_reported_at_once(self):
+        """Reporting one at a time would cost a turn per argument."""
+        rt = self._rt([[call("write")], [text("ok")]])
+        run(AgentLoop(rt).run("x"))
+        result = rt.frontend.tool_results()[0]
+        self.assertTrue(result.is_error)
+        self.assertIn("path", result.content)
+        self.assertIn("content", result.content)
+
+    def test_a_complete_call_is_not_blocked_by_validation(self):
+        rt = self._rt([[call("shell", command="echo fine")], [text("ok")]])
+        run(AgentLoop(rt).run("x"))
+        self.assertFalse(rt.frontend.tool_results()[0].is_error)
+
+    def test_validation_reads_the_tool_own_schema(self):
+        """A plugin tool with its own required list is covered without registering anything."""
+        class Widget:
+            name = "widget"
+            description = "test tool"
+            parameters = {"type": "object", "properties": {"size": {"type": "string"}},
+                          "required": ["size"]}
+            async def execute(self, args, ctx):
+                raise AssertionError("must not run: validation should stop this first")
+
+        rt = self._rt([[call("widget")], [text("ok")]])
+        rt.tools.register(Widget())
+        run(AgentLoop(rt).run("x"))
+        result = rt.frontend.tool_results()[0]
+        self.assertTrue(result.is_error)
+        self.assertIn("size", result.content)
+
     def test_before_agent_start_can_rewrite_system_prompt(self):
         rt = self._rt([[text("ok")]])
         rt.events.on("before_agent_start", lambda p, c: {"system_prompt": p["system_prompt"] + "\nEXTRA"})

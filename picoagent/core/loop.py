@@ -37,7 +37,7 @@ from .events import EventBus
 from .provider import ProviderRegistry
 from .session import Session
 from .skills import SkillRegistry
-from .tools import ToolContext, ToolRegistry
+from .tools import ToolContext, ToolRegistry, missing_required_args
 from .types import Message, ToolCall, ToolResult
 
 log = logging.getLogger("picoagent.loop")
@@ -237,6 +237,15 @@ class AgentLoop:
         tool = rt.tools.get(call.name)
         if tool is None or not rt.tools.is_active(tool):
             return ToolResult(call.id, f"Unknown or inactive tool '{call.name}'", is_error=True)
+        # A model omitting an argument is an expected failure, so it is a value. Letting it
+        # reach the tool produced `KeyError: 'path'`, which says nothing about what to fix,
+        # so small models reissued the same malformed call until the turn cap stopped them.
+        missing = missing_required_args(tool, call.args)
+        if missing:
+            required = ", ".join(tool.parameters.get("required", []))
+            return ToolResult(call.id, f"{call.name}: missing required argument(s): "
+                                       f"{', '.join(missing)}. This tool requires: {required}.",
+                              is_error=True)
         ctx = ToolContext(cwd=rt.cwd, config=rt.cfg, tool_call_id=call.id, abort=rt.abort, ui=rt.frontend)
         try:
             return await tool.execute(call.args, ctx)

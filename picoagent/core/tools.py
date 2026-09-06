@@ -52,6 +52,17 @@ class Tool(Protocol):
 
 # --------------------------------------------------------------------------- helpers
 
+def missing_required_args(tool: Any, args: dict) -> list[str]:
+    """Declared-required arguments the caller did not supply.
+
+    Reads the tool's own ``parameters['required']``, so a tool that gains a required
+    argument is covered without touching this, and the message can never drift from the
+    schema it describes. Plugin tools are covered for free.
+    """
+    required = (getattr(tool, "parameters", None) or {}).get("required") or []
+    return [name for name in required if name not in args]
+
+
 def truncate(text: str, max_bytes: int, max_lines: int, keep: str = "head") -> tuple[str, bool]:
     """Cut ``text`` to the limits, keeping the ``head`` or the ``tail``.
 
