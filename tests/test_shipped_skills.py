@@ -136,7 +136,11 @@ class SkillToolReferences(unittest.TestCase):
             if not skills:
                 continue
             registered = self._registered_tools(plugin_dir)
-            namespaces = tuple(f"{n.split('_')[0]}_" for n in registered - self.CORE_TOOLS)
+            # Only a tool whose own name is namespaced claims a prefix. A single-word tool such
+            # as `agent` must not claim all of `agent_*`, or an event name like `agent_settled`
+            # written in a skill reads as a tool nothing registers.
+            namespaces = tuple(f"{n.split('_')[0]}_" for n in registered - self.CORE_TOOLS
+                               if "_" in n)
             if not namespaces:
                 continue
             for skill_md in skills:
