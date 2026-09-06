@@ -12,6 +12,7 @@ Whether a model *obeys* a skill is a separate question and needs a live run to a
 """
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -106,6 +107,48 @@ class ShippedSkillInvocation(unittest.TestCase):
                 delivered = self._invoke(skill_md, "PICO_ARG_TOKEN")
                 self.assertIn("PICO_ARG_TOKEN", delivered, "$ARGUMENTS was not substituted")
                 self.assertNotIn("$ARGUMENTS", delivered, "the placeholder survived substitution")
+
+
+class SkillToolReferences(unittest.TestCase):
+    """A skill must not tell the model to call a tool that nothing registers.
+
+    That failure is invisible today: the skill parses, loads, reaches the model, and then the
+    model issues a call that comes back "Unknown or inactive tool". Nothing fails until a user
+    is watching it happen. This passes at the time of writing; its value is the day somebody
+    renames a tool and forgets the skill that names it.
+    """
+
+    CORE_TOOLS = {"read", "write", "edit", "shell"}
+    #: A tool name in prose looks like `es_logs`: backticked, snake_case, no spaces.
+    CANDIDATE = re.compile(r"`([a-z][a-z0-9]*(?:_[a-z0-9]+)+)`")
+
+    def _registered_tools(self, plugin_dir: Path) -> set:
+        """Tool names the plugin's own modules declare, plus the core four it can also call."""
+        names = set(self.CORE_TOOLS)
+        for source in plugin_dir.glob("*.py"):
+            names |= set(re.findall(r'name\s*=\s*"([a-z_]+)"', source.read_text()))
+        return names
+
+    def test_no_skill_references_a_tool_that_does_not_exist(self):
+        checked = 0
+        for plugin_dir in sorted(ROOT.glob("examples/plugins/*/")):
+            skills = sorted(plugin_dir.glob("skills/*/SKILL.md"))
+            if not skills:
+                continue
+            registered = self._registered_tools(plugin_dir)
+            namespaces = tuple(f"{n.split('_')[0]}_" for n in registered - self.CORE_TOOLS)
+            if not namespaces:
+                continue
+            for skill_md in skills:
+                with self.subTest(skill=skill_md.parent.name):
+                    referenced = set(self.CANDIDATE.findall(skill_md.read_text()))
+                    # Only names in this plugin's namespace. Prose mentions plenty of other
+                    # snake_case identifiers (field names, settings) that are not tool calls.
+                    plausible = {r for r in referenced if r.startswith(namespaces)}
+                    unknown = sorted(plausible - registered)
+                    self.assertEqual(unknown, [], f"references tools nothing registers: {unknown}")
+                    checked += 1
+        self.assertGreater(checked, 0, "no skills were checked; the namespace filter is too narrow")
 
 
 if __name__ == "__main__":
