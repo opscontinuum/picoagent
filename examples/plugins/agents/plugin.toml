@@ -1,0 +1,5 @@
+name = "agents"
+entry = "agents:register"
+version = "0.1.0"
+skills = ["skills"]
+python_deps = []
