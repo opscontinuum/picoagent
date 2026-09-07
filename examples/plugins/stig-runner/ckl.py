@@ -120,7 +120,7 @@ class Checklist:
     asset: dict[str, str]
     stig_info: dict[str, str]
     rules: list[Rule]
-    dirty: int = 0                #: edits made since load or last write
+    unsaved_edits: int = 0        #: determinations changed since load or last write
 
     # ------------------------------------------------------------------ reading
 
@@ -178,7 +178,7 @@ class Checklist:
                                ("severity_justification", "SEVERITY_JUSTIFICATION")):
             if updates[tag] is not None:
                 setattr(rule, attribute, updates[tag])
-        self.dirty += 1
+        self.unsaved_edits += 1
         return rule
 
     def set_asset(self, **fields: str) -> dict[str, str]:
@@ -194,7 +194,7 @@ class Checklist:
                 raise CklError(f"unknown ASSET field {tag}")
             _set_text(asset, tag, str(value))
             self.asset[tag] = str(value)
-        self.dirty += 1
+        self.unsaved_edits += 1
         return dict(self.asset)
 
     # ------------------------------------------------------------------ writing
@@ -223,7 +223,7 @@ class Checklist:
             raise CklError(f"refusing to write {path}: the serialised checklist is not "
                            f"well-formed XML ({exc}). The file on disk is unchanged.") from exc
         os.replace(temp, path)
-        self.dirty = 0
+        self.unsaved_edits = 0
         return path
 
 

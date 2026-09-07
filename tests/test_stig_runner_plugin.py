@@ -337,6 +337,22 @@ class DeterminationGateTests(StigBase):
         self.assertIn("needs an interactive session", result.content)
         self.assertEqual(ckl.load(self.ckl_path).rules[0].status, "Not_Reviewed")
 
+    def test_the_unsaved_edit_count_is_named_as_a_count_not_as_a_flag(self):
+        """``dirty`` reads as a yes/no; the value is how many determinations are unwritten.
+
+        The tool result is what a ``--json`` consumer branches on, so the key has to say which
+        of the two it is: a caller testing ``details["dirty"] is True`` against a count of 1
+        gets False on a checklist that does have unsaved work.
+        """
+        self.load()
+        first = self.tool("stig_set", ui=AskSpy(answer="accept"), vuln_num="V-222387",
+                          status="NotAFinding", finding_details="app/session.py:4")
+        second = self.tool("stig_set", ui=AskSpy(answer="accept"), vuln_num="V-222396",
+                           status="Open", finding_details="app/http_client.py:6")
+        self.assertNotIn("dirty", first.details)
+        self.assertEqual(first.details["unsaved_edits"], 1)
+        self.assertEqual(second.details["unsaved_edits"], 2)
+
     def test_accept_records_the_proposal(self):
         self.load()
         ui = AskSpy(answer="accept")

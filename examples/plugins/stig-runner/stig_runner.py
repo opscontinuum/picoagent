@@ -84,6 +84,10 @@ Tools: stig_load, stig_rules, stig_rule, stig_evidence, stig_set, stig_asset, st
   architecture. If there is no evidence, ask the user for the artifact rather than guessing.
 - Nothing is on disk until stig_save. Read the stig-asd-run skill before starting a review."""
 
+#: How much of the proposed finding details the confirmation prompt shows. The rest is the
+#: model's to summarise; a prompt taller than the terminal is a prompt nobody reads.
+PREVIEW_CHARS = 600
+
 #: Argument names that would amount to "skip the human". None of them is in any schema; the
 #: check is here so that adding one later fails a test instead of shipping.
 FORBIDDEN_ARGUMENTS = ("interactive", "unattended", "force", "no_confirm", "skip_confirm",
@@ -386,8 +390,9 @@ class SetTool(_StigTool):
                              severity_justification=justification or None)
         return result(ctx,
                       f"{rule.vuln_num} {rule.rule_ver} -> {status}\n{_counts_line(checklist)}\n"
-                      f"unsaved edits: {checklist.dirty} (run stig_save)",
-                      recorded=True, vuln_num=rule.vuln_num, status=status, dirty=checklist.dirty)
+                      f"unsaved edits: {checklist.unsaved_edits} (run stig_save)",
+                      recorded=True, vuln_num=rule.vuln_num, status=status,
+                      unsaved_edits=checklist.unsaved_edits)
 
 
 class AssetTool(_StigTool):
@@ -417,7 +422,7 @@ class AssetTool(_StigTool):
         except ckl.CklError as exc:
             return result(ctx, str(exc), is_error=True)
         return result(ctx, "ASSET\n" + _asset_block(checklist) +
-                      f"\nunsaved edits: {checklist.dirty} (run stig_save)",
+                      f"\nunsaved edits: {checklist.unsaved_edits} (run stig_save)",
                       asset=dict(checklist.asset))
 
 
@@ -495,7 +500,7 @@ async def _ask(ctx, rule: ckl.Rule, status: str, details: str, comments: str) ->
     The options deliberately include every status, so a user who disagrees can correct the
     determination here rather than having to ask the model to call the tool again.
     """
-    preview = details if len(details) <= 600 else details[:600] + "…"
+    preview = details if len(details) <= PREVIEW_CHARS else details[:PREVIEW_CHARS] + "…"
     prompt = (f"{rule.vuln_num} {rule.rule_ver} ({rule.severity}) {rule.title}\n"
               f"proposed status: {status}\nfinding details:\n{preview}"
               + (f"\ncomments: {comments}" if comments else "")
@@ -587,7 +592,7 @@ def register(api):
         checklist = session.checklist
         following = _next_unreviewed(checklist)
         lines = [f"{checklist.title}", f"{checklist.release}", f"file: {checklist.path}",
-                 _counts_line(checklist), f"unsaved edits: {checklist.dirty}"]
+                 _counts_line(checklist), f"unsaved edits: {checklist.unsaved_edits}"]
         lines.append(f"next: {_rule_line(following)}" if following else "next: nothing unreviewed")
         return "\n".join(lines)
     api.register_command("stig", stig_command, "STIG checklist progress and the next rule to review")
@@ -613,8 +618,8 @@ def register(api):
     async def remind(event, rt) -> None:
         """``agent_end``: unsaved answers live only in memory; say so before the turn ends."""
         checklist = session.checklist
-        if checklist is not None and checklist.dirty and rt.frontend:
+        if checklist is not None and checklist.unsaved_edits and rt.frontend:
             await rt.frontend.emit("notice", {
-                "text": f"stig-runner: {checklist.dirty} unsaved determination(s) on "
+                "text": f"stig-runner: {checklist.unsaved_edits} unsaved determination(s) on "
                         f"{checklist.path.name} - run stig_save before you close the session."})
     api.on("agent_end", remind)

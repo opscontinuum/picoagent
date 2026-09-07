@@ -248,38 +248,18 @@ def run_probes(root: Path, probes: list[Probe], max_hits: int = 20) -> ScanResul
 
     One walk, not one per probe: the file list and the file contents are shared, so adding a
     probe to a rule costs a regex, not another traversal.
+
+    One helper per probe kind, so the four promises the module docstring makes are four
+    functions a reader can check one at a time. A kind handled inline here while another sits
+    in a helper costs that reader two shapes to learn before they can read either one.
     """
     scan = ScanResult(results=[ProbeResult(probe) for probe in probes])
     files = walk(root, scan)
     relatives = {path: path.relative_to(root).as_posix() for path in files}
     scan.files_scanned = len(files)
 
-    grep_probes = [(result, re.compile(result.probe.pattern,
-                                       re.IGNORECASE if result.probe.ignore_case else 0))
-                   for result in scan.results if result.probe.kind == "grep"]
-    exists_probes = [result for result in scan.results if result.probe.kind == "exists"]
-
-    for result in exists_probes:
-        for path in files:
-            if _matches_globs(relatives[path], path.name, result.probe.globs):
-                _add(result, Hit(relatives[path], 0, "present"), max_hits)
-
-    if grep_probes:
-        for path in files:
-            relative = relatives[path]
-            wanted = [(result, regex) for result, regex in grep_probes
-                      if _matches_globs(relative, path.name, result.probe.globs)
-                      and not _complete(result, max_hits)]
-            if not wanted:
-                continue
-            content = read_text(path, scan)
-            if content is None:
-                continue
-            for number, line in enumerate(content.splitlines(), 1):
-                for result, regex in wanted:
-                    if not _complete(result, max_hits) and regex.search(line):
-                        _add(result, Hit(relative, number, excerpt(line)), max_hits)
-
+    _probe_exists(files, relatives, _of_kind(scan, "exists"), max_hits)
+    _probe_grep(files, relatives, _of_kind(scan, "grep"), scan, max_hits)
     for result in scan.results:
         if result.probe.kind == "manifest":
             _probe_manifests(root, files, relatives, result, scan, max_hits)
@@ -288,11 +268,57 @@ def run_probes(root: Path, probes: list[Probe], max_hits: int = 20) -> ScanResul
     return scan
 
 
-def _complete(result: ProbeResult, max_hits: int) -> bool:
+def _of_kind(scan: ScanResult, kind: str) -> list[ProbeResult]:
+    """The results belonging to the probes of one kind, in the order they were declared."""
+    return [result for result in scan.results if result.probe.kind == kind]
+
+
+def _probe_exists(files: list[Path], relatives: dict[Path, str], results: list[ProbeResult],
+                  max_hits: int) -> None:
+    """Presence alone: one hit per file a probe's globs cover, no content read."""
+    for result in results:
+        for path in files:
+            if _matches_globs(relatives[path], path.name, result.probe.globs):
+                _record_hit(result, Hit(relatives[path], 0, "present"), max_hits)
+
+
+def _probe_grep(files: list[Path], relatives: dict[Path, str], results: list[ProbeResult],
+                scan: ScanResult, max_hits: int) -> None:
+    """Every grep probe against every line, reading each file at most once.
+
+    All the probes are matched inside one pass over a file's lines rather than one pass each,
+    for the reason ``run_probes`` walks once: reading is what costs. A probe already at
+    ``max_hits`` is dropped from the pass, so a pattern that matches everything stops paying
+    for itself instead of scanning the rest of the tree to throw the matches away.
+    """
+    compiled = [(result, re.compile(result.probe.pattern,
+                                    re.IGNORECASE if result.probe.ignore_case else 0))
+                for result in results]
+    if not compiled:
+        return
+    for path in files:
+        relative = relatives[path]
+        wanted = [(result, regex) for result, regex in compiled
+                  if _matches_globs(relative, path.name, result.probe.globs)
+                  and not _is_full(result, max_hits)]
+        if not wanted:
+            continue
+        content = read_text(path, scan)
+        if content is None:
+            continue
+        for number, line in enumerate(content.splitlines(), 1):
+            for result, regex in wanted:
+                if not _is_full(result, max_hits) and regex.search(line):
+                    _record_hit(result, Hit(relative, number, excerpt(line)), max_hits)
+
+
+def _is_full(result: ProbeResult, max_hits: int) -> bool:
+    """Whether ``result`` has all the hits it is allowed to keep."""
     return len(result.hits) >= max_hits
 
 
-def _add(result: ProbeResult, hit: Hit, max_hits: int) -> None:
+def _record_hit(result: ProbeResult, hit: Hit, max_hits: int) -> None:
+    """Keep ``hit``, or mark the result truncated once ``max_hits`` of them are already kept."""
     if len(result.hits) >= max_hits:
         result.truncated = True
         return
@@ -321,7 +347,7 @@ def _probe_manifests(root: Path, files: list[Path], relatives: dict[Path, str],
             summary = (f"{_dependency_count(path.name, content)} declared dependencies; "
                        + (f"lockfile: {', '.join(locks)}" if locks
                           else "NO lockfile beside it - dependency versions are not pinned"))
-            _add(result, Hit(relative, 0, summary), max_hits)
+            _record_hit(result, Hit(relative, 0, summary), max_hits)
 
 
 #: Rough per-ecosystem "how many dependencies" patterns, keyed by the shape of the manifest.
@@ -355,4 +381,4 @@ def _probe_ci(root: Path, files: list[Path], relatives: dict[Path, str],
         tools = sorted({match.group(0).lower() for match in SECURITY_TOOLS.finditer(content)})
         summary = (f"pipeline; security tooling named: {', '.join(tools)}" if tools
                    else "pipeline; NO SAST or dependency-scanning step named in it")
-        _add(result, Hit(relative, 0, summary), max_hits)
+        _record_hit(result, Hit(relative, 0, summary), max_hits)

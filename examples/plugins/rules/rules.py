@@ -339,7 +339,7 @@ class RuleEngine:
                 current = self._current(rule)
                 if current is None or not current.matches(relpath):
                     continue
-                if await self._approved(current):
+                if await self._record_approval(current):
                     self.pending.append((current, relpath))
         return None
 
@@ -377,8 +377,15 @@ class RuleEngine:
         await self._notice(f"rules applied: {applied}")
 
     # ------------------------------------------------------------------ gate
-    async def _approved(self, rule: Rule) -> bool:
-        """Whether ``rule`` may be injected. The only place that answers yes for a project rule.
+    async def _record_approval(self, rule: Rule) -> bool:
+        """Settle whether ``rule`` may be injected, writing down the answer. Returns the answer.
+
+        Named for the writing rather than the answering. Reaching a decision here is what
+        *creates* the record: a yes calls :meth:`RuleTrust.trust`, which persists an approval to
+        ``rules-trust.json`` that outlives the session, and a no adds the rule to ``declined``,
+        which silences the prompt for the rest of it. A caller who read this as a question and
+        put it in a condition twice would have approved a rule on disk while believing they had
+        only asked about one.
 
         User rules are the user's own text and need no ceremony. Project rules need a live
         answer: trusted-and-unchanged passes, anything else asks, and a missing or
@@ -513,7 +520,7 @@ class RuleEngine:
         if rule is None:
             return f"'{name}' could not be read from disk"
         self.declined.discard(rule.key)
-        return f"'{name}' approved" if await self._approved(rule) else f"'{name}' not approved"
+        return f"'{name}' approved" if await self._record_approval(rule) else f"'{name}' not approved"
 
     # ------------------------------------------------------------------ helpers
     def _envelope(self, rule: Rule, relpath: str) -> str:

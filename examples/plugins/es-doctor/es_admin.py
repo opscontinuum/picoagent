@@ -94,11 +94,13 @@ SLOWLOG_INDEX = "logs-elasticsearch.slowlog-*,filebeat-*"
 SLOWLOG_DATASETS = ("elasticsearch.slowlog", "elasticsearch.index.slowlog", "elasticsearch.search.slowlog")
 
 #: Thread pools worth asking about; the rest are noise on a healthy cluster.
-THREAD_POOLS = "write,search,get,bulk,management,snapshot,force_merge,refresh,flush"
+THREAD_POOLS = ("write", "search", "get", "bulk", "management", "snapshot", "force_merge",
+                "refresh", "flush")
 
 HEAP_WARN_PERCENT = 75.0        # JVM heap that stays this high is the usual prelude to old-GC pain
 DISK_WARN_PERCENT = 85.0        # cluster.routing.allocation.disk.watermark.low default
 PENDING_TASK_WARN_SECONDS = 30  # a cluster-state task queued this long means a busy master
+OLD_GC_WARN_MILLIS = 60_000     # a minute of old-generation GC, totalled over the node's life
 
 
 # ------------------------------------------------------------------ small helpers
@@ -384,7 +386,7 @@ class NodesTool(_AdminTool):
                 found.append(_flag(f"{name}: breaker {breaker} tripped {body['tripped']} times "
                                    f"(estimated {body.get('estimated_size')} of {body.get('limit_size')})"))
         gc_old = _dig(stats, "jvm", "gc", "collectors", "old") or {}
-        if _num(gc_old.get("collection_time_in_millis")) > 60_000:
+        if _num(gc_old.get("collection_time_in_millis")) > OLD_GC_WARN_MILLIS:
             found.append(_flag(f"{name}: old-generation GC has spent "
                                f"{_num(gc_old['collection_time_in_millis']) / 1000:.0f}s over "
                                f"{gc_old.get('collection_count')} collections"))
@@ -392,7 +394,8 @@ class NodesTool(_AdminTool):
 
     def _thread_pools(self, node: str, ctx):
         columns = "node_name,name,active,queue,rejected,completed,size,queue_size,type"
-        rows = self.es.request("GET", f"/_cat/thread_pool/{THREAD_POOLS}?format=json&h={columns}")
+        pools = ",".join(THREAD_POOLS)
+        rows = self.es.request("GET", f"/_cat/thread_pool/{pools}?format=json&h={columns}")
         if node:
             rows = [r for r in rows if node in (r.get("node_name") or "")]
         rows.sort(key=lambda r: (-_num(r.get("rejected")), -_num(r.get("queue")), r.get("node_name") or "",
@@ -402,7 +405,7 @@ class NodesTool(_AdminTool):
                   r.get("queue", ""), r.get("queue_size", ""), r.get("rejected", ""),
                   r.get("completed", ""), r.get("size", "")] for r in rows]
         busy = [r for r in rows if _num(r.get("rejected")) or _num(r.get("queue"))]
-        lines = [f"{len(rows)} thread pools ({THREAD_POOLS}); rejecting or queueing first",
+        lines = [f"{len(rows)} thread pools ({pools}); rejecting or queueing first",
                  text_table(header, table) if table else "(no thread pools match)"]
         if busy:
             lines += ["", "Rejections mean work was dropped, not delayed - the client saw an error:"]

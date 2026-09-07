@@ -103,6 +103,11 @@ es_correlate (errors vs cpu/memory/latency, same window, same host/service) -> r
 
 _DURATION = re.compile(r"^\d+[smhd]$")
 
+#: Buckets where both series carry a value, below which no correlation is reported.
+MIN_CORRELATION_PAIRS = 3
+#: Buckets a series needs before any of them can be called a spike.
+MIN_SPIKE_SAMPLES = 4
+
 
 def time_bound(value: str | None, default: str) -> str:
     """Accept ISO timestamps, ES date-math (``now-1h``) or bare durations (``15m`` -> ``now-15m``)."""
@@ -153,9 +158,14 @@ def bucket_label(bucket: dict) -> str:
 
 
 def pearson(xs: list[float], ys: list[float]) -> float | None:
-    """Correlation coefficient, or ``None`` when either series is constant."""
+    """Correlation coefficient, or ``None`` when there is no honest one to report.
+
+    ``None`` covers both refusals, and the caller renders it the same way: fewer than
+    :data:`MIN_CORRELATION_PAIRS` buckets where both series have a value, or either series
+    constant across them. An r computed from two points is 1.0 or -1.0 whatever the data did.
+    """
     pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
-    if len(pairs) < 3:
+    if len(pairs) < MIN_CORRELATION_PAIRS:
         return None
     mx = sum(p[0] for p in pairs) / len(pairs)
     my = sum(p[1] for p in pairs) / len(pairs)
@@ -167,9 +177,13 @@ def pearson(xs: list[float], ys: list[float]) -> float | None:
 
 
 def spike_indices(values: list[float], sigma: float = 2.0) -> list[int]:
-    """Indices where the value exceeds mean + ``sigma`` standard deviations."""
+    """Indices where the value exceeds mean + ``sigma`` standard deviations.
+
+    Empty rather than wrong for a series with fewer than :data:`MIN_SPIKE_SAMPLES` values or
+    no variation at all: a standard deviation taken over two buckets calls one of them a spike.
+    """
     clean = [v for v in values if v is not None]
-    if len(clean) < 4:
+    if len(clean) < MIN_SPIKE_SAMPLES:
         return []
     mean = sum(clean) / len(clean)
     std = math.sqrt(sum((v - mean) ** 2 for v in clean) / len(clean))
@@ -334,51 +348,59 @@ class CorrelateTool(_ESTool):
         "logs_index": {"type": "string"}, "metrics_index": {"type": "string"}, "traces_index": {"type": "string"}}}
 
     def run(self, args, ctx):
+        """Three queries, one table, then the two readings a responder wants off it.
+
+        The coefficients and the spike section are separate functions because each answers a
+        separate question about the same table - "does anything move with the errors" and
+        "when did the errors jump, and what were they" - and a responder reads one of them at
+        a time under pressure. Inline, the two answers and the query bodies that produced
+        neither sat in one block a reader had to hold whole.
+        """
         interval = args.get("interval") or "1m"
         window = time_filters(args.get("since"), args.get("until"))
         who = entity_filters(args.get("host"), args.get("service"), args.get("container"))
-        metrics = [metric_field(m) for m in (args.get("metrics") or ["cpu", "memory"])]
+        fields = [metric_field(name) for name in (args.get("metrics") or ["cpu", "memory"])]
 
         errors_by_bucket, total_by_bucket = self._log_series(args, window, who, interval)
-        metric_series = {m: self._metric_series(args, window, entity_filters(args.get("host"), None, args.get("container")), interval, m) for m in metrics}
+        host_and_container = entity_filters(args.get("host"), None, args.get("container"))
+        metric_series = {field: self._metric_series(args, window, host_and_container, interval, field)
+                         for field in fields}
         apm = self._apm_series(args, window, who, interval) if args.get("include_apm", True) else None
 
-        keys = sorted(set(total_by_bucket) | {k for s in metric_series.values() for k in s} | set(apm["p50"] if apm else []))
-        if not keys:
+        buckets = sorted(set(total_by_bucket)
+                         | {bucket for series in metric_series.values() for bucket in series}
+                         | set(apm["p50"] if apm else []))
+        if not buckets:
             return result(ctx, "no data in window; widen since/until or drop host/service filters", is_error=True)
 
-        errors = [errors_by_bucket.get(k, 0) for k in keys]
-        header = ["bucket", "errors", "logs"] + [metric_label(m) for m in metrics]
+        errors = [errors_by_bucket.get(bucket, 0) for bucket in buckets]
+        header = ["bucket", "errors", "logs"] + [metric_label(field) for field in fields]
         header += ["apm_p50_ms", "apm_fail"] if apm else []
         rows = []
-        for i, k in enumerate(keys):
-            row = [k[:16].replace("T", " "), errors[i], total_by_bucket.get(k, 0)]
-            row += [fmt(metric_series[m].get(k)) for m in metrics]
+        for position, bucket in enumerate(buckets):
+            row = [bucket[:16].replace("T", " "), errors[position], total_by_bucket.get(bucket, 0)]
+            row += [fmt(metric_series[field].get(bucket)) for field in fields]
             if apm:
-                p50 = apm["p50"].get(k)
-                row += [fmt(p50 / 1000, 0) if p50 else "-", apm["fail"].get(k, 0)]
+                p50 = apm["p50"].get(bucket)
+                row += [fmt(p50 / 1000, 0) if p50 else "-", apm["fail"].get(bucket, 0)]
             rows.append(row)
 
-        lines = [f"errors vs metrics per {interval}, {len(keys)} buckets", text_table(header, rows), "", "Correlation of error count with:"]
-        for m in metrics:
-            r = pearson(errors, [metric_series[m].get(k) for k in keys])
-            lines.append(f"  {m:40} r={fmt(r, 2)} {_strength(r)}")
-        if apm:
-            r_lat = pearson(errors, [apm['p50'].get(k) for k in keys])
-            r_fail = pearson(errors, [apm['fail'].get(k, 0) for k in keys])
-            lines.append(f"  {'apm transaction.duration.us (p50)':40} r={fmt(r_lat, 2)} {_strength(r_lat)}")
-            lines.append(f"  {'apm event.outcome=failure count':40} r={fmt(r_fail, 2)} {_strength(r_fail)}")
-
         spikes = spike_indices(errors)
-        if spikes:
-            first, last = keys[spikes[0]], keys[spikes[-1]]
-            lines.append(f"\nError spike: {len(spikes)} bucket(s) from {first[:16]} to {last[:16]} (>2σ above mean)")
-            lines.append("Top error messages during the spike:")
-            for msg, count in self._top_errors(args, first, last, who):
-                lines.append(f"  {count:>5}  {msg[:160]}")
-        else:
-            lines.append("\nNo error spike (>2σ) detected in this window.")
-        return result(ctx, "\n".join(lines), buckets=len(keys), spike_buckets=len(spikes))
+        lines = [f"errors vs metrics per {interval}, {len(buckets)} buckets", text_table(header, rows), "",
+                 "Correlation of error count with:",
+                 *_correlation_lines(errors, buckets, fields, metric_series, apm),
+                 *self._spike_lines(args, buckets, spikes, who)]
+        return result(ctx, "\n".join(lines), buckets=len(buckets), spike_buckets=len(spikes))
+
+    def _spike_lines(self, args, buckets, spikes, who) -> list[str]:
+        """The spike section: when the errors jumped, and the messages inside the jump."""
+        if not spikes:
+            return ["\nNo error spike (>2σ) detected in this window."]
+        first, last = buckets[spikes[0]], buckets[spikes[-1]]
+        lines = [f"\nError spike: {len(spikes)} bucket(s) from {first[:16]} to {last[:16]} (>2σ above mean)",
+                 "Top error messages during the spike:"]
+        return lines + [f"  {count:>5}  {message[:160]}"
+                        for message, count in self._top_errors(args, first, last, who)]
 
     # ---- the three series -------------------------------------------------
     def _log_series(self, args, window, who, interval) -> tuple[dict[str, int], dict[str, int]]:
@@ -427,6 +449,21 @@ class CorrelateTool(_ESTool):
             msg = re.sub(r"\d+", "N", src.get("message") or (src.get("error") or {}).get("message") or "")   # collapse ids/numbers
             counts[msg] = counts.get(msg, 0) + 1
         return sorted(counts.items(), key=lambda kv: -kv[1])[:5]
+
+
+def _correlation_lines(errors: list[int], buckets: list[str], fields: list[str],
+                       metric_series: dict[str, dict], apm: dict | None) -> list[str]:
+    """One ``r=`` line per series, every one of them against the same error counts."""
+    series: list[tuple[str, list]] = [(field, [metric_series[field].get(bucket) for bucket in buckets])
+                                      for field in fields]
+    if apm:
+        series.append(("apm transaction.duration.us (p50)", [apm["p50"].get(bucket) for bucket in buckets]))
+        series.append(("apm event.outcome=failure count", [apm["fail"].get(bucket, 0) for bucket in buckets]))
+    lines = []
+    for label, values in series:
+        coefficient = pearson(errors, values)
+        lines.append(f"  {label:40} r={fmt(coefficient, 2)} {_strength(coefficient)}")
+    return lines
 
 
 def _strength(r: float | None) -> str:
