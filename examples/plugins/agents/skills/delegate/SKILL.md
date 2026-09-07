@@ -60,9 +60,11 @@ There are two bounds and only one of them is yours.
   timeout is the only thing that ends that, and it discards the output.
 
 If an `agent` tool is available, prefer it. It runs the child in this process with a real turn
-cap, so a child that loops is stopped at a turn count and you still get the text it produced.
-Use the subprocess route below when the child must outlive this turn, run somewhere else, or use
-a different model or config than this session.
+cap, so a child that loops is stopped at a turn count and you still get the text it produced. Its
+tool calls also run through this session's `tool_call` handlers, so a gate that would stop a
+command here stops it in the child too, and a gate that asks reaches the user instead of a
+headless default. Use the subprocess route below when the child must outlive this turn, run
+somewhere else, or use a different model or config than this session.
 
 A timeout kills the child's whole process tree and returns `Command timed out after Ns` with
 **none** of its output. If losing the work would hurt, write the run to a file first:

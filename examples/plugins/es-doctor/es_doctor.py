@@ -34,6 +34,11 @@ Configuration (``[plugins.es-doctor]`` or env vars)::
     logs_index = "logs-*,filebeat-*"          # override the default patterns if your naming differs
     metrics_index = "metrics-*,metricbeat-*"
     traces_index = "traces-apm*,apm-*"
+
+The three index patterns are the only keys a repository's ``.picoagent/config.toml`` may set;
+see :data:`PROJECT_SETTABLE`. Connection and destructive-access settings come from your own
+config, because a repository that could move ``url`` would be given the API key sitting next
+to it in your config.
 """
 from __future__ import annotations
 
@@ -50,6 +55,19 @@ from es_client import (DEFAULT_LOGS_INDEX, DEFAULT_METRICS_INDEX, DEFAULT_TRACES
 # ------------------------------------------------------------------ Elastic knowledge
 # Beats and Elastic Agent write ECS documents into these data streams; the default patterns
 # live in es_client.py, so a user with legacy indices overrides three config keys.
+
+#: The only ``[plugins.es-doctor]`` keys taken from a repository's ``.picoagent/config.toml``.
+#: Which index a repository's own logs land in is what a repository knows and the person who
+#: cloned it does not, and the worst a wrong pattern does is return no documents. Everything
+#: else in this plugin's config - ``url``, ``api_key``, ``username``, ``password``,
+#: ``verify_tls``, ``ca_cert``, ``allow_destructive`` - decides where a credential travels, what
+#: TLS is checked, or whether the model may delete data, and is read from the user layer only.
+#:
+#: Each key carries its default, which is also the shape the repository's value must have: an
+#: index pattern is a string, and ``logs_index = 5`` gets the default back rather than reaching
+#: a URL path. Naming the keys without their defaults left the type unchecked.
+PROJECT_SETTABLE = {"logs_index": DEFAULT_LOGS_INDEX, "metrics_index": DEFAULT_METRICS_INDEX,
+                    "traces_index": DEFAULT_TRACES_INDEX}
 
 #: Friendly names -> ECS / Beats metric fields.
 METRIC_ALIASES = {
@@ -418,13 +436,23 @@ def register(api):
     import es_admin       # sibling module; the loader puts the plugin root on sys.path
 
     cfg = api.plugin_config()
+    # Two kinds of setting, two layers. The connection is where a credential goes and what TLS
+    # is checked, and ``allow_destructive`` decides whether the model may delete an index, so all
+    # of those come from the user's own config only - a cloned repository that set ``url`` would
+    # have the key in your config sent to its host on the first cluster call. Index patterns are
+    # taste: which indices this repository's logs live in is exactly the thing a repository knows
+    # and you do not, and naming the wrong index returns no documents rather than leaking any.
+    api.warn_about_project_config(*PROJECT_SETTABLE)
+    indices = cfg.with_project(**PROJECT_SETTABLE)
     es = ESClient(url=cfg.get("url") or os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200"),
                   api_key=cfg.get("api_key") or os.environ.get("ELASTICSEARCH_API_KEY", ""),
                   username=cfg.get("username", ""), password=cfg.get("password", ""),
                   verify_tls=cfg.get("verify_tls", True),
                   ca_cert=cfg.get("ca_cert", ""))
-    settings = Settings(logs_index=cfg.get("logs_index", DEFAULT_LOGS_INDEX), metrics_index=cfg.get("metrics_index", DEFAULT_METRICS_INDEX),
-                        traces_index=cfg.get("traces_index", DEFAULT_TRACES_INDEX), allow_destructive=bool(cfg.get("allow_destructive", False)))
+    settings = Settings(logs_index=indices.get("logs_index", DEFAULT_LOGS_INDEX),
+                        metrics_index=indices.get("metrics_index", DEFAULT_METRICS_INDEX),
+                        traces_index=indices.get("traces_index", DEFAULT_TRACES_INDEX),
+                        allow_destructive=bool(cfg.get("allow_destructive", False)))
 
     for tool_class in (ClusterHealthTool, IndicesTool, LogsTool, MetricsTool, CorrelateTool, SearchTool, RequestTool):
         api.register_tool(tool_class(es, settings))

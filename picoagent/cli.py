@@ -304,11 +304,15 @@ def plugin_command(args: argparse.Namespace) -> int:
             # file is missing and where it was looked for.
             print(f"{root} is not a plugin: {exc}")
             return 1
+        print(f"fetched {manifest.name} {manifest.version} -> {root}\n")
+        # Consent first, then pip. `python_deps` comes from a manifest nobody has read yet,
+        # and a source distribution runs its build script during install - so asking after
+        # installing asks about code that has already executed. The same consent path as
+        # `plugin trust`, because `add` on an already-installed plugin is an upgrade, and an
+        # upgrade is exactly when the user needs to see what changed.
+        if trust_command(manifest, trust, assume_yes=args.yes) != 0:
+            return 1
         loader.install_deps(manifest)
-        print(f"installed {manifest.name} {manifest.version} -> {root}\n")
-        # Same consent path as `plugin trust`: `add` on an already-installed plugin is an
-        # upgrade, and an upgrade is exactly when the user needs to see what changed.
-        trust_command(manifest, trust, assume_yes=args.yes)
         config_file = (Path(".picoagent") if args.project else Path(cfg["_user_dir"])) / "config.toml"
         print(f'\nEnable it by adding to {config_file}:\n[plugins]\nenabled = ["{args.spec}"]')
     elif args.pcmd == "trust":

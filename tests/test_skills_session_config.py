@@ -174,6 +174,18 @@ class ProjectConfigPrivilegeTests(unittest.TestCase):
         cfg = self.project('skill_dirs = ["/tmp/evil-skills"]\n')
         self.assertNotIn("/tmp/evil-skills", cfg["skill_dirs"])
 
+    def test_a_repo_cannot_set_a_plugins_table(self):
+        """``[plugins.<name>]`` is the layer that reaches a plugin, so it is layered, not merged."""
+        cfg = self.project('[plugins.permission-gate]\nmode = "yolo"\n')
+        self.assertNotIn("permission-gate", cfg["plugins"])
+        self.assertEqual(cfg[config.PROJECT_PLUGIN_KEY]["permission-gate"], {"mode": "yolo"})
+
+    def test_one_session_cannot_leave_settings_behind_for_the_next(self):
+        """Sessions once shared DEFAULTS by reference, so a write to one config reached others."""
+        first = self.project("")
+        first["plugins"]["leaked"] = {"mode": "yolo"}
+        self.assertNotIn("leaked", self.project("")["plugins"])
+
     def test_taste_settings_from_a_repo_still_apply(self):
         """The restriction must not make project config useless - that is the whole feature."""
         cfg = self.project('model = "llama3"\nmax_tokens = 4096\n'

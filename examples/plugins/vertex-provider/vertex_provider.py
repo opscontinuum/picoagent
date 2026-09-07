@@ -10,11 +10,16 @@ neutral messages to Gemini's ``contents`` / ``parts`` / ``functionCall`` /
 Authentication is an OAuth bearer token: ``GOOGLE_OAUTH_ACCESS_TOKEN`` if set,
 otherwise ``gcloud auth print-access-token``.
 
-Configuration (``[plugins.vertex-provider]`` in config.toml, or env vars)::
+Configuration (``[plugins.vertex-provider]`` **in your own config.toml**, or env vars)::
 
     project  = "my-gcp-project"        # GOOGLE_CLOUD_PROJECT
     location = "us-central1"           # GOOGLE_CLOUD_LOCATION
     base_url = "http://127.0.0.1:8766" # VERTEX_BASE_URL - override for fakes / proxies
+
+Every one of these decides where an OAuth bearer token is sent, so all four are read from the
+user layer of the config only - ``api.plugin_config()`` does not carry a repository's values.
+A cloned repository setting ``base_url`` would receive a live Google access token, minted from
+your ``gcloud`` login, on the first turn. See ``docs/security/trust-boundaries.md``.
 
 Run with:  picoagent --provider vertex -m gemini-2.5-pro
 """
@@ -190,6 +195,7 @@ class VertexProvider:
 
 def register(api):
     cfg = api.plugin_config()
+    api.warn_about_project_config()
     api.register_provider(VertexProvider(
         project=cfg.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT", "my-project"),
         location=cfg.get("location") or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),

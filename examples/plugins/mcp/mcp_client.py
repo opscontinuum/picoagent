@@ -17,7 +17,8 @@ Two things this file is careful about, because both are silent when wrong:
   schema. Anything else is refused at registration, where the reason can be reported, rather
   than at the provider, where it is an opaque HTTP 400 on an unrelated turn.
 
-Configuration (``[plugins.mcp]``)::
+Configuration (``[plugins.mcp]`` **in your own ~/.picoagent/config.toml**; a server named by a
+repository's ``.picoagent/config.toml`` is refused, because connecting one runs its command)::
 
     [plugins.mcp]
     timeout = 30                      # seconds per tools/call; per-server override below
@@ -50,6 +51,13 @@ log = logging.getLogger("mcp")
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_STARTUP_TIMEOUT = 20.0
+#: The only ``[plugins.mcp]`` keys read from a repository's config. Both say how long to wait;
+#: neither says what to run. ``servers`` is deliberately absent - see :func:`register`.
+#:
+#: Each carries its default, which is also the shape the repository's value must have. Without
+#: that, ``timeout = "soon"`` reached ``float()`` in :func:`server_specs` and took ``register()``
+#: down with it, so a repository could delete the user's own MCP servers by mistyping a number.
+PROJECT_SETTABLE = {"timeout": DEFAULT_TIMEOUT, "startup_timeout": DEFAULT_STARTUP_TIMEOUT}
 #: What OpenAI-style function names accept, and the narrowest of the rules across providers.
 UNSAFE_IN_NAME = re.compile(r"[^a-zA-Z0-9_-]")
 MAX_NAME_LENGTH = 64
@@ -297,7 +305,16 @@ atexit.register(close_all)
 
 
 def register(api) -> None:
-    statuses = [connect(spec, api) for spec in server_specs(api.plugin_config())]
+    # ``servers`` is a list of commands this function spawns before the first turn, with the
+    # user's environment and the project directory as cwd. That makes it the one setting in this
+    # plugin that must never come out of a cloned repository: ``[plugins.mcp.servers.x]`` with a
+    # ``command`` would be arbitrary code executed at session start, ahead of any prompt, ahead
+    # of the plugin trust store that gates every other way a repository gets code to run.
+    # ``api.plugin_config()`` reads the user layer, so the servers here are the user's own.
+    # The two timeouts are how long to wait, not what to run, so a repository may set them.
+    settings = api.plugin_config()
+    api.warn_about_project_config(*PROJECT_SETTABLE)
+    statuses = [connect(spec, api) for spec in server_specs(settings.with_project(**PROJECT_SETTABLE))]
     if any(status.registered for status in statuses):
         api.register_system_prompt_section("mcp", lambda: prompt_section(statuses))
 

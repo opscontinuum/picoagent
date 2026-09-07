@@ -7,6 +7,10 @@ which is how plugins override built-ins.
 
 Handlers, commands and tools registered here are tagged with the plugin's name so
 they can be listed and, later, unloaded.
+
+One thing to know before reading settings: :meth:`PluginAPI.plugin_config` answers with the
+user's config layers, not with a repository's. A repository's ``[plugins.<name>]`` values are
+kept apart and taken only when a plugin names them. See :class:`picoagent.core.config.PluginConfig`.
 """
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ import asyncio
 from pathlib import Path
 from typing import Any, Callable
 
+from ..core.config import PluginConfig, plugin_config
 from ..core.loop import Runtime
 from ..core.skills import Skill
 
@@ -21,6 +26,22 @@ from ..core.skills import Skill
 class PluginAPI:
     def __init__(self, rt: Runtime, name: str, root: Path):
         self.rt, self.name, self.root = rt, name, root
+        self.required_reason: str | None = None
+
+    def declare_required(self, reason: str) -> None:
+        """Say that this session should not run without this plugin.
+
+        The loader's default is to catch whatever ``register()`` raises, note the plugin as
+        skipped, and carry on. That is right for a plugin that adds a convenience and wrong for
+        one that provides a control: a session missing its permission gate looks exactly like a
+        session whose permission gate allowed everything. The loader cannot tell those plugins
+        apart, so the plugin says so, and a failure after this call stops startup instead.
+
+        Call it as the first statement in ``register()``. A failure before it - a syntax error,
+        a missing import - is still a plain skip, because nothing has said otherwise yet. That
+        is the honest limit of a declaration made in code the declaration is meant to protect.
+        """
+        self.required_reason = reason
 
     # ------------------------------------------------------------------ events
     def on(self, event: str, handler: Callable) -> None:
@@ -141,6 +162,42 @@ class PluginAPI:
         """Cancel the current run at the next safe point."""
         self.rt.abort.set()
 
-    def plugin_config(self) -> dict:
-        """Settings from ``[plugins.<this plugin>]`` in config.toml (empty dict if absent)."""
-        return self.rt.cfg.get("plugins", {}).get(self.name, {})
+    def plugin_config(self) -> PluginConfig:
+        """Settings from ``[plugins.<this plugin>]`` in config.toml (empty if absent).
+
+        Reads as a dict of the **user's** layers. A repository's ``[plugins.<this plugin>]``
+        values sit beside them and are reachable by name through ``.from_project(key)`` or
+        ``.with_project(*keys)``, and ``.source(key)`` says which layer a value came from.
+        Both readers take the default you pass as the shape the repository's value must have,
+        so a mistyped project value costs you the value and not your ``register()``.
+        See :class:`picoagent.core.config.PluginConfig` for why that is the default direction.
+        """
+        return plugin_config(self.rt.cfg, self.name)
+
+    def warn_about_project_config(self, *accepted: str) -> None:
+        """At session start, name the ``[plugins.<this plugin>]`` keys this repository set and
+        this plugin did not take. Pass the keys you deliberately accept from a repository.
+
+        Refusing a value and saying nothing leaves two people confused: whoever wrote the project
+        config wonders why it did nothing, and whoever cloned the repository never learns it tried
+        to move an endpoint or start a process. Both need to see the same line.
+
+        An *accepted* key that arrived with the wrong type is reported here too. It is refused
+        deeper down, by :class:`~picoagent.core.config.PluginConfig`, and a plugin author who
+        never thinks about types still gets the announcement: the message is collected in the
+        config layer and read back at session start, after ``register()`` has done its reading.
+        """
+        ignored = [key for key in self.plugin_config().project_keys() if key not in accepted]
+
+        async def announce(event: dict, rt) -> None:
+            if not rt.frontend:
+                return
+            lines = []
+            if ignored:
+                lines.append(f"{self.name}: ignored {', '.join(ignored)} from this repository's "
+                             ".picoagent/config.toml - these are read from your own config only.")
+            lines += [f"{self.name}: {message}" for message in self.plugin_config().refusals]
+            if lines:
+                await rt.frontend.emit(
+                    "notice", {"text": "\n".join(lines + ["See docs/security/trust-boundaries.md"])})
+        self.on("session_start", announce)

@@ -227,5 +227,57 @@ class RulesPluginTests(unittest.TestCase):
         self.assertNotIn("\r", prompt)
 
 
+class DelegatedToolCallTests(unittest.TestCase):
+    """What a child agent touches must not spend the parent's once-per-session rule delivery.
+
+    The agents plugin forwards a child's ``tool_call`` to the parent's bus so the parent's
+    security gates still see it. The rules plugin also lives on ``tool_call``, but it is not a
+    gate: it keeps per-session state there and delivers text from ``turn_end``, on the parent's
+    conversation. Forwarding without a distinction runs it split-brain, the ``tool_call`` half
+    firing for the child and the ``turn_end`` half for the parent.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "a.py").write_text("print('hi')\n")
+        directory = self.tmp / "home" / "rules"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "python-style.md").write_text(USER_RULE)
+
+    def _rt(self, turns):
+        """A parent running both plugins, one script driving parent and child alike."""
+        self.provider = ScriptedProvider(turns)
+        rt = make_runtime(self.tmp, provider=self.provider, frontend=RecordingFrontend())
+        trust = loader.TrustStore(self.tmp / "home")
+        for plugin in ("rules", "agents"):
+            loader.load_plugin(PLUGINS / plugin, rt, trust, allow_untrusted=True)
+        return rt
+
+    @staticmethod
+    def _conversation(rt) -> str:
+        return "\n".join(message.text or "" for message in rt.session.messages())
+
+    def test_a_file_only_the_child_read_does_not_inject_a_rule_into_the_parent(self):
+        rt = self._rt([[call("agent", prompt="read a.py and summarise it")],
+                       [call("read", path="a.py")],
+                       [text("a.py prints hi")],
+                       [text("the child said: a.py prints hi")]])
+        run(AgentLoop(rt).run("delegate the reading"))
+        self.assertNotIn("USER RULE BODY", self._conversation(rt))
+
+    def test_the_parent_still_gets_the_rule_when_it_reads_the_file_itself(self):
+        """The once-per-session marker must still be unspent when the parent's own turn comes."""
+        rt = self._rt([[call("agent", prompt="read a.py")],
+                       [call("read", path="a.py")],
+                       [text("a.py prints hi")],
+                       [call("read", path="a.py")],
+                       [text("done")]])
+        run(AgentLoop(rt).run("delegate, then look myself"))
+        self.assertEqual(self._conversation(rt).count("USER RULE BODY"), 1)
+        order = [event for event, payload in rt.frontend.events
+                 if event == "tool_result" or (event == "notice" and "rules applied" in payload["text"])]
+        self.assertEqual(order, ["tool_result", "tool_result", "notice"])
+
+
 if __name__ == "__main__":
     unittest.main()

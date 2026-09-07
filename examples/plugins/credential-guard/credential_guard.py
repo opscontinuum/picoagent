@@ -26,6 +26,11 @@ Two concerns, kept separate:
    before the command ever sees them, and a ``tool_call`` guard blocks ``read``/``write``/
    ``edit``/``grep_search`` (and a shell ``cat``/``Get-Content``-style command) from touching
    the credentials file.
+
+Configuration (``[plugins.credential-guard]``)::
+
+    extra_allow_env = ["MY_BUILD_FLAG"]     # your config only: this widens what a command sees
+    extra_deny_patterns = ["_pat$"]         # a repository may add to this: it only refuses more
 """
 from __future__ import annotations
 
@@ -442,9 +447,28 @@ async def warn_about_inline_keys(event: dict, rt) -> None:
 # --------------------------------------------------------------------------- register
 
 def register(api):
+    api.declare_required("without it the shell tool is the built-in one, which passes every "
+                         "environment variable, API keys included, to whatever the model runs")
+    # ``extra_allow_env`` names variables a shell command may see, so it is the boundary this
+    # plugin exists to hold, and it is read from the user's config only. A cloned repository that
+    # added ``DATABASE_URL`` (which the secret-shaped denylist does not match, because no denylist
+    # of names is complete) would have it in the environment of the first command the model ran,
+    # and the output of that command goes to the session log and back into the next prompt.
+    # ``extra_deny_patterns`` runs the other way: it only ever refuses more, and a repository
+    # knowing the shape of its own secret variable names is worth having, so it is added to the
+    # user's list rather than replacing it.
+    #
+    # The ``[]`` passed to ``from_project`` is the shape the repository's value must have, and
+    # the seam returns ``[]`` when it does not. It is not wrapped in ``list()`` here: that wrap
+    # is what turned ``extra_deny_patterns = 5`` into a ``TypeError`` in this function, and a
+    # ``register()`` that raises is skipped by the loader - leaving the *built-in* shell tool
+    # registered and every secret-shaped variable in the environment of the next command.
     config = api.plugin_config()
-    api.register_tool(GuardedShellTool(extra_deny=config.get("extra_deny_patterns"),
-                                        extra_allow=config.get("extra_allow_env")))
+    api.warn_about_project_config("extra_deny_patterns")
+    deny = (list(config.get("extra_deny_patterns") or [])
+            + config.from_project("extra_deny_patterns", []))
+    api.register_tool(GuardedShellTool(extra_deny=deny,
+                                       extra_allow=config.get("extra_allow_env")))
     api.on("tool_call", guard_tool_call)
     api.on("session_start", warn_about_inline_keys)
     api.register_command("secrets", secrets_command,

@@ -286,7 +286,26 @@ class RuleEngine:
         should not be, because the model is mid-batch. Delivery therefore waits for
         :meth:`on_turn_end`. This handler always returns ``None``: a rules plugin that could
         block a tool call would be a permission system wearing the wrong name.
+
+        A ``delegated`` call is skipped, and that check has to be the first thing here. The
+        agents plugin runs a child agent in-process and re-emits the child's ``tool_call`` on the
+        parent's bus so the parent's gates still see it; this handler is on that bus but is not a
+        gate. Its half of the plugin writes ``self.pending`` and the other half runs at the
+        *parent's* ``turn_end``, so a child reading a file would spend the parent's
+        once-per-session delivery on it and inject the body into the parent's conversation, for a
+        file the parent never touched. The parent then reads that file itself and gets nothing,
+        because the rule is already marked delivered.
+
+        Skipping, not deferring: a rule is guidance for the conversation that touched the file,
+        and the child's conversation is not this one. The child gets no rule either, and that is
+        the honest state of things rather than a second bug - only ``tool_call`` is forwarded, so
+        this plugin has no channel into the child's stream at all. A child is given its whole task
+        in one prompt by the parent and cannot ask a follow-up, so guidance arriving mid-run has
+        far less to change there. If that stops being true, the fix is a rules engine of the
+        child's own on the child's bus, not this handler reaching across.
         """
+        if event.get("delegated"):
+            return None
         for relpath in self._paths_in(event.get("name", ""), event.get("args") or {}):
             for rule in self.rules:
                 if rule.key in self.delivered or rule.key in self.declined:
