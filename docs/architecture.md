@@ -24,6 +24,7 @@ picoagent/
     commands.py          slash-command registry
     events.py            the event bus
     config.py            layered TOML config
+    text.py              untrusted text made safe to show a person
     types.py             dataclasses shared by everything
   plugins/
     api.py               PluginAPI - the only thing plugins import

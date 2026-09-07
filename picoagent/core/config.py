@@ -55,7 +55,6 @@ DEFAULTS: dict[str, Any] = {
     "skill_dirs": ["skills", ".picoagent/skills", ".agents/skills"],
     "plugins": {"enabled": []},   # also: [plugins].rewrite maps a url prefix to a mirror
     "upgrade": {"check_on_startup": False, "app_repo": ""},
-    "frontend": "plain",
 }
 
 
@@ -82,6 +81,13 @@ PROJECT_PLUGIN_KEY = "_project_plugin_config"
 
 #: Keys under ``[plugins]`` that belong to the loader, not to a plugin's own settings table.
 PLUGINS_RESERVED: tuple[str, ...] = ("enabled", "rewrite")
+
+#: The sentence explaining why the repository's config.toml was dropped, or ``None`` when it parsed.
+#: A repository you cloned must not be able to stop your tool starting, so an unusable one is
+#: ignored rather than fatal - and ignoring it silently would leave the user running under settings
+#: they can see in the file and cannot find in the session. The wording lives here so a frontend can
+#: show it verbatim; :func:`load_config` also logs it, which is what puts it on stderr today.
+UNREADABLE_PROJECT_CONFIG_KEY = "_unreadable_project_config"
 
 #: Where refused project values are collected, per plugin name, so the session can report them.
 #: A list per plugin rather than a return value, because the code that reads a setting and the
@@ -354,12 +360,34 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return merged
 
 
+class _ConfigFileError(Exception):
+    """A config file that exists and cannot be used, worded for whoever has to fix it.
+
+    An exception rather than a returned value, against the usual rule, because there is no
+    partial answer to carry on with: a half-parsed config is not a config. What the two callers
+    do with it differs - the user's own files end the session, a repository's is dropped - and
+    both need the same sentence, so the sentence is what travels.
+    """
+
+
 def _read_toml(path: Path) -> dict:
-    """Parse a TOML file, or return ``{}`` if it does not exist."""
+    """Parse a TOML file, or return ``{}`` if it does not exist.
+
+    A file that exists and will not parse raises :class:`_ConfigFileError` naming the file and
+    the fault. Letting ``tomllib`` and ``OSError`` out instead put a stack trace through
+    ``tomllib._parser`` in front of somebody whose only mistake was an unclosed quote - or, for a
+    repository's config, whose only act was cloning it. A directory and an unreadable file land
+    here too: all three mean "this file is not usable", and only the wording differs.
+    """
     if not path.exists():
         return {}
-    with path.open("rb") as fh:
-        return tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise _ConfigFileError(f"{path} is not valid TOML: {exc}") from None
+    except OSError as exc:
+        raise _ConfigFileError(f"{path} could not be read: {exc.strerror or exc}") from None
 
 
 def load_config(cwd: Path, overrides: dict | None = None) -> dict:
@@ -368,9 +396,30 @@ def load_config(cwd: Path, overrides: dict | None = None) -> dict:
     ``overrides`` come from the CLI; ``None`` values are ignored so unset flags
     do not clobber file settings. The result also carries two private keys,
     ``_user_dir`` and ``_cwd``, so other modules don't need to recompute them.
+
+    An unusable config file is answered differently per layer, and the asymmetry is the point.
+    The user's own files - ``config.toml`` and the endpoint files beside it - stop the session:
+    they were written deliberately, and carrying on without them would silently run the agent
+    under settings the user did not choose, confinement and gateway included. A repository's is
+    dropped with a warning: it arrived with a clone, and a repository must not be able to deny
+    somebody their own tool by shipping a broken file.
     """
-    user_cfg = _read_toml(user_dir() / "config.toml")
-    project_cfg, ignored = _strip_user_only(_read_toml(cwd / ".picoagent" / "config.toml"))
+    try:
+        user_cfg = _read_toml(user_dir() / "config.toml")
+        endpoints = load_endpoints(user_dir())
+    except _ConfigFileError as exc:
+        raise SystemExit(f"{exc}. This is your own config, so picoagent will not start under "
+                         "settings you did not choose; fix it or move it aside") from None
+
+    unreadable_project: str | None = None
+    try:
+        raw_project = _read_toml(cwd / ".picoagent" / "config.toml")
+    except _ConfigFileError as exc:
+        raw_project = {}
+        unreadable_project = (f"{exc}. Ignoring this repository's config and continuing with your "
+                              "own settings; fix the file to make its settings apply")
+        log.warning("%s", unreadable_project)
+    project_cfg, ignored = _strip_user_only(raw_project)
     project_cfg, project_plugin_cfg = _split_project_plugin_tables(project_cfg)
 
     # DEFAULTS is copied, not merged from: ``_deep_merge`` keeps a nested dict by reference when
@@ -386,8 +435,9 @@ def load_config(cwd: Path, overrides: dict | None = None) -> dict:
     if overrides:
         cfg = _deep_merge(cfg, {k: v for k, v in overrides.items() if v is not None})
 
-    cfg["endpoints"] = load_endpoints(user_dir())
+    cfg["endpoints"] = endpoints
     cfg[PROJECT_PLUGIN_KEY] = project_plugin_cfg
+    cfg[UNREADABLE_PROJECT_CONFIG_KEY] = unreadable_project
     cfg["_user_dir"] = str(user_dir())
     cfg["_cwd"] = str(cwd)
     cfg["_ignored_project_keys"] = ignored

@@ -18,9 +18,11 @@ in `picoagent/testing/fakes.py`.
 | `test_tools.py` | read/write/edit/bash, truncation, the per-file lock |
 | `test_skills_session_config.py` | SKILL.md parsing, session tree + compaction, config layering, command parsing |
 | `test_loop_and_plugins.py` | the loop end-to-end with a scripted model; plugin loading and trust |
-| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers |
+| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, and the `base_url` scheme check |
+| `test_config_refusals.py` | config files that will not parse, and `DEFAULTS` keys nothing reads |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
+| `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |
 | `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident) |
 | `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
 | `test_mcp_live.py` | live end-to-end against a real MCP server in a container (opt-in, skipped by default) |

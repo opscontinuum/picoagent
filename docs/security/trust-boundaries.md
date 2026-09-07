@@ -123,16 +123,17 @@ the wording, and whether it is `urgent`, meaning a plugin the user approved is n
 | `changed`, files edited in place | CHANGED since you approved it and NOT LOADED, whatever it enforces is off | yes |
 | `changed`, checkout on a different commit | MOVED to a revision you have not approved (`old -> new`), you did not edit it, check `[plugins].enabled` in both configs | yes |
 | `shadowed`, a repository offers a name the user's own loaded copy already provides | the repository's copy did not load and yours is the one running | no |
-| `missing`, a plugin approved as required is no longer running from the directory it was approved in | you approved this as REQUIRED and nothing loaded from that directory | yes |
+| `missing`, a plugin approved as required is no longer running from the directory it was approved in | you approved this as REQUIRED, nothing loaded from that directory, and here is the one command that clears the record | yes |
 
 An approval covers the **directory** the code was read from, not the name written inside it.
 Keyed by name, an approval was only as durable as a field the replacing code also gets to
 write: changing `name` in the replaced `plugin.toml` made the same directory read as `new`
-rather than `changed`, so the enforcement below never fired and the requirement recorded at
-approval was answered by a record nothing looked up. `fast_forward` does that move without
-anyone touching the machine. Two checkouts sharing a name get an approval each; a record from
-a version that stored no directory is still honoured for the plugin of that name, and
-re-approving gives it one.
+rather than `changed`, so a replacement was announced as ordinary first-run chatter instead of
+"code you approved has been replaced", and the enforcement below never fired. `fast_forward`
+does that move without anyone touching the machine. Two checkouts sharing a name get an approval
+each. A record written before approvals named a directory has none to match on, so the first
+directory that asks for it takes it over: an upgrade sends nobody back to the trust prompt, and
+the record stops answering for a second directory that later claims the same name.
 
 `changed` splits on the commit in the trust record: nobody arrives at a different commit by
 editing a file, so "something moved your checkout" and "you edited this yourself" are separable
@@ -154,6 +155,28 @@ same reader:
   `root`, `urgent` and the same text. A `--json` consumer reads stdout and never saw stderr, so
   it branches on `urgent` rather than on a sentence. The REPL and a plain `-p` run render only
   the events they know about, so they ignore it and nobody is told twice.
+
+### Taking an approval back
+
+An approval that can be given and not withdrawn is not a decision the user holds. `picoagent
+plugin untrust <directory-or-name>` removes one record from `trust.json` and says which record it
+removed and from which file. It refuses, without exit code 0, when nothing matches, and refuses
+when a name covers two checkouts rather than guessing which the user meant - the copy it could
+guess wrong about is an approval they still want.
+
+It matches the record, not a plugin on disk, and that is the point of it. `plugin trust` resolves
+its argument by reading `plugin.toml`, which cannot reach the case that matters: a record outlives
+its directory, going on standing for that path so that whatever arrives there next reads as code
+the user once vetted rather than as code they have never seen, and after a deletion there is no
+manifest left to resolve. A directory is compared as the
+store writes it, resolved, so a symlinked spelling still matches; the name a record was filed under
+is accepted as well, because after a deletion the name is what the user still has. For the same
+reason `plugin list` names every approval the directory walk cannot show: one whose directory is
+gone, marked `MISSING`, and one pointing outside both plugin directories, marked `outside`. A
+record nobody can see is a record nobody can withdraw.
+
+Withdrawing is not uninstalling. The plugin's files are untouched; it reverts to `UNTRUSTED` and
+does not load until it is approved again.
 
 ### `[plugins.<name>]` is layered, not merged
 
@@ -318,23 +341,64 @@ What it stops, and what it does not:
 | The same replacement, with a different `name` in its `plugin.toml` | The session does not start. The approval covers the directory, so renaming is a change like any other |
 | A required plugin's entry module raises on import - a dependency gone after a venv rebuild, an entry attribute that no longer exists | The session does not start. `RequiredPluginFailed` names what the import reported. It used to be an ordinary skip: not urgent, "run with --verbose", the control absent, `required` in hand and never read |
 | A required plugin's `register()` raises | The session does not start. `RequiredPluginFailed`, as before |
-| A required plugin in the user's own `~/.picoagent/plugins` is no longer there, or no longer loads at all | The session does not start. `RequiredPluginMissing` names the directory it was approved in and the store to edit if the removal was deliberate. Deleting approved code must not be the quiet way around a check that replacing it trips |
+| A required plugin in the user's own `~/.picoagent/plugins` is no longer there, or no longer loads at all | The session does not start. `RequiredPluginMissing` names the directory it was approved in and the single command that clears the record. Deleting approved code must not be the quiet way around a check that replacing it trips |
+| A replacement deletes the `required` line along with the code | Announced as urgent and not loaded, session continues. The declaration is read from the plugin in front of you; see Known limits below |
 | A required plugin is `new` - never approved | Announced as urgent, session continues. Install-then-run is the ordinary first-run path, and making it fatal means the plugin can never be trusted from a session that will no longer open |
 | A required plugin the *repository* owns is refused, or its copy disappears | Announced, session continues. `required` is a line a cloned repository wrote, and honouring it there would hand any repository a switch that stops the user's session on demand |
 
-The requirement is recorded in `trust.json` at approval, not read from the directory under
-suspicion, so whoever replaced the code cannot delete the line that makes replacing it fatal.
-The reason shown to the user is recorded with it, for the same reason. Because the record
-outlives the directory, it is also what catches a required plugin that is not there any
-more; that check is scoped to the user's own plugin directory, which every session of theirs
-reads, so absence from it means gone rather than unused in this project. Approvals made before
-these fields existed fall back to the manifest on disk, because reading them as *not required*
-would silently disarm them, and an approval that recorded no directory is not read as a
-disappearance - a bare name cannot tell "the plugin is gone" from "this project does not use
-it", and re-approving it once records the directory.
+A plugin that is gone cannot declare anything, so the requirement is also recorded in
+`trust.json` when the user approves, with the reason they were shown. That record is read back for
+one question and no other: **is a plugin the user approved as required absent altogether?** A
+plugin that is present is asked directly, so the store and the manifest can never disagree about
+code that exists. Only records naming a directory inside the user's own `~/.picoagent/plugins`
+count - a bare name cannot tell "the plugin is gone" from "this project does not use it", and a
+repository's copy is not the user's decision to enforce.
+
+An absence is a stop rather than a notice, because that is what the flag means: `required` is a
+plugin saying a session without it should not run, and the user approved that statement. It is
+defensible only because it is recoverable without a session. `picoagent plugin untrust <name>`
+builds a trust store from the config and stops there - it imports no plugin and builds no
+runtime - so the record doing the stopping is always one command away from gone, and the refusal
+names that command instead of telling anyone to hand-edit a security file. An earlier version of
+this check told them exactly that, which is what made it a lockout rather than a refusal.
+
+**That property is load-bearing.** If `plugin untrust` or `plugin list` ever grew a plugin load,
+this stop would become a wedge again. Both are deliberately runtime-free, and
+`tests/test_plugin_untrust.py` drives them through `cli.plugin_command` with no runtime in sight.
+
+A user who wants the plugin but not the requirement has two ways out that do not involve this
+check: drop `required = true` from the plugin's own `plugin.toml`, or withdraw the approval that
+carries it. Every row above that stops a session is recoverable from the CLI. `picoagent plugin
+trust` shows what changed and then asks; `picoagent plugin untrust` takes the decision back and
+accepts the plugin's name as well as its directory, because a record can outlive what it names.
 
 A caller that needs a control the loader treats as optional still has to read `LoadReport` and
 decide for itself.
+
+**`required` is a statement by the plugin in front of you, except for absence.** Three things it
+does not catch, stated because a control that is oversold is worse than one that is absent:
+
+* A replacement that deletes the `required` line along with the code is not enforced as required.
+  It is still refused as code the user never approved, announced as urgent, and not loaded, so
+  what is missing is the stop rather than the refusal - but the stop is missing.
+* The reason a user reads at a refusal comes from the manifest whenever the plugin is present, so
+  a replacement chooses that sentence. It only reaches a user whose session is being stopped.
+* A plugin renamed *and* replaced in one move, where the user's only approval is a record written
+  before approvals named a directory, reads as `new` rather than `changed` and its absence is not
+  enforced: the old record is filed under the old name, and nothing looks that name up again. It
+  ends at the first re-approval, which writes a directory.
+
+**A plugin's import namespace does not cover `importlib.import_module`.** Everything a plugin
+imports with the `import` statement is loaded inside that plugin's own package: files beside the
+entry module, modules in subdirectories of the plugin, absolute or relative spellings, and the
+imports those modules make in turn. `importlib.import_module` is not an `import` statement. It
+calls the interpreter's import machinery directly and never consults the hook this uses, so it
+resolves against `sys.path` and can bind an installed distribution that no fingerprint covers -
+the crossing the namespace exists to prevent. A hook installed on each module's builtins cannot
+answer it, and the alternatives (`sys.meta_path`) are process-wide and would have to guess which
+plugin is asking. Plugin authors are told to use the `import` statement instead
+([plugin-authoring.md](../plugin-authoring.md#more-than-one-file)), and
+`tests/test_plugin_isolation.py` pins the behaviour so the limit stays visible.
 
 **Owner-restriction is not encryption.** The credentials file is `0600` on POSIX and
 ACL-restricted via `icacls` on Windows - the same trust model as `~/.netrc`. Anything running
@@ -344,3 +408,34 @@ implying protection it did not achieve.
 **Prompt injection is not solved.** Tool output is untrusted content that reaches the model as
 context. The zeroth-law skill instructs treating it as data, but that is guidance to a model,
 not an enforced control.
+
+## What a frontend may be told, and by whom
+
+Two claims travel with a `notice`, and neither is worth anything unless the frontend can tell
+who made it.
+
+**Only the command dispatcher can put a notice on stdout.** In a `-p` run stdout is the answer
+and stderr is everything else, and the split is decided by `source` on the notice payload. The
+key used to be the plain string `"command"`, which any plugin could write into a payload of its
+own - `api.ui.emit`, `rt.frontend.emit` from any event handler, either one - and so put its own
+sentence inside the bytes a script captured and parsed as the model's reply. The dispatcher now
+stamps `picoagent.core.commands.COMMAND_SOURCE`, a single `str` instance, and `PrintFrontend`
+drops any `source` that is not that object before it chooses a stream or writes a `--json`
+record. It still reads as `"command"`, so a frontend plugin comparing with `==` is unaffected;
+what changed is that comparing with `is` now means something. This does not contain a plugin
+that imports the name deliberately - nothing here does, and the load-time trust decision remains
+the only boundary around plugin code - it ends the forgery that costs one extra dictionary key.
+
+**Notice and error text is stripped before a terminal sees it.** That text comes from plugins,
+tool results, a repository's config file and remote MCP servers, and a terminal obeys some of
+what it can contain: `picoagent.core.text.strip_terminal_controls` removes ANSI CSI and OSC
+sequences and the rest of C0/C1, keeping tabs and newlines so a multi-line command answer still
+arrives whole. `--json` is deliberately left verbatim: `json.dumps` escapes everything a
+terminal would obey, so those bytes are inert, and stripping would edit a record a program
+parses rather than a display. A consumer that echoes a field to its own terminal owns that step.
+
+Alongside it, an exception whose `__str__` a plugin wrote is rendered through
+`describe_exception`, which strips the same sequences from both the message and the class name
+(`type()` accepts any string as a name) and bounds the result at 2000 characters. Logging is not
+covered: `log.exception` renders the traceback itself, so the fix there is a formatter installed
+where logging is configured, and it is not installed today.

@@ -59,8 +59,18 @@ Worth knowing:
   works; pick one.
 * Anything outside your directory imports normally: the standard library, `picoagent.core.*`,
   a package listed in `python_deps`.
-* If you nest a subdirectory package inside your plugin, its own modules import each other
-  relatively. The rewrite covers the files at the top of your plugin directory.
+* Subdirectories work the same way, all the way down. `from pkg import mod` gets your `mod`,
+  and a module inside `pkg/` may import a file at the top of your plugin by name or reach its
+  neighbours relatively. Every module the loader reaches this way is inside your namespace, so
+  none of them can pick up an installed package of the same name by accident.
+* Use the `import` statement, not `importlib.import_module("utils")`. That function calls the
+  interpreter's import machinery directly and cannot be redirected into your plugin, so it looks
+  along `sys.path` instead: it will not find your files, and if something installed happens to
+  share the name it will silently give you that instead. This is a real limit rather than an
+  oversight - see the note in
+  [docs/security/trust-boundaries.md](security/trust-boundaries.md#known-limits). If you need a
+  module chosen at runtime, import your plugin's modules with the statement and pick between
+  them yourself.
 * Every file in the directory is part of the trust fingerprint, so a change to any of them
   sends users back to the trust prompt, not only a change to the entry module.
 * An approval covers the directory the code was read from. Renaming your plugin is a change
@@ -88,9 +98,10 @@ not import. With it set, four things stop the session instead of being announced
 * the same replacement carrying a different `name` in its `plugin.toml`, because the approval
   covers the directory rather than the name written in it,
 * an import that raises, including a dependency that left the environment after approval,
-* your plugin no longer being there at all, if the user had approved it in their own
-  `~/.picoagent/plugins`. The requirement is recorded when they approve, so it outlives the
-  directory that stated it, and a deleted checkout is as absent as a replaced one.
+* your plugin no longer being there at all, if the user approved it in their own
+  `~/.picoagent/plugins`. You cannot declare anything once you are gone, so the requirement is
+  recorded when they approve and read back for that one question; a deleted checkout is as
+  absent as a replaced one.
 
 A `register()` that raises stops the session too.
 
@@ -100,6 +111,19 @@ there would mean the user cannot open a session to trust you from. And when your
 copy a *repository* suggested rather than one the user installed, `required` is announced
 rather than enforced, because a line in a cloned repo's `plugin.toml` must not be able to stop
 someone's session.
+
+One thing it does not cover, said plainly because a control that is oversold is worse than one
+that is absent: whoever replaces your code can delete the `required` line along with it, and that
+replacement is refused as code the user never approved, announced as urgent, and not loaded - but
+it does not stop the session. The stop covers your code being replaced, failing to import, failing
+to register, or being gone; it does not survive a replacement that also edits your manifest.
+
+The user keeps a way out of every one of these. `picoagent plugin untrust <directory-or-name>`
+withdraws the approval your requirement is enforced against, and it reads the trust store without
+loading a single plugin, so it works from a machine whose sessions are refusing to start. It takes
+a name as well as a directory, so it still works after the directory is gone. Setting
+`required = true` is therefore a statement about what your plugin is for, not a switch the user
+cannot reach.
 
 `api.declare_required("reason")` is the same declaration made at runtime, for a plugin that
 only discovers inside `register()` that it cannot do its job. It sets the same field the

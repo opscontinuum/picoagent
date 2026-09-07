@@ -10,6 +10,8 @@ import json
 import sys
 from typing import Any
 
+from ..core.text import strip_terminal_controls
+
 _ANSI = {"dim": "\033[2m", "bold": "\033[1m", "red": "\033[31m", "cyan": "\033[36m",
          "yellow": "\033[33m", "off": "\033[0m"}
 
@@ -20,6 +22,11 @@ class PlainFrontend:
 
     # ------------------------------------------------------------------ output
     def _print(self, text: str, *styles: str, end: str = "\n") -> None:
+        """Write one styled line. Callers pass text that is already safe to hand a terminal.
+
+        The sanitising is at the call site rather than here because this method is also how the
+        frontend writes its *own* escape codes, and a stripper that ran last would remove them.
+        """
         if self.color and styles:
             text = "".join(_ANSI[s] for s in styles) + text + _ANSI["off"]
         print(text, end=end, flush=True)
@@ -37,9 +44,9 @@ class PlainFrontend:
         elif event == "tool_result":
             self._print(self._preview(payload["result"].content), "red" if payload["result"].is_error else "dim")
         elif event == "notice":
-            self._print(payload["text"], "yellow")
+            self._print(strip_terminal_controls(payload["text"]), "yellow")
         elif event == "error":
-            self._print("error: " + payload["text"], "red")
+            self._print("error: " + strip_terminal_controls(payload["text"]), "red")
 
     @staticmethod
     def _preview(text: str, lines: int = 8) -> str:

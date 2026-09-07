@@ -255,3 +255,59 @@ class TemperatureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BaseUrlSchemeTests(unittest.TestCase):
+    """`urlopen` speaks more than HTTP, so an unchecked base_url turns the client into a reader.
+
+    `file:///etc/passwd` is the concrete case: `urllib.request.urlopen` resolves it against the
+    local filesystem, so a base_url that reaches the request builder unchecked makes the model
+    client open files instead of talking to a server. A repository cannot set `providers.base_url`
+    (it is in `USER_ONLY`), but a plugin handed one from `[plugins.<name>]`, an environment
+    variable and a typo all reach the same place.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "models").write_text('{"data": [{"id": "leaked-from-disk"}]}')
+        (self.tmp / "chat").mkdir()
+        (self.tmp / "chat" / "completions").write_text('data: {"choices":[{"delta":{"content":"hi"}}]}\n')
+        self.file_base = "file://" + self.tmp.as_posix()
+
+    def test_list_models_refuses_a_file_url_instead_of_reading_the_disk(self):
+        provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertIn("file", str(caught.exception))
+        self.assertNotIn("leaked-from-disk", str(caught.exception))
+
+    def test_stream_refuses_a_file_url_as_an_error_event_not_an_exception(self):
+        """Providers report expected failures as `StreamEvent("error")`; only bugs raise."""
+        provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
+
+        async def collect():
+            return [event async for event in provider.stream(
+                system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+
+        events = asyncio.run(collect())
+        self.assertEqual([event.type for event in events], ["error"])
+        self.assertIn("file", events[0].error)
+        self.assertNotIn("hi", events[0].error)
+
+    def test_the_refusal_names_the_url_so_the_user_can_find_the_setting(self):
+        provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertIn(self.file_base, str(caught.exception))
+
+    def test_an_http_base_url_still_reaches_the_server(self):
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1", api_key="k")
+            self.assertEqual(asyncio.run(provider.list_models()), ["fake-large", "fake-small"])
+
+    def test_an_https_base_url_is_not_refused_for_its_scheme(self):
+        """Nothing is listening, so this must fail as a transport error and not as a scheme one."""
+        provider = OpenAICompatProvider(base_url="https://127.0.0.1:9/v1", api_key="k")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertNotIn("http or https", str(caught.exception))

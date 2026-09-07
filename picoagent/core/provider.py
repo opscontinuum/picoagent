@@ -17,9 +17,11 @@ import json
 import os
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, AsyncIterator, Iterator, Protocol, runtime_checkable
 
+from .text import safe_for_display
 from .types import Message, StreamEvent, ToolCall, ToolSpec, new_id
 
 
@@ -67,6 +69,30 @@ def _user_message(message: Message) -> dict:
     if message.text:
         content.append({"type": "text", "text": message.text})
     return {"role": "user", "content": content}
+
+
+#: The only schemes a model endpoint may use. ``urlopen`` also speaks ``file:``, ``ftp:`` and
+#: ``data:``, and it resolves them without complaint: a ``base_url`` of ``file:///etc`` makes this
+#: client open local paths and hand their contents back as if a server had sent them. ``providers``
+#: is in ``config.USER_ONLY``, so a cloned repository cannot set the URL - but an environment
+#: variable, a typo, and a plugin passing a value out of its own ``[plugins.<name>]`` table all
+#: arrive at the same argument, and none of them is checked anywhere else.
+HTTP_SCHEMES = ("http", "https")
+
+
+def check_base_url(url: str) -> str | None:
+    """Why ``url`` cannot be a model endpoint, or ``None`` when it can.
+
+    A returned string rather than a raise, because a wrong ``base_url`` is a config file's
+    mistake and not a bug, and the two callers owe the user different things: ``stream`` an
+    ``error`` event like any other provider failure, ``list_models`` a raised message that
+    ``/model list`` already knows how to print.
+    """
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme in HTTP_SCHEMES:
+        return None
+    found = f"its scheme is '{scheme}'" if scheme else "it names no scheme"
+    return f"refusing to use {url} as a model endpoint: base_url must be http or https, {found}"
 
 
 def parse_sse(response) -> Iterator[dict]:
@@ -124,6 +150,10 @@ class OpenAICompatProvider:
 
     async def stream(self, *, system, messages, tools, model, max_tokens, thinking="off",
                      temperature=None):
+        refusal = check_base_url(self._base)
+        if refusal:
+            yield StreamEvent("error", error=refusal)
+            return
         request = self._request(system, messages, tools, model, max_tokens, thinking, temperature)
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -162,6 +192,9 @@ class OpenAICompatProvider:
         return await asyncio.get_running_loop().run_in_executor(None, self._fetch_models)
 
     def _fetch_models(self) -> list[str]:
+        refusal = check_base_url(self._base)
+        if refusal:
+            raise RuntimeError(refusal)
         headers = dict(self._headers)
         if self._key:
             headers["Authorization"] = f"Bearer {self._key}"
@@ -170,9 +203,10 @@ class OpenAICompatProvider:
             with urllib.request.urlopen(request, timeout=30) as response:
                 payload = json.loads(response.read().decode(errors="replace"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(self._scrub(f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:300]}")) from None
+            raise RuntimeError(safe_for_display(
+                self._scrub(f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:300]}"))) from None
         except Exception as exc:  # noqa: BLE001 - surface transport failures the same way
-            raise RuntimeError(self._scrub(f"{type(exc).__name__}: {exc}")) from None
+            raise RuntimeError(safe_for_display(self._scrub(f"{type(exc).__name__}: {exc}"))) from None
         entries = payload.get("data") if isinstance(payload, dict) else None
         return sorted(str(e["id"]) for e in (entries or []) if isinstance(e, dict) and e.get("id"))
 
@@ -181,6 +215,10 @@ class OpenAICompatProvider:
 
         Error text reaches the terminal and the ``--json`` event stream, so a gateway that
         echoes the ``Authorization`` header back in a 401 body would otherwise print the key.
+
+        It runs *before* :func:`~picoagent.core.text.safe_for_display` at every call site, and
+        that order is load-bearing: bounding first could cut a key in half and leave the front
+        of it as text no later pass recognises.
         """
         return text.replace(self._key, "[redacted]") if self._key else text
 
@@ -192,9 +230,10 @@ class OpenAICompatProvider:
                 for chunk in parse_sse(response):
                     put(chunk)
         except urllib.error.HTTPError as exc:
-            put(RuntimeError(self._scrub(f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}")))
+            put(RuntimeError(safe_for_display(
+                self._scrub(f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}"))))
         except Exception as exc:  # noqa: BLE001 - surface anything as a provider error
-            put(RuntimeError(self._scrub(f"{type(exc).__name__}: {exc}")))
+            put(RuntimeError(safe_for_display(self._scrub(f"{type(exc).__name__}: {exc}"))))
         put(None)
 
     @staticmethod

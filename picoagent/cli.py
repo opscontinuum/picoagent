@@ -5,7 +5,7 @@
     picoagent -p "prompt" --json   one-shot; JSONL event stream
     picoagent -r                   resume the most recent session for this directory
     picoagent -e ./my-plugin       load a plugin directory for this run
-    picoagent plugin add|trust|list
+    picoagent plugin add|trust|untrust|list
 
 The heavy lifting is delegated: :func:`build_runtime` wires registries and plugins,
 :class:`~picoagent.core.loop.AgentLoop` runs prompts, the frontend drives the UI.
@@ -362,9 +362,15 @@ def report_available_upgrades(rt: Runtime) -> None:
 
 
 def plugin_command(args: argparse.Namespace) -> int:
-    """``picoagent plugin add|trust|list``."""
+    """``picoagent plugin add|trust|untrust|list``."""
     cfg = load_config(Path(".").resolve())
     trust = loader.TrustStore(Path(cfg["_user_dir"]))
+    if args.pcmd != "list" and not args.spec:
+        # Named rather than crashed on: every verb but `list` acts on something, and the three
+        # that do accept different spellings of it, so the usage error says which one is missing.
+        print(f"picoagent plugin {args.pcmd}: name a plugin - a directory, a git spec for `add`, "
+              "or for `untrust` the name an approval was filed under (see `picoagent plugin list`)")
+        return 2
     if args.pcmd == "add":
         try:
             root = loader.resolve_source(args.spec, cfg, project=args.project)
@@ -396,13 +402,110 @@ def plugin_command(args: argparse.Namespace) -> int:
             print(f"not a plugin directory: {exc}")
             return 1
         return trust_command(manifest, trust, assume_yes=args.yes)
+    elif args.pcmd == "untrust":
+        return untrust_command(args.spec, trust)
     elif args.pcmd == "list":
-        for directory in (loader.plugins_dir(cfg), loader.plugins_dir(cfg, project=True)):
+        listed_roots: set[str] = set()
+        listed_names: set[str] = set()
+        directories = (loader.plugins_dir(cfg), loader.plugins_dir(cfg, project=True))
+        for directory in directories:
             for path in sorted(directory.iterdir()) if directory.is_dir() else []:
                 if (path / "plugin.toml").exists():
                     manifest = loader.Manifest.load(path)
                     status = {"trusted": "trusted", "changed": "CHANGED", "new": "UNTRUSTED"}[trust.status(manifest)]
+                    listed_roots.add(loader.TrustStore.key(path))
+                    listed_names.add(manifest.name)
                     print(f"{manifest.name:20} {manifest.version:8} {status:10} {path}")
+        if not listed_roots:
+            # An empty listing used to print nothing at all, which reads like a command that
+            # failed. The directories are named because which ones were walked is the question
+            # a user with a plugin they thought was installed is actually asking.
+            print(f"no plugins in {directories[0]} or {directories[1]}")
+        print_unlisted_approvals(trust, listed_roots, listed_names)
+    return 0
+
+
+def print_unlisted_approvals(trust: loader.TrustStore, roots: set[str], names: set[str]) -> None:
+    """Approvals ``plugin list`` would otherwise never mention, and how to withdraw one.
+
+    The listing above walks the two plugin directories, so it can only show approvals that still
+    have a directory in one of them. The approval most likely to need withdrawing is exactly the
+    one that does not. A record outlives its directory twice over: it goes on standing for that
+    path, so code that later arrives there reads as a plugin the user once vetted rather than one
+    they have never seen, and if it carries a requirement it is what stops sessions until the
+    plugin is back. Neither is visible in the ordinary listing. A user who cannot see a
+    record cannot name it to ``untrust``, which is why this section prints the identifier rather
+    than only the fact.
+
+    A directory outside both plugin directories is listed for the same reason and marked
+    ``outside`` rather than given a status: its fingerprint is not checked here, and reporting a
+    trust state nobody verified would be worse than reporting none.
+    """
+    rows = []
+    for label, record in trust.data.items():
+        root = record.get("root")
+        if root is None:
+            if label not in names:                       # pre-``root`` record, matched by name
+                rows.append((record.get("name") or label, "no directory", label))
+        elif root not in roots:
+            rows.append((record.get("name") or label, "outside" if Path(root).is_dir() else "MISSING", root))
+    if not rows:
+        return
+    print("\napprovals not shown above (withdraw one with: picoagent plugin untrust <directory-or-name>):")
+    for name, state, where in rows:
+        print(f"  {name:20} {state:12} {where}")
+
+
+def untrust_command(spec: str, trust: loader.TrustStore) -> int:
+    """``picoagent plugin untrust <directory-or-name>`` - take back an approval.
+
+    The counterpart to ``trust``, and named for it: approving is the decision, and a decision the
+    user can make once and never revisit is not one they hold. Without this the only way back was
+    editing ``trust.json`` by hand, which is what a refusal had to tell someone to do at the exact
+    moment their session would not start - hand-editing a security file to get back to work.
+
+    ``RequiredPluginMissing`` now names this command instead, which makes one property of the whole
+    ``plugin`` verb load-bearing: it builds a config and a trust store and stops there. No runtime,
+    no ``load_all``, no plugin imported. That is what lets a refusal about a recorded requirement be
+    a stop the user can undo rather than a wedge, so a future verb that needs a live runtime should
+    get its own entry point rather than pulling one in here.
+
+    Matched against the *record*, not against a plugin on disk. ``trust`` resolves its argument by
+    reading ``plugin.toml``, which is the right thing for approving code and the wrong thing here:
+    the case that matters most is a record whose directory is gone, and there is no manifest left
+    to read. So a directory is compared as ``TrustStore.key`` writes it (resolved, so the same
+    directory spelled through a symlink still matches), and the name a record was filed under is
+    accepted too, because after a deletion the name is all the user still has.
+
+    A name covering two records is refused rather than resolved by guessing. Two checkouts can
+    share a plugin name - the user's own and a repository's copy - and withdrawing the wrong one
+    silently disarms an approval the user still wants.
+    """
+    wanted = loader.TrustStore.key(Path(spec).expanduser())
+    labels = [label for label, record in trust.data.items() if record.get("root") == wanted]
+    if not labels:
+        labels = [label for label, record in trust.data.items() if spec in (label, record.get("name"))]
+    if not labels:
+        print(f"no approval matches {spec!r}, so nothing was withdrawn.")
+        print(f"{trust.path} records nothing at all." if not trust.data
+              else f"Approvals in {trust.path} - pass a directory or a name from this list:")
+        for label, record in trust.data.items():
+            print(f"  {record.get('name') or label:20} {record.get('root') or '(no directory recorded)'}")
+        return 1
+    if len(labels) > 1:
+        print(f"{spec!r} names {len(labels)} approvals, so nothing was withdrawn. "
+              "Pass the directory of the one you mean:")
+        for label in labels:
+            print(f"  {trust.data[label].get('root') or '(no directory recorded)'}")
+        return 1
+
+    record = trust.withdraw(labels[0])
+    root = record.get("root")
+    print(f"withdrew the approval of {record.get('name') or labels[0]} "
+          f"({root or 'no directory recorded'}) from {trust.path}")
+    if root and (Path(root) / "plugin.toml").exists():
+        print(f"  The plugin itself is untouched and will not load until you approve it again:\n"
+              f"    picoagent plugin trust {root}")
     return 0
 
 
@@ -462,8 +565,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-v", "--verbose", action="store_true")
     sub = ap.add_subparsers(dest="cmd")
     plugin = sub.add_parser("plugin", help="manage plugins")
-    plugin.add_argument("pcmd", choices=["add", "trust", "list"])
-    plugin.add_argument("spec", nargs="?", help="git:host/user/repo@ref or a local path")
+    plugin.add_argument("pcmd", choices=["add", "trust", "untrust", "list"])
+    plugin.add_argument("spec", nargs="?",
+                        help="git:host/user/repo@ref, a local path, or for untrust an approved name")
     plugin.add_argument("--project", action="store_true", help="install under the project instead of the user dir")
     upgrade_p = sub.add_parser("upgrade", help="check for and apply plugin updates")
     upgrade_p.add_argument("ucmd", nargs="?",

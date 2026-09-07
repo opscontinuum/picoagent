@@ -455,14 +455,6 @@ class RequiredInTheManifestTests(RequiredPluginFixture):
         report = self.load()
         self.assertEqual([entry[:2] for entry in report.skipped], [("guard", "changed")])
 
-    def test_a_requirement_recorded_at_approval_outlives_its_removal_from_the_manifest(self):
-        """Otherwise whoever replaced the code deletes the line that makes replacing it fatal."""
-        root = self.write(self.user_plugins())
-        self.approve(root)
-        (root / "plugin.toml").write_text('name = "guard"\nentry = "guard:register"\n')
-        with self.assertRaises(loader.RequiredPluginError):
-            self.load()
-
     def test_a_manifest_requirement_covers_a_register_that_raises(self):
         """One mechanism: the manifest field is read into the same declaration `declare_required` sets."""
         root = self.write(self.tmp / "cli", body="""
@@ -491,9 +483,9 @@ class TheIdentityOfAnApproval(RequiredPluginFixture):
 
     Keyed by the name in `plugin.toml`, an approval is only as durable as a field the replacing
     code gets to rewrite. Change the name and the same directory reads as a plugin nobody has
-    ever seen: `new` rather than `changed`, a notice rather than a stop, and the requirement the
-    store recorded so it could not be deleted is answered by a record nothing looks up. Nobody
-    needs local access for it; a `fast_forward` onto a rewritten upstream does it.
+    ever seen: `new` rather than `changed`, first-run chatter rather than "the code you approved
+    has been replaced". Nobody needs local access for it; a `fast_forward` onto a rewritten
+    upstream does it.
     """
 
     def rename(self, root: Path, name: str) -> None:
@@ -507,14 +499,6 @@ class TheIdentityOfAnApproval(RequiredPluginFixture):
         self.approve(root)
         self.rename(root, "guard2")
         self.assertEqual(loader.TrustStore(self.tmp / "home").status(Manifest.load(root)), "changed")
-
-    def test_a_rename_does_not_disarm_the_recorded_requirement(self):
-        root = self.write(self.user_plugins())
-        self.approve(root)
-        self.rename(root, "guard2")
-        with self.assertRaises(loader.RequiredPluginError) as caught:
-            self.load()
-        self.assertIn("guarding the shell", str(caught.exception))
 
     def test_a_second_copy_of_a_plugin_is_a_separate_approval(self):
         """Two checkouts may share a name; approving one is not approving the other."""
@@ -531,6 +515,18 @@ class TheIdentityOfAnApproval(RequiredPluginFixture):
         self.as_an_older_version_wrote_it()
         self.assertEqual([m.name for m in self.load().loaded], ["guard"])
 
+    def test_a_record_that_names_no_directory_is_taken_over_by_the_first_that_asks(self):
+        """Left as a standing name match, one old record answers for every directory that claims
+        the name - including a copy the user has never seen. Adopted, it answers for the directory
+        it was found in, and the next one is the ordinary first-approval prompt."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.as_an_older_version_wrote_it()
+        store = loader.TrustStore(self.tmp / "home")
+        self.assertEqual(store.status(Manifest.load(root)), "trusted")
+        other = self.write(self.tmp / ".picoagent" / "plugins")
+        self.assertEqual(store.status(Manifest.load(other)), "new")
+
     def as_an_older_version_wrote_it(self) -> None:
         """Rewrite the store the way it was written before a record said which directory it covers."""
         path = self.tmp / "home" / "trust.json"
@@ -543,10 +539,15 @@ class TheIdentityOfAnApproval(RequiredPluginFixture):
 class ARecordedRequirementWithNothingBehindIt(RequiredPluginFixture):
     """A requirement the user approved, and a directory that no longer answers for it.
 
-    `required` stops a session when approved code has been replaced. Deleting the code instead
-    of replacing it reached the same end by a quieter route: nothing loads, nothing is reported,
-    and the control the user was relying on is absent. The store is the only party that still
-    remembers the plugin was meant to be there.
+    `required` stops a session when approved code has been replaced. Deleting the code instead of
+    replacing it reaches the same end by a quieter route: nothing loads, nothing is reported, and
+    the control the user was relying on is absent from a session that looks exactly like one where
+    it ran and found nothing. The plugin cannot declare itself when it is not there, so the store
+    is the only party that still remembers it was meant to be.
+
+    The stop this raises is only defensible because it can be undone without a session: `picoagent
+    plugin untrust` builds a trust store and nothing else - no config-driven plugin load - so the
+    record that is stopping the user can always be withdrawn. The refusal says so.
     """
 
     def test_a_required_plugin_that_vanished_stops_the_session(self):
@@ -564,6 +565,25 @@ class ARecordedRequirementWithNothingBehindIt(RequiredPluginFixture):
         with self.assertRaises(loader.RequiredPluginError) as caught:
             self.load()
         self.assertIn(str(root), str(caught.exception))
+
+    def test_the_refusal_names_the_one_command_that_clears_it(self):
+        """A refusal that ends in "edit trust.json by hand" is a lockout with extra steps."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        shutil.rmtree(root)
+        with self.assertRaises(loader.RequiredPluginError) as caught:
+            self.load()
+        self.assertIn("plugin untrust guard", str(caught.exception))
+
+    def test_withdrawing_the_record_lets_the_session_start(self):
+        """The recovery the refusal promises, driven end to end: the store the CLI writes through
+        is the store the next session reads, and after the withdrawal there is nothing to raise."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        shutil.rmtree(root)
+        store = loader.TrustStore(self.tmp / "home")
+        store.withdraw(next(iter(store.data)))
+        self.assertEqual(self.load().loaded, [])
 
     def test_a_required_plugin_whose_manifest_stopped_parsing_stops_the_session(self):
         """Not loading is the same absence as not being there, and the store knows both."""

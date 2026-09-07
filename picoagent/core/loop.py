@@ -32,12 +32,13 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .commands import Command, CommandRegistry
+from .commands import COMMAND_SOURCE, Command, CommandRegistry
 from .context import SystemPromptBuilder
 from .events import EventBus
 from .provider import ProviderRegistry
 from .session import Session
 from .skills import SkillRegistry
+from .text import describe_exception
 from .tools import ToolContext, ToolRegistry, missing_required_args
 from .types import Message, ToolCall, ToolResult
 
@@ -124,6 +125,11 @@ class AgentLoop:
 
         ``KeyboardInterrupt`` and ``CancelledError`` do not derive from ``Exception`` and so keep
         travelling: the user asking to stop, and the loop being torn down, are not plugin bugs.
+
+        What the exception *says* is the plugin's too, so it goes through
+        :func:`~picoagent.core.text.describe_exception` rather than into an f-string. A
+        ``__str__`` returning escape sequences writes over the report it is quoted in, and one
+        returning five megabytes buries the session that survived the failure.
         """
         try:
             notice = await command.handler(args, self.rt)
@@ -131,11 +137,10 @@ class AgentLoop:
                 return
             if not isinstance(notice, str):
                 raise TypeError(f"handler returned {type(notice).__name__}, expected str or None")
-            await self._tell_user("notice", {"text": notice, "source": "command"})
+            await self._tell_user("notice", {"text": notice, "source": COMMAND_SOURCE})
         except Exception as exc:  # noqa: BLE001 - plugin code is untrusted; the session outlives it
             log.exception("command /%s failed", command.name)
-            await self._tell_user(
-                "error", {"text": f"/{command.name} failed: {type(exc).__name__}: {exc}"})
+            await self._tell_user("error", {"text": f"/{command.name} failed: {describe_exception(exc)}"})
 
     async def _tell_user(self, event: str, payload: dict) -> None:
         """Emit to the frontend if one is attached. For paths that are not allowed to raise.
@@ -329,4 +334,7 @@ class AgentLoop:
             return await tool.execute(call.args, ctx)
         except Exception as exc:  # noqa: BLE001 - a tool bug must not kill the session
             log.exception("tool %s failed", call.name)
-            return ToolResult(call.id, f"{type(exc).__name__}: {exc}", is_error=True)
+            # A tool is plugin code, so the exception's message and its class name are both its
+            # words. This result is rendered in the REPL and replayed to the model next turn,
+            # and neither reader benefits from an escape sequence or a megabyte of one.
+            return ToolResult(call.id, describe_exception(exc), is_error=True)

@@ -22,7 +22,11 @@ Events the core emits (payload keys in brackets):
     notice           [text, source?]   informational text. ``source`` is ``command`` when the text
                                        is a slash command's output, which is the answer in a
                                        ``-p`` run; without it the notice is commentary about the
-                                       session and headless runs keep it off stdout
+                                       session and headless runs keep it off stdout. It reads as
+                                       the string ``"command"``, but the dispatcher stamps
+                                       :data:`~picoagent.core.commands.COMMAND_SOURCE` and a
+                                       frontend that routes on it should compare with ``is``:
+                                       a plugin's payload can carry the word, not the object
     error            [text]            something went wrong
     plugin_skipped   [name, reason, root, urgent, text]
                                        one plugin did not load, at startup; ``urgent`` marks

@@ -157,9 +157,19 @@ underneath you, and only you can tell those apart.
 picoagent tells you which case you're in rather than making you guess:
 
 ```bash
-picoagent plugin list          # trusted | CHANGED (approved before, but not this code) | UNTRUSTED (never approved)
-picoagent plugin trust <path>  # shows what moved, then asks
+picoagent plugin list            # trusted | CHANGED (approved before, but not this code) | UNTRUSTED (never approved)
+picoagent plugin trust <path>    # shows what moved, then asks
+picoagent plugin untrust <path>  # takes the approval back; also accepts the plugin's name
 ```
+
+`list` also names any approval that no longer has a plugin directory behind it, because that is
+the record you are most likely to want gone and the one nothing else shows you. `untrust` takes a
+name as well as a path for the same reason: an approval outlives the directory it covers, so a
+plugin you deleted still has a record, code that later lands in that directory reads as one you
+vetted once rather than one you have never seen, and a plugin you approved as `required` stops
+your sessions until you put it back or withdraw it. `untrust` reads the trust store without
+loading anything, so it works even then. Withdrawing leaves the plugin's files alone; only the
+decision is taken back.
 
 Re-approving a **changed** plugin shows what you're actually accepting — which file moved, and
 for a git checkout, the commits that arrived since you last approved:
