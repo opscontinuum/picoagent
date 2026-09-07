@@ -27,10 +27,15 @@ repository's ``.picoagent/config.toml`` is refused, because connecting one runs 
     [plugins.mcp.servers.notes]
     command = "python3"
     args = ["-m", "my_notes_server"]
-    env = { NOTES_DIR = "/srv/notes" }   # merged over the agent's environment
+    env = { NOTES_DIR = "/srv/notes" }   # set here, on top of the minimal environment
+    # pass_env = ["NOTES_TOKEN"]         # carry these over from your own environment, by name
     # cwd = "/srv/notes"                 # default: the project directory
     # timeout = 60
     # protocol_version = "2024-11-05"
+
+A server does **not** inherit the agent's environment: it starts from
+:data:`picoagent.plugins.api.MINIMAL_ENV_NAMES` plus whatever ``env`` and ``pass_env`` add. See
+the README's Environment section for what that set is and why.
 """
 from __future__ import annotations
 
@@ -88,6 +93,11 @@ def server_specs(cfg: dict) -> list[ServerSpec]:
             name=name, command=str(entry["command"]),
             args=[str(arg) for arg in entry.get("args", [])],
             env={str(key): str(value) for key, value in (entry.get("env") or {}).items()},
+            # ``pass_env`` widens what one server sees, so it lives inside a ``servers`` entry
+            # rather than beside the timeouts: ``servers`` is read from the user's own config
+            # only (see :func:`register`), which is what keeps a cloned repository from naming
+            # the variable its server should receive.
+            pass_env=[str(name) for name in entry.get("pass_env") or []],
             cwd=entry.get("cwd"),
             timeout=float(entry.get("timeout", cfg.get("timeout", DEFAULT_TIMEOUT))),
             startup_timeout=float(entry.get("startup_timeout",
@@ -306,12 +316,14 @@ atexit.register(close_all)
 
 def register(api) -> None:
     # ``servers`` is a list of commands this function spawns before the first turn, with the
-    # user's environment and the project directory as cwd. That makes it the one setting in this
+    # project directory as cwd. That makes it the one setting in this
     # plugin that must never come out of a cloned repository: ``[plugins.mcp.servers.x]`` with a
     # ``command`` would be arbitrary code executed at session start, ahead of any prompt, ahead
     # of the plugin trust store that gates every other way a repository gets code to run.
     # ``api.plugin_config()`` reads the user layer, so the servers here are the user's own.
     # The two timeouts are how long to wait, not what to run, so a repository may set them.
+    # ``env`` and ``pass_env`` are inside a server entry for the same reason the command is:
+    # they say what a server may see, and widening that is not a repository's call to make.
     settings = api.plugin_config()
     api.warn_about_project_config(*PROJECT_SETTABLE)
     statuses = [connect(spec, api) for spec in server_specs(settings.with_project(**PROJECT_SETTABLE))]

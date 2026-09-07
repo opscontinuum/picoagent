@@ -23,6 +23,7 @@ from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, 
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 from picoagent.plugins.api import PluginAPI
+from picoagent.plugins.manifest import Manifest
 
 PLUGINS = ROOT / "examples/plugins"
 
@@ -379,6 +380,105 @@ class RequiredPluginTests(LayeredConfigCase):
             self.load(root)
         self.assertIn("fragile", str(caught.exception))
         self.assertIn("guarding the shell", str(caught.exception))
+
+
+class RequiredInTheManifestTests(LayeredConfigCase):
+    """`required = true` in plugin.toml: the same declaration, readable without running anything.
+
+    `api.declare_required` is a statement made from inside `register()`, so it cannot cover the
+    case it most needs to. A plugin the trust check refuses is skipped *before* `load_plugin`
+    runs: `register()` never executes, the declaration never happens, and the session carries on
+    with the control absent. A trusted credential-guard with one file edited left the built-in
+    shell in place and said so on one line of stderr.
+    """
+
+    def user_plugins(self) -> Path:
+        return self.tmp / "home" / "plugins"
+
+    def write(self, parent: Path, *, required: str = "required = true\n",
+              body: str = "def register(api):\n    pass\n") -> Path:
+        root = parent / "guard"
+        root.mkdir(parents=True)
+        (root / "plugin.toml").write_text(
+            'name = "guard"\nentry = "guard:register"\n'
+            'required_reason = "the only thing guarding the shell"\n' + required)
+        (root / "guard.py").write_text(textwrap.dedent(body))
+        return root
+
+    def approve(self, root: Path) -> None:
+        loader.TrustStore(self.tmp / "home").trust(Manifest.load(root))
+
+    def edit(self, root: Path) -> None:
+        (root / "guard.py").write_text("def register(api):\n    pass  # not what was approved\n")
+
+    def load(self, extra: list[str] | None = None):
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
+        return loader.load_all(rt, extra_paths=extra or [])
+
+    def test_a_required_plugin_replaced_since_approval_stops_the_session(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.edit(root)
+        with self.assertRaises(loader.RequiredPluginError) as caught:
+            self.load()
+        self.assertIn("guard", str(caught.exception))
+        self.assertIn("guarding the shell", str(caught.exception))
+
+    def test_the_refusal_says_how_to_get_the_session_back(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.edit(root)
+        with self.assertRaises(loader.RequiredPluginError) as caught:
+            self.load()
+        self.assertIn("plugin trust", str(caught.exception))
+
+    def test_a_first_run_of_a_newly_added_required_plugin_is_not_fatal(self):
+        """`new` is the ordinary path: install a plugin, run, approve it. Fatal there is a brick."""
+        self.write(self.user_plugins())
+        report = self.load()
+        self.assertEqual([entry[:2] for entry in report.skipped], [("guard", "new")])
+
+    def test_an_unapproved_required_plugin_is_still_announced_as_urgent(self):
+        self.write(self.user_plugins())
+        self.assertEqual([n.name for n in self.load().urgent()], ["guard"])
+
+    def test_the_repositorys_own_required_plugin_cannot_stop_the_users_session(self):
+        """`required` is a repository-controlled string; halting on it hands a repo a kill switch."""
+        root = self.write(self.tmp / ".picoagent" / "plugins")
+        self.approve(root)
+        self.edit(root)
+        report = self.load()
+        self.assertEqual([entry[:2] for entry in report.skipped], [("guard", "changed")])
+
+    def test_a_requirement_recorded_at_approval_outlives_its_removal_from_the_manifest(self):
+        """Otherwise whoever replaced the code deletes the line that makes replacing it fatal."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        (root / "plugin.toml").write_text('name = "guard"\nentry = "guard:register"\n')
+        with self.assertRaises(loader.RequiredPluginError):
+            self.load()
+
+    def test_a_manifest_requirement_covers_a_register_that_raises(self):
+        """One mechanism: the manifest field is read into the same declaration `declare_required` sets."""
+        root = self.write(self.tmp / "cli", body="""
+            def register(api):
+                raise RuntimeError("boom")
+        """)
+        with self.assertRaises(loader.RequiredPluginFailed) as caught:
+            self.load(extra=[str(root)])
+        self.assertIn("guarding the shell", str(caught.exception))
+
+    def test_a_required_plugin_the_user_approved_still_loads(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.assertEqual([m.name for m in self.load().loaded], ["guard"])
+
+    def test_a_plugin_that_says_nothing_is_still_skipped_when_it_changes(self):
+        root = self.write(self.user_plugins(), required="")
+        self.approve(root)
+        self.edit(root)
+        report = self.load()
+        self.assertEqual([entry[:2] for entry in report.skipped], [("guard", "changed")])
 
 
 if __name__ == "__main__":

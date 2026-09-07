@@ -18,6 +18,9 @@ python_deps = []                       # pip-installed by `picoagent plugin add`
 skills = ["skills"]                    # optional: folders of SKILL.md to expose
 ```
 
+If your plugin is a security control rather than a convenience, add two more lines. See
+[If being skipped is not acceptable](#if-being-skipped-is-not-acceptable).
+
 ```python
 # my_plugin.py
 def register(api):
@@ -28,6 +31,67 @@ async def say_hello(args, rt):
 ```
 
 Try it: `picoagent -e ./my-plugin` then type `/hello`.
+
+## More than one file
+
+A plugin is a directory, so split it up as it grows. Import your other files by name, the way
+you would in any script:
+
+```python
+# es_doctor.py
+from es_client import ESError, request   # a file beside this one
+import es_admin                          # also fine inside a function, imported on demand
+```
+
+Those imports resolve *inside your plugin*. The entry module is loaded as a package rooted at
+your directory, and the loader rewrites your top-level imports into it, so your `utils.py` is
+yours: another installed plugin shipping a `utils.py` gets its own, and load order does not
+decide who wins because neither of you takes the bare name `utils`. Two checkouts of the *same*
+plugin loaded in one process get separate namespaces too, so `-e` on a second copy does not
+quietly run the first one's code. Your directory never joins `sys.path`, so it cannot shadow the
+standard library or an installed package for the rest of the session either.
+
+Worth knowing:
+
+* A file you ship wins over an installed distribution of the same name, but only for your own
+  modules. Calling a file `json.py` changes what *your* code gets from `import json`.
+* Relative imports (`from .es_client import ESError`) reach the same modules. Either style
+  works; pick one.
+* Anything outside your directory imports normally: the standard library, `picoagent.core.*`,
+  a package listed in `python_deps`.
+* If you nest a subdirectory package inside your plugin, its own modules import each other
+  relatively. The rewrite covers the files at the top of your plugin directory.
+* Every file in the directory is part of the trust fingerprint, so a change to any of them
+  sends users back to the trust prompt, not only a change to the entry module.
+
+## If being skipped is not acceptable
+
+A plugin that does not load is skipped and the session carries on. That is right for a
+formatter and wrong for a gate: from inside the session, "the guard refused that command" and
+"there is no guard" look identical.
+
+Say so in `plugin.toml`:
+
+```toml
+required = true
+required_reason = "this session's only check on destructive commands"
+```
+
+Read before any of your code runs, so it covers the case a runtime call cannot: a plugin the
+trust check refuses never reaches `register()`. With it set, a copy the user approved and that
+has since been replaced by different code stops the session instead of being announced, and so
+does a `register()` that raises.
+
+Two things it deliberately does not do. A **first run**, before the user has ever approved you,
+is announced loudly and left to continue: install-then-run is the normal path, and being fatal
+there would mean the user cannot open a session to trust you from. And when your plugin is the
+copy a *repository* suggested rather than one the user installed, `required` is announced
+rather than enforced, because a line in a cloned repo's `plugin.toml` must not be able to stop
+someone's session.
+
+`api.declare_required("reason")` is the same declaration made at runtime, for a plugin that
+only discovers inside `register()` that it cannot do its job. It sets the same field the
+manifest seeds, so you do not need both; if you write both, the runtime reason wins.
 
 ## The `api` object
 
@@ -57,6 +121,9 @@ api.register_command("deploy", handler, "deploy to an environment")   # /deploy 
 api.register_frontend(MyTUI())                                          # replace the REPL
 ```
 
+A command handler that raises is logged and shown to the user as `/deploy failed: ...`; the
+session stays up. Return a string for the normal case, since that is what the user is shown.
+
 **Change how the model is called**
 
 ```python
@@ -74,6 +141,17 @@ ok = await api.ui.ask("confirm", "Delete build/?")            # confirm | select
 await api.ui.emit("notice", {"text": "done"})
 ```
 
+| `deliver_as` | The message arrives |
+|---|---|
+| `steer` (default) | right after the current tool batch, inside the run that is going on |
+| `follow_up` | as a fresh prompt, once the agent has finished the current one |
+| `next_turn` | as its own user-role message, immediately before the user's next prompt |
+
+A `steer` queued from the final `turn_end` has no tool batch left to follow. It is not dropped:
+it is carried to the user's next prompt alongside `next_turn` text, ahead of what they typed.
+So queue a `steer` only when the guidance still reads sensibly one prompt later, and use
+`follow_up` when you want the agent to act on it rather than the user.
+
 **Remember things**
 
 ```python
@@ -86,7 +164,61 @@ api.plugin_config()                              # [plugins.my-plugin] from conf
 
 ```python
 code, output = await api.exec("git", "status")
+code, output = await api.exec("gh", "pr", "list", env={"GH_TOKEN": token})   # named, not inherited
 ```
+
+## Spawning a process
+
+**The rule: a child process a plugin starts gets a minimal environment, and anything more is
+named one variable at a time.** Two kinds of child sit outside it, and both are stated rather
+than overlooked: a command the *user* typed runs with the user's own environment (`!cmd` in the
+REPL, and the `git`/`pip` calls that install a plugin, which authenticate through a credential
+helper that reads it), and the built-in `shell` tool inherits everything, which is the leak
+`examples/plugins/credential-guard` exists to close by replacing that tool. Everything a plugin
+spawns for itself is on this side of the line.
+
+`api.exec` already does this: the child starts from `minimal_env()` in `picoagent/plugins/api.py`
+and your `env=` dict is merged over the top. If you spawn your own process instead of using
+`api.exec`, use the same function:
+
+```python
+from picoagent.plugins.api import minimal_env
+
+proc = await asyncio.create_subprocess_exec(
+    "my-server", "--stdio", cwd=api.cwd,
+    env=minimal_env({"MY_DIR": "/srv"}, pass_env=["MY_TOKEN"]),
+    stdout=asyncio.subprocess.PIPE)
+```
+
+`MINIMAL_ENV_NAMES` holds what a program needs to *run*: `PATH` (which is also the search path
+that finds your command once you pass `env` at all), `HOME`, the locale and timezone, a temp
+directory, and the Windows names a child cannot start without, `SystemRoot` among them, because
+a child that opens a socket fails without it. It holds nothing that identifies you to a service.
+It is an allowlist rather than a denylist of secret-shaped names, because no such denylist is
+complete: `DATABASE_URL` passes every one of them.
+
+Why this and not "inherit, it is only my own code": the output of a command a plugin runs is the
+thing plugins put into tool results and notices, and both go back to the model and into the
+session log on the next turn. A subprocess the model can influence is a subprocess whose
+environment is a prompt away from the transcript. Take the credential your command needs from
+`os.environ` at the call site, so the widening is one visible line in your plugin and not the
+default for everything you spawn.
+
+Two things this deliberately does not do:
+
+* **It is not a sandbox.** Nothing stops your plugin reading `os.environ` and passing all of it.
+  The load-time trust decision is still the only boundary around plugin code. This makes the
+  safe environment the one you get for free, not the one you have to remember.
+* **It does not stop a child reading files.** `HOME` is in the set, so `~/.aws/credentials`,
+  `~/.netrc` and every other on-disk credential is one `open()` away for a process running as
+  you. Closing the environment closes the path where a program is *handed* a secret without
+  asking; a program that goes looking is a program you chose to run.
+
+Where user config decides what a child sees, keep the setting out of a repository's reach:
+`api.plugin_config()` reads your user layers by default, and a key that widens an environment is
+exactly the kind that `.from_project()` should not name. The `mcp` plugin's `pass_env` lives
+inside its `servers` table for that reason, so a cloned repository can neither name a server's
+command nor name the variables it receives.
 
 ## Writing a tool
 
@@ -171,5 +303,7 @@ scenario, assert on the queries the plugin sends and the text it returns.
 ## Publishing
 
 Push the directory to git and tag it. Users install with
-`picoagent plugin add git:github.com/you/my-plugin@v0.1.0`. Bump the tag when you change
-the entry module; users will be asked to re-trust because the fingerprint changed.
+`picoagent plugin add git:github.com/you/my-plugin@v0.1.0`. Bump the tag whenever you change
+anything in the directory: the fingerprint covers every file, not just the entry module, so
+users will be asked to re-trust. If you set `required = true`, that re-trust is a hard stop
+rather than a notice, so ship upgrades that users will want to read.

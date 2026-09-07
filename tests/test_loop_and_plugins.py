@@ -118,6 +118,79 @@ class LoopTests(unittest.TestCase):
         run(AgentLoop(rt).run("x"))
         self.assertEqual(self.provider.calls[1]["messages"][-1].text, "focus on tests")
 
+    def test_a_command_that_raises_is_reported_and_not_propagated(self):
+        """A plugin command handler was the one plugin call-in that ran uncaught.
+
+        Events and tools are already contained, so a raising handler unwound out of
+        `handle_input` and through `PlainFrontend.run`, which catches only KeyboardInterrupt.
+        One broken `/command` therefore ended the REPL and the session. The user has to be
+        told what failed and left at a prompt.
+        """
+        rt = self._rt([[text("never runs")]])
+
+        async def boom(args, runtime):
+            raise RuntimeError("handler bug")
+
+        rt.commands.register("boom", boom, "explodes", owner="myplug")
+        run(AgentLoop(rt).handle_input("/boom now"))
+        errors = [p["text"] for e, p in rt.frontend.events if e == "error"]
+        self.assertTrue(errors, "the failure must reach the user, not just the log")
+        self.assertIn("boom", errors[0], "the message must name the command that failed")
+        self.assertIn("handler bug", errors[0], "and what went wrong")
+
+    def test_the_session_still_works_after_a_command_raised(self):
+        """Survival is the point: the next prompt has to reach the model as usual."""
+        rt = self._rt([[text("still here")]])
+
+        async def boom(args, runtime):
+            raise RuntimeError("handler bug")
+
+        rt.commands.register("boom", boom, "explodes", owner="myplug")
+        run(AgentLoop(rt).handle_input("/boom"))
+        run(AgentLoop(rt).handle_input("carry on"))
+        self.assertEqual(rt.frontend.text, "still here")
+        self.assertEqual(len(self.provider.calls), 1)
+
+    def test_next_turn_message_is_delivered_with_the_next_user_prompt(self):
+        """`next_turn` is accepted by the API and advertised in the docs, so it must arrive.
+
+        Queued text that is never drained accumulates in `rt.queue` for the life of the
+        session and reaches the model never, which is the worst of the three outcomes: the
+        plugin believes it spoke.
+        """
+        rt = self._rt([[text("ok")]])
+        PluginAPI(rt, "notes", self.tmp).send_message("remember the style guide", deliver_as="next_turn")
+        run(AgentLoop(rt).handle_input("write a test"))
+        sent = [m.text for m in self.provider.calls[0]["messages"] if m.role == "user"]
+        self.assertIn("remember the style guide", sent)
+        self.assertLess(sent.index("remember the style guide"), sent.index("write a test"),
+                        "queued text is context for the prompt, so it precedes it")
+        self.assertEqual(rt.queue, [], "delivered means removed")
+
+    def test_a_steer_queued_on_a_final_turn_arrives_with_the_next_prompt(self):
+        """A `steer` is drained after a tool batch, and a final turn has none.
+
+        The rules plugin queues its overflow on `turn_end`; on the last turn that text used to
+        sit in the queue until some later run happened to execute a tool, landing mid-batch in
+        unrelated work. It is delivered at the next prompt instead, where it is read in order.
+        """
+        rt = self._rt([[text("done")], [text("ok")]])
+        api = PluginAPI(rt, "rules", self.tmp)
+        already_queued: list[bool] = []
+
+        def queue_once(payload, runtime):
+            if not already_queued:
+                already_queued.append(True)
+                api.send_message("rule: prefer tests", deliver_as="steer")
+
+        rt.events.on("turn_end", queue_once, owner="rules")
+        run(AgentLoop(rt).handle_input("first prompt"))
+        run(AgentLoop(rt).handle_input("second prompt"))
+        sent = [m.text for m in self.provider.calls[1]["messages"] if m.role == "user"]
+        self.assertIn("rule: prefer tests", sent)
+        self.assertLess(sent.index("rule: prefer tests"), sent.index("second prompt"))
+        self.assertEqual(rt.queue, [])
+
     def test_provider_error_emits_error_and_stops(self):
         from picoagent.core.types import StreamEvent
         rt = self._rt([[StreamEvent("error", error="boom")]])

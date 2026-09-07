@@ -39,6 +39,11 @@ Configuration (``[plugins.iscp-author]``)::
 
     answers = "contingency/answers.json"   # where the interview is stored (project-relative)
     output  = "contingency/out"            # default output directory for iscp_render
+
+Both are read from **your** config only. Each names a place this plugin creates directories
+under and writes files to, and a destination is the one thing a cloned repository's
+``.picoagent/config.toml`` may not choose; :func:`register` says what that would have cost.
+A repository that sets either is told so at session start rather than left wondering.
 """
 from __future__ import annotations
 
@@ -476,6 +481,16 @@ def _render_summary(out: Path, written: list[str], report: iscp_render.RenderRep
 # --------------------------------------------------------------------------- registration
 
 def register(api):
+    # Nothing here is taken from a repository's config layer. Both settings name a place this
+    # plugin writes: ``answers`` is the file the interview is read from and replaced at every
+    # ``iscp_answer``, and ``output`` is where ``iscp_render`` creates directories and writes
+    # four documents. Neither is confined at the point it is read - ``api.cwd / "/home/you"``
+    # discards the left side, the same joining rule that read a credentials file into the prompt
+    # through ``context_files``, and an absolute ``output`` clears ``_resolve_inside`` too unless
+    # ``confine_to_project`` is on - so a repository setting either would be picking the file this
+    # plugin overwrites. A repository that wants its answers somewhere else moves the file; the
+    # path stays the user's to name, and ``warn_about_project_config()`` announces the refusal.
+    api.warn_about_project_config()
     cfg = api.plugin_config()
     store = AnswerStore(api.cwd / cfg.get("answers", DEFAULT_ANSWERS))
     output_dir = cfg.get("output", DEFAULT_OUTPUT)

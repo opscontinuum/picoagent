@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -634,3 +635,51 @@ class ConfinementTests(unittest.TestCase):
         source = inspect.getsource(iscp_author)
         self.assertEqual(source.count("except (ValueError, PathRefused) as exc:"), 2,
                          "every _resolve_inside call site must catch both refusal types")
+
+
+class ProjectConfigLayerTests(unittest.TestCase):
+    """What a cloned repository's ``[plugins.iscp-author]`` may decide, which is nothing.
+
+    Both settings this plugin reads name a place it writes: the answers file it replaces on
+    every recorded answer, and the directory ``iscp_render`` creates and fills. Neither is
+    confined where ``register`` reads it, so a repository choosing one would be choosing which
+    of the user's files get overwritten with a contingency plan. The refusal is the point of
+    these tests; that it is announced rather than silent is the other half, because a
+    repository author whose setting did nothing and a user who cloned that repository both
+    need to see the same line.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / ".picoagent").mkdir()
+        self.outside = self.tmp / "outside"
+
+    def _runtime(self, project: str):
+        (self.tmp / ".picoagent" / "config.toml").write_text(textwrap.dedent(project))
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]), frontend=CaptureFrontend())
+        loader.load_plugin(PLUGIN, rt, loader.TrustStore(self.tmp / "home"), allow_untrusted=True)
+        return rt
+
+    def _tool(self, rt, name, **args):
+        return run(rt.tools.get(name).execute(args, tool_ctx(self.tmp)))
+
+    def test_a_repository_cannot_move_the_file_the_interview_is_written_to(self):
+        rt = self._runtime(f'[plugins.iscp-author]\nanswers = "{self.outside / "answers.json"}"\n')
+        outcome = self._tool(rt, "iscp_answer", id="scope.rto_hours", value=12)
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertTrue((self.tmp / "contingency/answers.json").exists())
+        self.assertFalse(self.outside.exists(), "a repository's config chose where the plugin writes")
+
+    def test_a_repository_cannot_move_where_the_rendered_plan_is_written(self):
+        rt = self._runtime(f'[plugins.iscp-author]\noutput = "{self.outside}"\n')
+        outcome = self._tool(rt, "iscp_render")
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertTrue((self.tmp / "contingency/out/ISCP.md").exists())
+        self.assertFalse(self.outside.exists(), "a repository's config chose the output directory")
+
+    def test_both_refusals_are_named_at_session_start(self):
+        rt = self._runtime('[plugins.iscp-author]\nanswers = "a.json"\noutput = "out"\n')
+        run(rt.events.emit("session_start", {}, rt))
+        notices = "\n".join(payload["text"] for event, payload in rt.frontend.events if event == "notice")
+        self.assertIn("iscp-author: ignored answers, output", notices)
+        self.assertIn("read from your own config only", notices)

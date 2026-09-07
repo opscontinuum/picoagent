@@ -16,6 +16,9 @@ Events the core emits (payload keys in brackets):
     tool_result      [call, result]    its ToolResult (also emitted for blocked calls)
     notice           [text]            informational text (command output etc.)
     error            [text]            something went wrong
+    plugin_skipped   [name, reason, root, urgent, text]
+                                       one plugin did not load, at startup; ``urgent`` marks
+                                       one the user approved that is now not running
 """
 from __future__ import annotations
 

@@ -6,6 +6,7 @@ must be shown and approved before its text can reach the model, and there must b
 """
 import json
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -29,6 +30,14 @@ globs: *.py
 description: Conventions that ship with the repo
 ---
 PROJECT RULE BODY: prefer composition over inheritance.
+"""
+
+CONFIGURED_DIR_RULE = """---
+name: docs-rule
+globs: *.py
+description: Conventions the repository keeps outside .picoagent/rules
+---
+CONFIGURED DIR RULE BODY: run the formatter before you commit.
 """
 
 CHANGED_PROJECT_RULE = """---
@@ -225,6 +234,74 @@ class RulesPluginTests(unittest.TestCase):
         prompt = rt.frontend.questions[0]
         self.assertNotIn("\x1b", prompt)
         self.assertNotIn("\r", prompt)
+
+
+class ProjectConfiguredDirectoryTests(unittest.TestCase):
+    """A repository naming its own rules directory in ``[plugins.rules].dirs``.
+
+    This is the case the module docstring was written around: ``[plugins.rules]`` is not in
+    ``USER_ONLY``, so a repository can name a directory, and the plugin answers that by calling
+    every configured directory project-sourced and putting each file it finds through the same
+    fingerprint gate as ``.picoagent/rules/``. Layering ``[plugins.<name>]`` took the key away
+    from the repository without telling anybody, which turns a designed-for hazard into a
+    directory that is never read at all. The tests here pin both halves: the directory is read,
+    and nothing in it reaches the model that a person did not approve first.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / "a.py").write_text("print('hi')\n")
+        directory = self.tmp / "docs" / "rules"
+        directory.mkdir(parents=True)
+        (directory / "docs-rule.md").write_text(CONFIGURED_DIR_RULE)
+        (self.tmp / ".picoagent").mkdir()
+
+    def _project_config(self, body: str) -> None:
+        (self.tmp / ".picoagent" / "config.toml").write_text(textwrap.dedent(body))
+
+    def _touch_py(self, frontend):
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[call("read", path="a.py")], [text("ok")]]),
+                          frontend=frontend)
+        loader.load_plugin(PLUGINS / "rules", rt, loader.TrustStore(self.tmp / "home"),
+                           allow_untrusted=True)
+        run(AgentLoop(rt).run("look at a.py"))
+        return rt
+
+    @staticmethod
+    def _conversation(rt) -> str:
+        return "\n".join(message.text or "" for message in rt.session.messages())
+
+    @staticmethod
+    def _notices(rt) -> str:
+        return "\n".join(payload["text"] for event, payload in rt.frontend.events if event == "notice")
+
+    def test_a_directory_the_repository_configured_is_read_and_gated(self):
+        self._project_config('[plugins.rules]\ndirs = ["docs/rules"]\n')
+        rt = self._touch_py(RecordingFrontend(answer=True))
+        self.assertEqual(len(rt.frontend.questions), 1)
+        self.assertIn("docs/rules/docs-rule.md", rt.frontend.questions[0])
+        self.assertIn("CONFIGURED DIR RULE BODY", self._conversation(rt))
+
+    def test_that_directory_is_gated_as_project_text_not_trusted_as_the_users_own(self):
+        self._project_config('[plugins.rules]\ndirs = ["docs/rules"]\n')
+        rt = self._touch_py(RecordingFrontend(answer=False))
+        self.assertEqual(len(rt.frontend.questions), 1)
+        self.assertNotIn("CONFIGURED DIR RULE BODY", self._conversation(rt))
+
+    def test_a_headless_run_never_injects_from_a_repository_configured_directory(self):
+        self._project_config('[plugins.rules]\ndirs = ["docs/rules"]\n')
+        rt = self._touch_py(HeadlessFrontend())
+        self.assertNotIn("CONFIGURED DIR RULE BODY", self._conversation(rt))
+
+    def test_the_repository_may_not_set_the_per_turn_budget_and_is_told_so(self):
+        """``dirs`` says where to look; ``max_rules_per_turn`` is how much of the user's own
+        context window one turn may spend, which is not a repository's call."""
+        self._project_config('[plugins.rules]\ndirs = ["docs/rules"]\nmax_rules_per_turn = 99\n')
+        rt = self._touch_py(RecordingFrontend(answer=True))
+        run(rt.events.emit("session_start", {}, rt))
+        notices = self._notices(rt)
+        self.assertIn("ignored max_rules_per_turn", notices)
+        self.assertNotIn("dirs", notices)
 
 
 class DelegatedToolCallTests(unittest.TestCase):

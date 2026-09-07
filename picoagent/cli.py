@@ -34,6 +34,12 @@ from .plugins import upgrade as upgrade_mod
 
 # ---------------------------------------------------------------------------- wiring
 
+#: Marks the startup lines a user must not scroll past: a plugin they approved is not running.
+#: Routine lines (a plugin they have never approved, a repository copy that lost to their own)
+#: carry no mark, so the one line worth stopping for does not look like the rest.
+URGENT_MARK = "!!"
+
+
 def session_dir(cfg: dict, cwd: Path) -> Path:
     """Sessions live under the user dir, one folder per project path."""
     return Path(cfg["_user_dir"]) / "sessions" / cwd.as_posix().strip("/").replace("/", "--")
@@ -156,7 +162,12 @@ def register_core_commands(rt: Runtime) -> None:
 
 
 def build_runtime(args: argparse.Namespace) -> Runtime:
-    """Config -> session -> core registrations -> frontend -> plugins."""
+    """Config -> session -> core registrations -> frontend -> plugins.
+
+    The load report is kept on the runtime because the two halves of telling the user about it
+    happen at different times: the stderr copy right here, while the terminal is still empty, and
+    the event copy once the session is running, from :func:`announce_load_report`.
+    """
     cwd = Path(args.cwd or ".").resolve()
     cfg = load_config(cwd, {"model": args.model, "provider": args.provider, "thinking": args.thinking,
                             "temperature": args.temperature})
@@ -164,30 +175,49 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
     register_core(rt)
     headless = bool(args.prompt or args.json)
     rt.frontend = PrintFrontend(json_mode=args.json) if headless else PlainFrontend()
-    report = loader.load_all(rt, extra_paths=args.extension, allow_untrusted=args.dangerously_trust_all)
-    _report_skipped(report)
+    rt.load_report = loader.load_all(rt, extra_paths=args.extension,
+                                     allow_untrusted=args.dangerously_trust_all)
+    _report_skipped(rt.load_report)
     report_available_upgrades(rt)
     return rt
 
 
 def _report_skipped(report: loader.LoadReport) -> None:
-    """Say plainly which plugins didn't load, on stderr.
+    """Print the loader's own wording for every plugin that did not load, on stderr.
 
-    A skipped plugin is silent otherwise: the user installed it, expects it to be running, and
-    only finds out when the behaviour it provides is missing. A plugin that *changed* after
-    approval is the one to shout about - that is code the user vetted being replaced by code
-    they haven't seen.
+    The wording belongs to the loader, which knows why the skip happened: "you edited this",
+    "something moved your checkout" and "this repository offers a version you never approved"
+    call for different answers from the user. Re-deriving one line here from the reason string
+    collapsed those three into one, and announced a plugin as failed when it was only shadowed by
+    the user's own copy that loaded fine. The urgency travels with the notice too, so an approved
+    plugin that is not running is marked rather than sitting in the same shape as the rest.
     """
-    for name, reason, root in report.skipped:
-        if reason == "changed":
-            sys.stderr.write(
-                f"picoagent: plugin '{name}' CHANGED since you approved it and was not loaded.\n"
-                f"  Review and accept the change:  picoagent plugin trust {root}\n")
-        elif reason == "new":
-            sys.stderr.write(f"picoagent: plugin '{name}' is not trusted yet and was not loaded.\n"
-                             f"  Review and approve it:  picoagent plugin trust {root}\n")
-        else:
-            sys.stderr.write(f"picoagent: plugin '{name}' failed to load ({reason}); see --verbose.\n")
+    for notice in report.notices:
+        head, *rest = notice.text.splitlines() or [""]
+        mark = f"{URGENT_MARK} " if notice.urgent else ""
+        sys.stderr.write(f"picoagent: {mark}{head}\n")
+        for line in rest:
+            sys.stderr.write(f"{line}\n")
+
+
+async def announce_load_report(rt) -> None:
+    """Put the plugin skips into the event stream as well, one event each.
+
+    A ``--json`` consumer reads stdout, so the stderr copy above does not exist for it: the line
+    saying an approved security plugin is not running arrived beside a machine-readable stream
+    that never mentioned it. Each skip goes out as its own ``plugin_skipped`` event carrying
+    ``urgent`` as a field, so a consumer branches on a boolean rather than parsing English, and
+    an urgent skip is not another line of ``notice`` chatter. Frontends that render only the
+    events they know about (the REPL, ``-p`` without ``--json``) ignore it and keep the stderr
+    copy, so nobody is told twice.
+    """
+    report = getattr(rt, "load_report", None)
+    if report is None or rt.frontend is None:
+        return
+    for notice in report.notices:
+        await rt.frontend.emit("plugin_skipped", {"name": notice.name, "reason": notice.reason,
+                                                  "root": str(notice.root), "urgent": notice.urgent,
+                                                  "text": notice.text})
 
 
 async def warn_about_ignored_project_keys(rt) -> None:
@@ -196,14 +226,19 @@ async def warn_about_ignored_project_keys(rt) -> None:
     Dropping these silently would leave two people confused for different reasons: whoever
     wrote the project config wondering why it did nothing, and whoever cloned the repository
     never learning it tried to point their API key somewhere else.
+
+    It goes to the frontend, not the event bus: ``notice`` on the bus is a name no subscriber
+    has, so the warning was computed and thrown away in every run mode. The refused names ride
+    along as a list beside the text, which costs a text frontend nothing and saves a ``--json``
+    consumer from reading the sentence back apart.
     """
     ignored = rt.cfg.get("_ignored_project_keys") or []
     if not ignored:
         return
-    await rt.events.emit("notice", {
+    await rt.frontend.emit("notice", {
         "text": f"ignored {', '.join(ignored)} from this repository's .picoagent/config.toml - "
-                "these are read from your own config only. See docs/security/trust-boundaries.md"},
-        rt)
+                "these are read from your own config only. See docs/security/trust-boundaries.md",
+        "ignored_project_keys": list(ignored)})
 
 
 # ---------------------------------------------------------------------------- commands
@@ -212,6 +247,7 @@ async def run_agent(args: argparse.Namespace) -> int:
     rt = build_runtime(args)
     agent = AgentLoop(rt)
     await warn_about_ignored_project_keys(rt)
+    await announce_load_report(rt)
     await rt.events.emit("session_start", {"resume": bool(args.resume)}, rt)
     try:
         if args.prompt:

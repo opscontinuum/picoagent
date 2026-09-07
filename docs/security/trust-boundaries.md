@@ -66,7 +66,9 @@ approve it), `upgrade` (redirects where picoagent upgrades itself from), and
 A repo may still set `model`, `max_tokens`, `thinking`, `parallel_tools` and add to
 `plugins.enabled` - each added plugin still faces the trust prompt, and installs under the
 repository's own `.picoagent/plugins/` rather than yours. When a repository tries to set a
-`USER_ONLY` key, the session says so at startup rather than dropping it silently.
+`USER_ONLY` key, the session says so at startup rather than dropping it silently. The warning is
+a `notice` handed to the frontend, so it is on screen in the REPL and in a `-p` run, and a
+`--json` run carries the refused names as `ignored_project_keys` beside the sentence.
 
 ### `plugins.enabled` is concatenated, and a spec carries its layer
 
@@ -86,7 +88,12 @@ The fix is that a spec carries the layer that wrote it as far as the directory i
 
 * `enabled_by_layer` recovers the provenance the merge discards. `load_config` builds the list
   user-first, so the repository's specs are its tail; a config assembled any other way is
-  attributed by membership, which errs towards calling a spec the repository's.
+  attributed by membership, which errs towards calling a spec the repository's. When the
+  repository's own list cannot be read - no `_cwd` to look under, a `.picoagent/config.toml`
+  that will not open or will not parse - neither rule applies, and `enabled_by_layer` raises
+  `PluginProvenanceError` instead of picking one. An unreadable file used to arrive as an empty
+  repository list, which put every spec in the *user* layer and so switched the off-limits check
+  off: the config nobody could read got the privilege that reading it was meant to decide.
 * A repository's spec clones into `<project>/.picoagent/plugins/`. The user's plugin directory
   is off limits to it, compared after resolving symlinks so a `.picoagent/plugins` symlink
   committed in the repository does not get there either, and a checkout directory name that is
@@ -116,6 +123,21 @@ editing a file, so "something moved your checkout" and "you edited this yourself
 and no longer share one message. `shadowed` exists so the repository's rejected copy does not
 raise a false alarm about the user's copy that is loading perfectly well, and it is only used
 when that user-owned copy really did load.
+
+Both channels carry the notice, because the person and the program reading a session are not the
+same reader:
+
+* **stderr**, in every run mode, is the loader's own wording printed verbatim. An urgent line is
+  prefixed `picoagent: !!`; a routine one is not, so the line worth stopping for is not the same
+  shape as "you have not approved this yet". The CLI prints it, once. The loader keeps its own
+  copy at `info`, where `--verbose` finds it, and only raises that to `warning`/`error` when the
+  runtime has no frontend at all: a library embedder driving the loop directly has nothing that
+  will ever print the text, so it goes where the default handler will show it. Whoever wires a
+  frontend owns presentation and reads the wording off `LoadReport`.
+* **the event stream** gets one `plugin_skipped` event per skip, carrying `name`, `reason`,
+  `root`, `urgent` and the same text. A `--json` consumer reads stdout and never saw stderr, so
+  it branches on `urgent` rather than on a sentence. The REPL and a plain `-p` run render only
+  the events they know about, so they ignore it and nobody is told twice.
 
 ### `[plugins.<name>]` is layered, not merged
 
@@ -253,12 +275,31 @@ environment allowlist and the tool-layer refusal.
 
 **Every control is void if the plugin is not loaded.** credential-guard supplies the guards.
 Untrusted or disabled, the built-in shell tool passes the entire environment through and no
-`tool_call` guard exists. This is why a skip is reported the way it is above, and it is also
-the remaining gap: the CLI still renders skips from the `(name, reason, root)` tuples on
-stderr, so in a `-p` or `--json` run the urgent lines are stderr text beside a machine-readable
-stream that does not mention them. `report.lines()` and `report.urgent()` are there for a
-frontend to print or emit as an event; wiring them into `_report_skipped` and the `--json`
-stream is not done.
+`tool_call` guard exists. This is why a skip is reported the way it is above, on stderr and as a
+`plugin_skipped` event.
+
+A plugin can say that reporting is not enough. `required = true` in its `plugin.toml` is read
+before any of its code runs, so unlike `api.declare_required` - which is a statement made from
+inside `register()`, and so cannot cover a plugin that never reaches `register()` - it covers
+the trust check too. Both set the same field: the loader seeds the runtime declaration from the
+manifest, so a manifest requirement already makes a failing `register()` fatal.
+
+What it stops, and what it does not:
+
+| Situation | Outcome |
+|---|---|
+| A required plugin the user owns is `changed` - approved once, now different code | The session does not start. `RequiredPluginUntrusted` names the plugin, what changed, and the `plugin trust` command |
+| A required plugin's `register()` raises | The session does not start. `RequiredPluginFailed`, as before |
+| A required plugin is `new` - never approved | Announced as urgent, session continues. Install-then-run is the ordinary first-run path, and making it fatal means the plugin can never be trusted from a session that will no longer open |
+| A required plugin the *repository* owns is refused | Announced, session continues. `required` is a line a cloned repository wrote, and honouring it there would hand any repository a switch that stops the user's session on demand |
+
+The requirement is recorded in `trust.json` at approval, not read from the directory under
+suspicion, so whoever replaced the code cannot delete the line that makes replacing it fatal.
+Approvals made before this field existed fall back to the manifest on disk, because reading
+them as *not required* would silently disarm them.
+
+A caller that needs a control the loader treats as optional still has to read `LoadReport` and
+decide for itself.
 
 **Owner-restriction is not encryption.** The credentials file is `0600` on POSIX and
 ACL-restricted via `icacls` on Windows - the same trust model as `~/.netrc`. Anything running

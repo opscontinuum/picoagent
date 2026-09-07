@@ -8,10 +8,13 @@ Three properties matter more than the rest, and each has its own class below:
 * ``EvidenceContainmentTests`` - the probes read a repository path the model chose, so they
   must not read outside it, must not follow a symlink out of it, and must not open ``.git``.
 * ``DeterminationGateTests`` - no tool argument may record a status without the user. The
-  only unattended path is ``interactive = false`` in the user's own config file.
+  only unattended path is ``interactive = false`` in the user's own config file, and
+  ``ProjectConfigLayerTests`` holds the "own" in that sentence: a cloned repository setting the
+  same flag must not switch the gate off, and must be told that it did not.
 """
 import re
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -619,3 +622,45 @@ class ControlCharacterTests(unittest.TestCase):
         self.assertIn("unchanged", str(caught.exception))
         self.assertEqual(self.path.read_bytes(), self.original)
         self.assertFalse((self.tmp / "c.ckl.tmp").exists(), "temp file must be cleaned up")
+
+
+class ProjectConfigLayerTests(unittest.TestCase):
+    """A cloned repository setting ``interactive = false`` must not open the gate.
+
+    ``interactive`` is the gate rather than a setting beside it, so a repository that could set
+    it could have an agent write "Not A Finding" onto a checklist somebody signs, for rules
+    nobody looked at. That is a permission, and the line the shipped plugins hold is that a
+    repository may tighten and may not grant. Refusing the key is the whole audit result for
+    this plugin; there is no second setting to weigh.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.ckl_path = self.tmp / "asd.ckl"
+        self.ckl_path.write_bytes(build_ckl())
+        (self.tmp / ".picoagent").mkdir()
+        (self.tmp / ".picoagent" / "config.toml").write_text(
+            textwrap.dedent('[plugins.stig-runner]\ninteractive = false\n'))
+        self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
+        loader.load_plugin(PLUGIN, self.rt, loader.TrustStore(self.tmp / "home"),
+                           allow_untrusted=True)
+
+    def _tool(self, name, ui=None, **args):
+        ctx = tool_ctx(self.tmp)
+        ctx.ui = ui
+        return run(self.rt.tools.get(name).execute(args, ctx))
+
+    def test_the_repository_cannot_grant_itself_unattended_recording(self):
+        self._tool("stig_load", path=str(self.ckl_path))
+        result = self._tool("stig_set", vuln_num="V-222387", status="NotAFinding",
+                            finding_details="app/session.py:4 limits sessions")
+        self.assertTrue(result.is_error)
+        self.assertIn("needs an interactive session", result.content)
+        self.assertEqual(ckl.load(self.ckl_path).rules[0].status, "Not_Reviewed")
+
+    def test_the_user_is_told_the_flag_was_refused(self):
+        run(self.rt.events.emit("session_start", {}, self.rt))
+        notices = "\n".join(payload["text"] for event, payload in self.rt.frontend.events
+                            if event == "notice")
+        self.assertIn("stig-runner: ignored interactive", notices)
+        self.assertIn("read from your own config only", notices)

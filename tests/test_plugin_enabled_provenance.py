@@ -222,6 +222,66 @@ class SpecProvenance(unittest.TestCase):
         self.assertEqual(self._layers(["./mine"]), [("./mine", "user")])
 
 
+class ProvenanceThatCannotBeEstablished(unittest.TestCase):
+    """A config whose layers cannot be told apart must not hand out the user's privileges.
+
+    `project_enabled` answered a missing `.picoagent/config.toml` and an unreadable one with the
+    same empty list, and an empty project list attributes every spec to the *user* layer - the
+    one allowed to write into `~/.picoagent/plugins`, with the off-limits check switched off.
+    Those are two different questions: "the repository asked for nothing" is knowable, "nobody
+    can read what the repository asked for" is not, and only the first is safe to act on.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / ".picoagent").mkdir(parents=True)
+        self.config = self.tmp / ".picoagent" / "config.toml"
+        self.spec = "git:evil.example/attacker/credential-guard@bad"
+
+    def _layers(self, enabled=None):
+        cfg = {"_cwd": str(self.tmp), "plugins": {"enabled": [self.spec] if enabled is None else enabled}}
+        return loader.enabled_by_layer(cfg)
+
+    def test_a_config_with_no_cwd_is_refused_rather_than_guessed_at(self):
+        with self.assertRaises(loader.PluginProvenanceError):
+            loader.enabled_by_layer({"plugins": {"enabled": [self.spec]}})
+
+    def test_a_malformed_project_config_is_refused(self):
+        self.config.write_text("[plugins\nenabled = [\n")
+        with self.assertRaises(loader.PluginProvenanceError):
+            self._layers()
+
+    def test_a_project_config_that_cannot_be_opened_is_refused(self):
+        self.config.mkdir()          # an OSError on open that needs no chmod and no non-root uid
+        with self.assertRaises(loader.PluginProvenanceError):
+            self._layers()
+
+    def test_the_refusal_names_the_spec_it_would_not_place(self):
+        self.config.write_text("[plugins\n")
+        with self.assertRaises(loader.PluginProvenanceError) as caught:
+            self._layers()
+        self.assertIn(self.spec, str(caught.exception))
+
+    def test_discovery_refuses_rather_than_resolving_an_unplaceable_spec(self):
+        """The consequence: the spec never reaches `resolve_source`, so it never clones anywhere."""
+        self.config.mkdir()
+        cfg = {"_cwd": str(self.tmp), "_user_dir": str(self.tmp / "home"),
+               "plugins": {"enabled": [self.spec]}}
+        with self.assertRaises(loader.PluginProvenanceError):
+            loader.discover(cfg, [])
+
+    def test_nothing_enabled_is_nothing_to_attribute(self):
+        self.config.write_text("[plugins\n")
+        self.assertEqual(self._layers([]), [])
+
+    def test_a_repository_that_wrote_no_config_is_still_answerable(self):
+        self.assertEqual(self._layers(), [(self.spec, "user")])
+
+    def test_a_config_without_a_plugins_table_is_still_answerable(self):
+        self.config.write_text('model = "x"\n')
+        self.assertEqual(self._layers(), [(self.spec, "user")])
+
+
 class MovedVersusEdited(unittest.TestCase):
     """A trusted plugin that stops loading: did the user edit it, or did something move it?"""
 

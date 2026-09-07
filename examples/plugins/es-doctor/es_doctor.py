@@ -433,7 +433,8 @@ def is_destructive(method: str, path: str) -> bool:
 # ------------------------------------------------------------------ registration
 
 def register(api):
-    import es_admin       # sibling module; the loader puts the plugin root on sys.path
+    import es_admin       # sibling module; the loader rewrites this import into the
+                          # plugin's own package, so sys.path is untouched
 
     cfg = api.plugin_config()
     # Two kinds of setting, two layers. The connection is where a credential goes and what TLS

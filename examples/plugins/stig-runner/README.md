@@ -46,6 +46,11 @@ Nothing in any tool's parameter schema reaches that flag, and a test asserts tha
 named `interactive`, `force`, `yes`, `unattended`, `auto`, `confirm`, `headless`, `no_confirm`,
 `skip_confirm` or `batch` exists on any tool.
 
+"The user's own config file" is literal. A cloned repository's `.picoagent/config.toml` is a
+separate layer that this plugin takes nothing from, so a repository setting `interactive = false`
+leaves the gate up and is named at session start. The gate is a permission, and a repository may
+tighten a permission but may not grant one.
+
 ## Evidence, not determinations
 
 `stig_evidence` maps 44 of the 286 ASD V6R4 rules to four kinds of probe — `grep`, `exists`,

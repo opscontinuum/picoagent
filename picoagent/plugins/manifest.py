@@ -9,6 +9,8 @@ Example::
     python_deps = []                      # pip-installed on `picoagent plugin add`
     skills = ["skills"]                   # directories of SKILL.md to expose
     requires = ["picoagent>=0.1"]         # informational for now
+    required = true                       # this session should not run without me
+    required_reason = "the only check on destructive commands"
 """
 from __future__ import annotations
 
@@ -27,6 +29,12 @@ class Manifest:
     skills: list[str] = field(default_factory=list)
     prompts: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
+    #: Declared here rather than only through ``api.declare_required`` because the loader has to
+    #: know before it runs anything. A plugin the trust check refuses never reaches ``register()``,
+    #: so a declaration made inside ``register()`` cannot cover the one case where the plugin is
+    #: absent and nobody chose that. See ``loader.RequiredPluginError``.
+    required: bool = False
+    required_reason: str = ""
     root: Path = Path(".")
 
     @property
@@ -50,7 +58,13 @@ class Manifest:
         if not path.exists():
             raise FileNotFoundError(f"{root} has no plugin.toml")
         data = tomllib.loads(path.read_text())
+        reason = data.get("required_reason")
         return Manifest(name=data["name"], entry=data["entry"], version=data.get("version", "0.0.0"),
                         description=data.get("description", ""), python_deps=data.get("python_deps", []),
                         skills=data.get("skills", []), prompts=data.get("prompts", []),
-                        requires=data.get("requires", []), root=root)
+                        requires=data.get("requires", []),
+                        # `is True` rather than a truth test: this field decides whether a session
+                        # refuses to start, so `required = "no"` must not read as yes.
+                        required=data.get("required") is True,
+                        required_reason=reason if isinstance(reason, str) else "",
+                        root=root)

@@ -11,16 +11,80 @@ they can be listed and, later, unloaded.
 One thing to know before reading settings: :meth:`PluginAPI.plugin_config` answers with the
 user's config layers, not with a repository's. A repository's ``[plugins.<name>]`` values are
 kept apart and taken only when a plugin names them. See :class:`picoagent.core.config.PluginConfig`.
+
+One thing to know before spawning anything: :func:`minimal_env` is the environment a child gets,
+and :meth:`PluginAPI.exec` uses it. See its docstring for the rule and for the one exception the
+tree makes.
 """
 from __future__ import annotations
 
 import asyncio
+import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Callable
 
 from ..core.config import PluginConfig, plugin_config
 from ..core.loop import Runtime
 from ..core.skills import Skill
+
+#: What a child process needs to *be a runnable program*, on either platform, and nothing that
+#: identifies you to a service. Each name earns its place by breaking something when absent:
+#:
+#: * ``PATH`` - passing ``env`` makes it the search path ``subprocess`` uses to find the command
+#:   itself, so a child without it cannot be started at all unless it was named absolutely.
+#: * ``HOME`` / ``USERPROFILE`` - where a runtime keeps its caches and its own config. A node or
+#:   python child without one writes to ``/`` or refuses to start.
+#: * ``SystemRoot`` and its neighbours - Windows platform, not preference. Winsock loads its
+#:   provider DLLs by way of ``SystemRoot``, so a child that opens a socket fails without it, and
+#:   the failure names a DLL rather than an environment variable.
+#: * ``LANG`` / ``LC_*`` - the pipe is UTF-8 by contract; a child that falls back to ASCII
+#:   mangles every non-ASCII character in a tool result.
+#: * ``TZ``, ``TMPDIR`` / ``TEMP`` / ``TMP`` - a timestamp and a scratch directory.
+#:
+#: Everything else, including every credential and every ``*_TOKEN`` a shell exports, is left
+#: behind. This is an allowlist for the same reason ``credential-guard``'s is: a denylist of
+#: secret-shaped names cannot be complete, and ``DATABASE_URL`` is the standing proof.
+MINIMAL_ENV_NAMES: frozenset[str] = frozenset({
+    # POSIX
+    "PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+    # Windows: a child cannot start, resolve a command, or open a socket without these.
+    "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE",
+    "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
+    "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS", "OS",
+})
+
+
+def minimal_env(extra: dict[str, str] | None = None, pass_env: Sequence[str] = (),
+                base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment picoagent gives a child process: :data:`MINIMAL_ENV_NAMES`, then
+    ``pass_env`` names lifted from ``base``, then ``extra`` written over the top.
+
+    The rule this exists to hold: **a child picoagent spawns starts from a minimal environment,
+    and anything more is named by the user, one variable at a time.** Inheriting ``os.environ``
+    is the opposite default and it is how a credential reaches a program the model influences -
+    an MCP server runs arguments the model chose, and a plugin's subprocess writes its output
+    into a tool result that goes back to the model on the next turn.
+
+    ``base`` is ``os.environ`` unless a caller passes its own, which is what lets a test check
+    the Windows half of the answer from Linux. A name is looked up exactly first and
+    case-insensitively second, because Windows spells ``SystemRoot`` several ways and POSIX
+    treats two spellings as two variables.
+    """
+    source = os.environ if base is None else base
+    by_upper: dict[str, tuple[str, str]] = {}
+    for key, value in source.items():
+        by_upper.setdefault(key.upper(), (key, value))
+
+    built: dict[str, str] = {}
+    for name in (*MINIMAL_ENV_NAMES, *pass_env):
+        if name in source:
+            built[name] = source[name]
+        elif name.upper() in by_upper:
+            key, value = by_upper[name.upper()]
+            built[key] = value
+    built.update({str(key): str(value) for key, value in (extra or {}).items()})
+    return built
 
 
 class PluginAPI:
@@ -109,7 +173,13 @@ class PluginAPI:
 
         ``steer``: delivered after the current tool batch (mid-run nudge).
         ``follow_up``: a new prompt once the agent finishes.
-        ``next_turn``: bundled with the user's next prompt.
+        ``next_turn``: its own message, immediately before the user's next prompt.
+
+        Every kind has a draining site in :class:`~picoagent.core.loop.AgentLoop`, so queued text
+        always reaches the model. A ``steer`` is the one with a timing caveat: queued from the
+        final ``turn_end`` there is no tool batch left to follow, and it is carried to the next
+        prompt with the ``next_turn`` text. Queue it only when the guidance still reads sensibly
+        one prompt later.
         """
         if deliver_as not in ("steer", "follow_up", "next_turn"):
             raise ValueError(f"unknown deliver_as {deliver_as!r}")
@@ -123,9 +193,22 @@ class PluginAPI:
         """Iterate previously persisted entries of ``custom_type`` on the active branch."""
         return self.rt.session.custom(custom_type)
 
-    async def exec(self, cmd: str, *args: str, timeout: float = 60) -> tuple[int, str]:
-        """Run a subprocess in the project dir; returns ``(exit_code, combined_output)``."""
+    async def exec(self, cmd: str, *args: str, timeout: float = 60,
+                   env: dict[str, str] | None = None) -> tuple[int, str]:
+        """Run a subprocess in the project dir; returns ``(exit_code, combined_output)``.
+
+        The child starts from :func:`minimal_env`, not from ``os.environ``, and ``env`` is
+        merged over that: ``await api.exec("gh", "pr", "list", env={"GH_TOKEN": token})`` is how
+        a command gets a credential, and the call site is then the place that says which one.
+
+        The same rule as an MCP server, for the same reason rather than by analogy. The output
+        of this command is a plugin's to do what it likes with, and what plugins do with it is
+        put it in a tool result or a notice, both of which reach the model and the session log.
+        A ``git status`` or a ``docker ps`` needs ``PATH`` and ``HOME`` and nothing else; a
+        command that genuinely needs more is a command whose author can name what.
+        """
         proc = await asyncio.create_subprocess_exec(cmd, *args, cwd=self.rt.cwd,
+                                                    env=minimal_env(env),
                                                     stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT)
         output, _ = await asyncio.wait_for(proc.communicate(), timeout)

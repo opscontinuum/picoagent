@@ -22,7 +22,6 @@ from __future__ import annotations
 import itertools
 import json
 import logging
-import os
 import queue
 import subprocess
 import threading
@@ -31,6 +30,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from picoagent.plugins.api import minimal_env
 
 log = logging.getLogger("mcp")
 
@@ -50,11 +51,18 @@ class McpError(Exception):
 
 @dataclass
 class ServerSpec:
-    """One entry from ``[plugins.mcp.servers.<name>]``."""
+    """One entry from ``[plugins.mcp.servers.<name>]``.
+
+    ``env`` and ``pass_env`` are the two ways a variable reaches the child, and neither is
+    inheritance: ``env`` sets a value here, ``pass_env`` names one to carry over from the
+    agent's own environment. Everything outside :data:`picoagent.plugins.api.MINIMAL_ENV_NAMES`
+    and those two lists stays behind.
+    """
     name: str
     command: str
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    pass_env: list[str] = field(default_factory=list)
     cwd: str | None = None
     timeout: float = 30.0             # per tools/call
     startup_timeout: float = 20.0     # for the initialize handshake and tools/list
@@ -92,11 +100,17 @@ class StdioServer:
 
         The order is fixed by the protocol: the ``initialize`` request, then the
         ``notifications/initialized`` notification, and only then anything else.
+
+        The child starts from :func:`~picoagent.plugins.api.minimal_env` rather than from a copy
+        of ``os.environ``. It is a long-lived process that executes arguments the model chose,
+        so handing it every variable the agent happens to hold hands it every credential too,
+        and the server never has to ask: it can read them the moment it starts.
         """
         try:
             self._proc = subprocess.Popen(
                 [self.spec.command, *self.spec.args], cwd=str(self.cwd) if self.cwd else None,
-                env={**os.environ, **self.spec.env}, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                env=minimal_env(self.spec.env, self.spec.pass_env), stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
         except OSError as exc:
             # The "server is not installed" path: no binary, no permission, no such directory.

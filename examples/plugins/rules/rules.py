@@ -38,18 +38,29 @@ So trust follows **location, not configuration**:
   defensible direction: the run is unattended, and the entire value of the gate is a
   human reading the text before it reaches the model.
 
-``[plugins.rules]`` is not itself in ``USER_ONLY``, so a repository's ``config.toml`` can
-set ``dirs``. That is why configured directories are project-sourced whatever they point
-at. Treating a configured directory as user-level would hand the repository the one key
-it must not hold, and the ``USER_ONLY`` list would have been re-opened through a plugin.
+A repository's ``config.toml`` can name a directory in ``[plugins.rules].dirs``. That is
+why configured directories are project-sourced whatever they point at. Treating a
+configured directory as user-level would hand the repository the one key it must not
+hold, and the ``USER_ONLY`` list would have been re-opened through a plugin.
+
+``[plugins.<name>]`` tables no longer merge across the two config layers, so a
+repository's ``dirs`` reaches this plugin only because :func:`RuleEngine._discover` asks
+for it by name through ``from_project``. Asking is safe here in a way it is not for a
+plugin that takes an endpoint or a command from a repository, because naming a directory
+buys nothing on its own: every file found in it is fingerprinted, previewed and approved
+by a person before a byte of it reaches the model, and refused outright with no frontend
+to ask. The one thing a repository must not do is choose how much of the user's context
+window a turn spends, so ``max_rules_per_turn`` stays in the user layer and a repository
+that sets it is told at session start that it did nothing.
 
 The approval record lives in ``~/.picoagent/rules-trust.json``, next to ``trust.json``
 and for the same reason: a store the project can write is a store the project can forge.
 
 Configuration (``[plugins.rules]`` in config.toml)::
 
-    dirs = ["docs/rules"]     # extra directories, always gated as project-supplied
-    max_rules_per_turn = 4    # cap on how much guidance one turn may deliver
+    dirs = ["docs/rules"]     # extra directories, always gated as project-supplied;
+                              # a repository may add to this list, the user's own or not
+    max_rules_per_turn = 4    # cap on how much guidance one turn may deliver; user layer only
 """
 from __future__ import annotations
 
@@ -255,11 +266,22 @@ class RuleEngine:
         self.declined: set[str] = set()      # rule keys refused this session; asked at most once
         self.pending: list[tuple[Rule, str]] = []
 
-    def _discover(self, settings: dict) -> list[Rule]:
-        """User rules first, then every project directory, deduplicated by resolved path."""
+    def _discover(self, settings: Any) -> list[Rule]:
+        """User rules first, then every project directory, deduplicated by resolved path.
+
+        ``dirs`` is read from both config layers, the user's own by dict access and the
+        repository's by name through ``from_project``. Naming it is what keeps a repository able
+        to say "our rules live in docs/rules", which this plugin was built to allow: a directory
+        is a place to look, not a decision, and the only decision, whether any of the text found
+        there enters the prompt, is still taken one file at a time by the person at the keyboard.
+
+        ``[]`` is the shape the repository's value must have, so ``dirs = "docs/rules"`` written
+        as a bare string is refused and reported rather than iterated character by character into
+        a list of one-letter paths.
+        """
         rules = load_rules(Path(self.api.config["_user_dir"]) / USER_RULES_DIR, "user")
         directories = [self.cwd / PROJECT_RULES_DIR]
-        for entry in settings.get("dirs", []) or []:
+        for entry in list(settings.get("dirs", []) or []) + settings.from_project("dirs", []):
             candidate = Path(entry).expanduser()
             directories.append(candidate if candidate.is_absolute() else self.cwd / candidate)
         seen: set[Path] = set()
@@ -530,6 +552,7 @@ def _attr(text: str) -> str:
 
 
 def register(api: Any) -> None:
+    api.warn_about_project_config("dirs")
     engine = RuleEngine(api)
     api.on("tool_call", engine.on_tool_call)
     api.on("turn_end", engine.on_turn_end)

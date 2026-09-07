@@ -38,3 +38,10 @@ subscribe to `"<plugin-name>:thing"`.
   a handler can't see sibling results, but it can rely on a stable order.
 * **`context` gets a copy.** Mutating `payload["messages"]` in place is safe; returning
   `{"messages": ...}` is the explicit way.
+* **Queued messages have fixed delivery points.** `api.send_message(text, deliver_as=...)` lands
+  after the current tool batch (`steer`), as a new prompt after `agent_end` (`follow_up`), or as
+  its own message just before the user's next prompt (`next_turn`). A `steer` queued from the
+  final `turn_end` has no batch left to follow, so it is carried to the next prompt with the
+  `next_turn` text rather than turning up mid-batch in unrelated work.
+* **Commands are contained like handlers.** A slash command handler that raises is logged and
+  reported to the user; it does not end the session.

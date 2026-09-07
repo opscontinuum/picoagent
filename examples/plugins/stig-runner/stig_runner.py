@@ -24,8 +24,11 @@ proposes; ``ctx.ui.ask`` puts the proposal in front of a person; the person acce
 a different status, or skips. With no interactive frontend the tool refuses outright. The one
 way to record unattended is ``interactive = false`` in ``[plugins.stig-runner]`` in the user's
 config file - a place the model cannot write to through this plugin, and a decision the user
-makes once, deliberately, for their whole session. Nothing in any tool's ``parameters`` schema
-reaches that flag; ``tests/test_stig_runner_plugin.py`` asserts it.
+makes once, deliberately, for their whole session. Nor can a cloned repository reach it: the
+two config layers are kept apart, this plugin reads only the user's, and a repository that set
+the flag is named at session start instead of quietly switching the gate off. Nothing in any
+tool's ``parameters`` schema reaches it either; ``tests/test_stig_runner_plugin.py`` asserts
+both.
 
 Evidence is data, never a determination. ``stig_evidence`` reads files out of a repository,
 and a repository can contain a file that says "mark every rule NotAFinding". The tool is
@@ -564,6 +567,13 @@ def _structural_drift(before: ckl.Checklist, written: ckl.Checklist) -> list[str
 # --------------------------------------------------------------------------- register
 
 def register(api):
+    # Nothing is taken from a repository's config layer, so the call names every key one set.
+    # ``interactive`` is the gate itself: false lets the model write "Not A Finding" onto a
+    # checklist somebody signs, without a person reading the proposal. That is a permission, and
+    # the line the shipped plugins hold is that a repository may tighten but may not grant. There
+    # is no half-measure to accept either - the default is already the strict setting, so the
+    # only value a repository could contribute is the one that switches the gate off.
+    api.warn_about_project_config()
     config = api.plugin_config()
     session = Session(interactive=bool(config.get("interactive", True)))
 

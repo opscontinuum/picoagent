@@ -3,9 +3,10 @@
 One user prompt runs like this::
 
     handle_input(text)
-      ├─ slash command?            -> run it, done
+      ├─ slash command?            -> run it (failures are reported, never fatal), done
       ├─ event: input              -> plugins may transform or fully handle it
       ├─ /skill:name expansion
+      ├─ queued "next_turn" text   -> carried in ahead of the prompt
       └─ run(prompt)
            ├─ event: before_agent_start   (system prompt is final after this)
            └─ repeat:
@@ -31,7 +32,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .commands import CommandRegistry
+from .commands import Command, CommandRegistry
 from .context import SystemPromptBuilder
 from .events import EventBus
 from .provider import ProviderRegistry
@@ -62,17 +63,22 @@ class Runtime:
         self.abort = asyncio.Event()              # set to cancel the current run
         # Messages queued by plugins/frontends: (deliver_as, text) where deliver_as is
         # "steer" (after the current tool batch), "follow_up" (after the agent finishes)
-        # or "next_turn" (bundled with the next user prompt).
+        # or "next_turn" (carried in ahead of the next user prompt). Every kind has a
+        # draining site in AgentLoop; a kind without one accumulates here unseen forever.
         self.queue: list[tuple[str, str]] = []
         self._busy = False
 
     def is_idle(self) -> bool:
         return not self._busy
 
-    def take_queued(self, deliver_as: str) -> list[str]:
-        """Remove and return queued messages of one delivery kind."""
-        taken = [text for kind, text in self.queue if kind == deliver_as]
-        self.queue = [(kind, text) for kind, text in self.queue if kind != deliver_as]
+    def take_queued(self, *deliver_as: str) -> list[str]:
+        """Remove and return queued messages of the named delivery kinds, in queue order.
+
+        Several kinds at once because one draining site can serve more than one of them, and
+        two filtered passes would reorder text a plugin queued as one sequence.
+        """
+        taken = [text for kind, text in self.queue if kind in deliver_as]
+        self.queue = [(kind, text) for kind, text in self.queue if kind not in deliver_as]
         return taken
 
 
@@ -86,8 +92,7 @@ class AgentLoop:
         rt = self.rt
         parsed = rt.commands.parse(text)
         if parsed:
-            command, args = parsed
-            notice = await command.handler(args, rt)
+            notice = await self._run_command(*parsed)
             if notice:
                 await rt.frontend.emit("notice", {"text": notice})
             return
@@ -96,17 +101,43 @@ class AgentLoop:
         if event.get("action") == "handled":
             return
 
+        # The prompt is where messages queued between runs come in: "next_turn" by its own
+        # contract, and a "steer" whose run ended before a tool batch could carry it (see
+        # _turns). Draining both here is what stops either from sitting in the queue unsent.
+        carried = rt.take_queued("next_turn", "steer")
         prompt = rt.skills.expand(event["text"])
-        await self.run(prompt if prompt is not None else event["text"], event["images"])
+        await self.run(prompt if prompt is not None else event["text"], event["images"], carried)
+
+    async def _run_command(self, command: Command, args: str) -> str | None:
+        """Run one slash command, turning any exception into an error the user is shown.
+
+        Commands were the last plugin call-in without a catch: events and tools already have
+        one, so a handler that raised unwound through here into ``PlainFrontend.run``, which
+        stops at ``KeyboardInterrupt`` only. One broken ``/command`` ended the REPL and took
+        the session with it. Reporting it leaves the user at a prompt with the rest of the
+        session intact, which is the same trade ``_invoke`` makes for a tool that raises.
+        """
+        try:
+            return await command.handler(args, self.rt)
+        except Exception as exc:  # noqa: BLE001 - plugin code is untrusted; the session outlives it
+            log.exception("command /%s failed", command.name)
+            await self.rt.frontend.emit(
+                "error", {"text": f"/{command.name} failed: {type(exc).__name__}: {exc}"})
+            return None
 
     # ------------------------------------------------------------------ one prompt
-    async def run(self, prompt: str, images: list[dict] | None = None) -> None:
-        """Run the model until it stops calling tools, then drain follow-ups."""
+    async def run(self, prompt: str, images: list[dict] | None = None,
+                  carried: list[str] | None = None) -> None:
+        """Run the model until it stops calling tools, then drain follow-ups.
+
+        ``carried`` is text queued before this prompt existed; it is delivered as its own
+        user-role messages ahead of the prompt, so the prompt the user typed stays theirs.
+        """
         rt = self.rt
         rt._busy = True
         rt.abort.clear()
         try:
-            system = await self._prepare(prompt, images or [])
+            system = await self._prepare(prompt, images or [], carried or [])
             await self._turns(system)
             await rt.events.emit("agent_end", {}, rt)
             follow_ups = rt.take_queued("follow_up")
@@ -117,8 +148,8 @@ class AgentLoop:
         finally:
             rt._busy = False
 
-    async def _prepare(self, prompt: str, images: list[dict]) -> str:
-        """Build the system prompt, let plugins adjust it, and record the user message."""
+    async def _prepare(self, prompt: str, images: list[dict], carried: list[str]) -> str:
+        """Build the system prompt, let plugins adjust it, and record the messages this prompt sends."""
         rt = self.rt
         system = rt.prompt.build()
         skills = rt.skills.prompt_section()
@@ -128,6 +159,8 @@ class AgentLoop:
                                      {"prompt": prompt, "system_prompt": system, "message": None}, rt)
         if event.get("message"):
             rt.session.append_message(Message(role="user", text=event["message"], meta={"custom_type": "injected"}))
+        for queued in carried:
+            rt.session.append_message(Message(role="user", text=queued, meta={"custom_type": "queued"}))
         rt.session.append_message(Message(role="user", text=prompt, images=images))
         await rt.frontend.emit("user_message", {"text": prompt})
         return event["system_prompt"]
@@ -143,6 +176,10 @@ class AgentLoop:
             if assistant is None:                       # provider error already reported
                 return
             if not assistant.tool_calls:
+                # The final turn. A steer queued from this turn_end has no batch left to follow,
+                # so it stays queued and handle_input carries it in at the next prompt. It is
+                # late either way; the top of a prompt beats surfacing inside a later run's tool
+                # batch, where the model reads it with no idea which turn it belonged to.
                 await rt.events.emit("turn_end", {"turn": turn, "message": assistant}, rt)
                 return
             results = await self._execute_tools(assistant.tool_calls)
