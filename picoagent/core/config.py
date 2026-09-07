@@ -84,6 +84,18 @@ PROJECT_PLUGIN_KEY = "_project_plugin_config"
 #: Keys under ``[plugins]`` that belong to the loader, not to a plugin's own settings table.
 PLUGINS_RESERVED: tuple[str, ...] = ("enabled", "rewrite")
 
+#: The specs the *repository's* config contributed to ``[plugins].enabled``, kept apart from the
+#: concatenated list so the loader can tell the two layers apart without opening the file again.
+#:
+#: The merge deliberately loses that distinction - the lists are concatenated so a repository may
+#: suggest a plugin - and the layer decides which plugin directory a spec is allowed to write to,
+#: so somebody has to remember it. Remembering is this module's job because this module did the
+#: read: it knows what the file said, and it knows when the file could not be read at all. A
+#: second reader answers about bytes that never entered the list it is describing, which is a
+#: different file if the file changed in between, and a traceback if it fails where this one did
+#: not. See :func:`picoagent.plugins.loader.project_enabled`.
+PROJECT_ENABLED_KEY = "_project_enabled"
+
 #: The sentence explaining why the repository's config.toml was dropped, or ``None`` when it parsed.
 #: A repository you cloned must not be able to stop your tool starting, so an unusable one is
 #: ignored rather than fatal - and ignoring it silently would leave the user running under settings
@@ -330,6 +342,20 @@ def _strip_user_only(project_cfg: dict) -> tuple[dict, list[str]]:
     return cleaned, ignored
 
 
+def _enabled_specs(layer: dict) -> list:
+    """``[plugins].enabled`` as one config layer wrote it, or ``[]`` when it is not a list.
+
+    Total, because the shape is a repository's to choose. ``plugins = 5`` in a cloned
+    ``.picoagent/config.toml`` reached ``project_cfg["plugins"].get("enabled")`` and raised
+    ``AttributeError`` out of ``load_config`` - a traceback before the first prompt, for a file
+    the user did not write. That is the same fault as a config that will not parse and gets the
+    same answer: the repository said nothing usable about plugins, so it asked for nothing.
+    """
+    plugins = layer.get("plugins")
+    enabled = plugins.get("enabled") if isinstance(plugins, dict) else None
+    return list(enabled) if isinstance(enabled, list) else []
+
+
 def load_endpoints(directory: Path) -> dict[str, dict]:
     """Read ``<user dir>/endpoints/*.toml`` - one file per external service.
 
@@ -414,8 +440,11 @@ def load_config(cwd: Path, overrides: dict | None = None) -> dict:
     """Build the effective config for a session rooted at ``cwd``.
 
     ``overrides`` come from the CLI; ``None`` values are ignored so unset flags
-    do not clobber file settings. The result also carries two private keys,
-    ``_user_dir`` and ``_cwd``, so other modules don't need to recompute them.
+    do not clobber file settings. The result also carries private keys the modules downstream
+    would otherwise have to recompute from the files: ``_user_dir``, ``_cwd``, and
+    :data:`PROJECT_ENABLED_KEY` - which of the plugin specs the repository asked for. That last
+    one travels because re-deriving it means opening a repository's file a second time, and the
+    second reader is the one that does not have this function's hardening.
 
     An unusable config file is answered differently per layer, and the asymmetry is the point.
     The user's own files - ``config.toml`` and the endpoint files beside it - stop the session:
@@ -448,15 +477,23 @@ def load_config(cwd: Path, overrides: dict | None = None) -> dict:
     # one process is not the common case, but "a setting from somewhere else turned up in this
     # config" is the failure this module is meant to make impossible.
     cfg = _deep_merge(_deep_merge(copy.deepcopy(DEFAULTS), user_cfg), project_cfg)
-    cfg["plugins"]["enabled"] = (
-        list(user_cfg.get("plugins", {}).get("enabled", []))
-        + list(project_cfg.get("plugins", {}).get("enabled", []))
-    )
+    project_specs = _enabled_specs(project_cfg)
+    if not isinstance(cfg.get("plugins"), dict):
+        # A layer wrote a scalar where the table goes, and the merge replaced the table with it.
+        # Assigning into that raises, which for a repository's config is a broken file ending
+        # somebody else's session.
+        cfg["plugins"] = {}
+    cfg["plugins"]["enabled"] = _enabled_specs(user_cfg) + project_specs
     if overrides:
         cfg = _deep_merge(cfg, {k: v for k, v in overrides.items() if v is not None})
 
     cfg["endpoints"] = endpoints
     cfg[PROJECT_PLUGIN_KEY] = project_plugin_cfg
+    # The repository's own contribution to the concatenated list above, recorded by the read that
+    # made it. When that read failed, this is empty and correct rather than unknown: the file the
+    # loader would go back to is the one that just did not open, and nothing of the repository's
+    # is in the list to attribute.
+    cfg[PROJECT_ENABLED_KEY] = project_specs
     cfg[UNREADABLE_PROJECT_CONFIG_KEY] = unreadable_project
     cfg["_user_dir"] = str(user_dir())
     cfg["_cwd"] = str(cwd)

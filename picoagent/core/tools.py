@@ -92,10 +92,69 @@ class PathRefused(Exception):
     """A model-supplied path fell outside the project while confinement was on."""
 
 
-def resolve_path(ctx: ToolContext, raw: str) -> Path:
-    """Turn a model-supplied path into an absolute one.
+@dataclass(frozen=True)
+class ResolvedPath:
+    """Which file a model-supplied path names, and whether a tool will open it.
 
-    Strips a leading ``@`` (some models copy it from ``@file`` mentions) and expands ``~``.
+    ``path`` is always absolute and always symlink-resolved: it is the file the OS reaches if
+    the call goes ahead, and it is filled in even when ``refusal`` says the tool will not make
+    that call. A guard asking "which file is this?" must never be handed ``None``, because
+    ``None`` reads as *no file here* - the same answer an unrelated argument gives - and a guard
+    that reads it that way lets the call through to a tool that then opens something.
+    """
+    path: Path
+    refusal: str | None = None
+
+
+def resolve_tool_path(raw: str, config: dict, cwd: Path | None = None) -> ResolvedPath:
+    """Where a model-supplied path lands: the seam a tool and a guard must both resolve through.
+
+    A ``tool_call`` guard decides about a path *before* the tool touches it, and the only way
+    that decision can be about the same file is for both to compute it here. Every guard that
+    resolved a path itself drifted from this function and the drift was a bypass: an unstripped
+    ``@`` prefix, a relative path resolved against the process directory rather than the
+    session's (they differ under ``-C``), a symlink nobody followed. See
+    docs/plugin-authoring.md, "Gating a path argument".
+
+    Guards have a runtime, not a :class:`ToolContext` - that is built per call inside the loop,
+    after the guards have already answered - so this takes the two things a runtime carries:
+    ``rt.cfg`` (the same dictionary the tool receives as ``ctx.config``) and, optionally, the
+    session directory. ``cwd`` defaults to the ``_cwd`` that ``load_config`` records, so
+    ``resolve_tool_path(raw, rt.cfg)`` is the whole call from a guard. It falls back to the
+    process directory only for a config nobody built with ``load_config``.
+
+    An expected failure is a value here, not an exception: guards outnumber tools and a guard
+    that has to wrap this in ``try`` is a guard that will one day catch the wrong thing, or
+    nothing. Tools keep the exception through :func:`resolve_path`.
+
+    Refused, for this function, means *the tool will not open this*: outside the project while
+    ``confine_to_project`` is on, or a path the OS cannot resolve at all (a symlink loop).
+    """
+    root = Path(cwd) if cwd is not None else Path(config.get("_cwd") or Path.cwd())
+    path = Path(os.path.expanduser(raw.lstrip("@")))
+    absolute = path if path.is_absolute() else root / path
+    try:
+        # Non-strict resolve() follows every symlink component that exists and appends the rest,
+        # so a file that does not exist yet still names the real directory it would be created
+        # in. The textual normpath this replaced could not see a link, which is how a write
+        # through `repo-symlink/new-file` landed outside a project confinement was holding.
+        real, project = absolute.resolve(), root.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        # A symlink loop (RuntimeError on CPython, ELOOP elsewhere) or a path the OS will not
+        # parse. Nothing can be opened through it, so it is refused - and the caller still gets
+        # the best name available rather than a None it would read as "no file".
+        return ResolvedPath(Path(os.path.normpath(absolute)), f"{absolute} cannot be resolved: {exc}")
+    if config.get("confine_to_project") and real != project and project not in real.parents:
+        return ResolvedPath(real, f"{real} is outside the project ({project}) "
+                                  "and confine_to_project is on")
+    return ResolvedPath(real)
+
+
+def resolve_path(ctx: ToolContext, raw: str) -> Path:
+    """Turn a model-supplied path into the absolute path this tool will open.
+
+    Strips a leading ``@`` (some models copy it from ``@file`` mentions), expands ``~``, and
+    resolves symlinks, so what comes back is the file the OS actually reaches.
 
     By default any path resolves, including absolute ones and ``..`` traversal. That is not an
     oversight: a coding agent legitimately edits sibling repositories, ``~/.config``, and files
@@ -106,16 +165,15 @@ def resolve_path(ctx: ToolContext, raw: str) -> Path:
     Deployments that need the harder rule can set ``confine_to_project = true``, which refuses
     anything resolving outside ``ctx.cwd``. Off by default because turning it on breaks real
     workflows; available because some environments must have it.
+
+    This is :func:`resolve_tool_path` with the refusal raised instead of returned, because a
+    tool that forgets to check gets an exception the loop turns into an error result, while a
+    guard that forgets to check would silently allow. Same decision, taken in one place.
     """
-    path = Path(os.path.expanduser(raw.lstrip("@")))
-    resolved = (path if path.is_absolute() else ctx.cwd / path)
-    if not ctx.config.get("confine_to_project"):
-        return resolved
-    root = ctx.cwd.resolve()
-    candidate = resolved.resolve() if resolved.exists() else Path(os.path.normpath(resolved))
-    if candidate != root and root not in candidate.parents:
-        raise PathRefused(f"{candidate} is outside the project ({root}) and confine_to_project is on")
-    return candidate
+    resolved = resolve_tool_path(raw, ctx.config, ctx.cwd)
+    if resolved.refusal:
+        raise PathRefused(resolved.refusal)
+    return resolved.path
 
 
 _file_locks: dict[str, asyncio.Lock] = {}

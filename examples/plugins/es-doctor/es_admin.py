@@ -34,8 +34,11 @@ exercise real field names:
 
 Deliberately absent: anything that changes the cluster. Reroute, ILM retry/move, restore,
 index deletion and every other write still go through ``es_request`` and its
-``allow_destructive`` gate. The one exception is ``es_slowlog enable|disable``, which writes
-three named keys and nothing else, after the user confirms.
+``allow_destructive`` gate. Two calls here are exceptions, and both are shown to the user in
+full and skipped when there is nobody to ask: ``es_slowlog enable|disable`` writes three named
+keys and nothing else, and ``es_snapshots verify=true`` has every node write a test blob to the
+repository. They reach the cluster through ``ESClient.request_after_confirmation``, which is
+the gate's only bypass.
 
 Two deviations from the 1.0 plan, both forced by the API:
 
@@ -635,7 +638,8 @@ class SnapshotsTool(_AdminTool):
             return "Repository verification skipped: no interactive session to confirm it. Re-run without -p."
         if not await ctx.ui.ask("confirm", prompt):
             return "Repository verification skipped at the user's request."
-        nodes = self.es.request("POST", f"/_snapshot/{_quote(repository)}/_verify").get("nodes", {})
+        nodes = self.es.request_after_confirmation(
+            "POST", f"/_snapshot/{_quote(repository)}/_verify").get("nodes", {})
         names = ", ".join(sorted(body.get("name", node) for node, body in nodes.items()))
         return f"Repository {repository} verified by {len(nodes)} nodes: {names}"
 
@@ -970,7 +974,7 @@ class SlowlogTool(_AdminTool):
             return result(ctx, f"es_slowlog {action} changes cluster settings on {index} and there is no "
                                "interactive session to confirm it. Run without -p, or set "
                                "allow_destructive = true in [plugins.es-doctor].", is_error=True)
-        self.es.request("PUT", f"/{_quote(index)}/_settings", body)
+        self.es.request_after_confirmation("PUT", f"/{_quote(index)}/_settings", body)
         return result(ctx, f"Slow-log settings on {index} updated: {summary}\n"
                            "The slow log is written to files on each node "
                            "(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to "

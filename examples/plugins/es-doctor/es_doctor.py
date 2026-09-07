@@ -12,7 +12,8 @@ Tools
                       bucket, Pearson correlation of errors vs each metric, spike detection, and
                       the top error messages inside the spike
   es_search           raw query DSL passthrough for anything the helpers don't cover
-  es_request          raw REST call; destructive ones are blocked unless ``allow_destructive = true``
+  es_request          raw REST call; only reads (GET, HEAD, and the POST endpoints that search)
+                      unless ``allow_destructive = true``
   es_shards, es_recovery, es_nodes, es_hot_threads, es_ilm, es_snapshots, es_index_inspect,
   es_templates, es_slowlog - the cluster-administration half, in ``es_admin.py``
 Skills
@@ -50,7 +51,8 @@ import urllib.parse
 from typing import Any
 
 from es_client import (DEFAULT_LOGS_INDEX, DEFAULT_METRICS_INDEX, DEFAULT_TRACES_INDEX,
-                       ESClient, ESError, Settings, _ESTool, result, text_table)
+                       ESClient, ESError, Settings, _ESTool, destructive_refusal, is_destructive,
+                       result, text_table)
 
 # ------------------------------------------------------------------ Elastic knowledge
 # Beats and Elastic Agent write ECS documents into these data streams; the default patterns
@@ -84,7 +86,6 @@ METRIC_ALIASES = {
     "jvm_heap": "jolokia.jvm.memory.heap.used.pct",
 }
 ERROR_LEVELS = ["error", "err", "fatal", "critical", "crit", "emerg", "alert", "panic"]
-DESTRUCTIVE = re.compile(r"(_delete_by_query|_close|_shrink|_forcemerge|_reindex|_update_by_query|/_settings|_ilm)", re.I)
 
 PROMPT_NOTE = """# Elasticsearch / Elastic Stack
 You have es_* tools. Data from Beats and Elastic Agent follows ECS (Elastic Common Schema):
@@ -486,17 +487,16 @@ class SearchTool(_ESTool):
 
 class RequestTool(_ESTool):
     name = "es_request"
-    description = "Raw REST call to Elasticsearch (GET/POST/PUT/DELETE + path + optional JSON body). Destructive calls are blocked unless configured."
+    description = ("Raw REST call to Elasticsearch (method + path + optional JSON body). Read-only "
+                   "unless the user configured otherwise: GET and HEAD, plus the POST endpoints that "
+                   "only read (_search, _count, _cluster/allocation/explain, _index_template/"
+                   "_simulate_index). Every other call is refused.")
     parameters = {"type": "object", "properties": {"method": {"type": "string"}, "path": {"type": "string"}, "body": {"type": "object"}},
                   "required": ["method", "path"]}
 
     def run(self, args, ctx):
         data = self.es.request(args["method"].upper(), args["path"], args.get("body"))
         return result(ctx, json.dumps(data, indent=1) if not isinstance(data, str) else data)
-
-
-def is_destructive(method: str, path: str) -> bool:
-    return method.upper() in ("DELETE",) or bool(DESTRUCTIVE.search(path))
 
 
 # ------------------------------------------------------------------ registration
@@ -514,15 +514,17 @@ def register(api):
     # and you do not, and naming the wrong index returns no documents rather than leaking any.
     api.warn_about_project_config(*PROJECT_SETTABLE)
     indices = cfg.with_project(**PROJECT_SETTABLE)
+    allow_destructive = bool(cfg.get("allow_destructive", False))
     es = ESClient(url=cfg.get("url") or os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200"),
                   api_key=cfg.get("api_key") or os.environ.get("ELASTICSEARCH_API_KEY", ""),
                   username=cfg.get("username", ""), password=cfg.get("password", ""),
                   verify_tls=cfg.get("verify_tls", True),
-                  ca_cert=cfg.get("ca_cert", ""))
+                  ca_cert=cfg.get("ca_cert", ""),
+                  allow_destructive=allow_destructive)
     settings = Settings(logs_index=indices.get("logs_index", DEFAULT_LOGS_INDEX),
                         metrics_index=indices.get("metrics_index", DEFAULT_METRICS_INDEX),
                         traces_index=indices.get("traces_index", DEFAULT_TRACES_INDEX),
-                        allow_destructive=bool(cfg.get("allow_destructive", False)))
+                        allow_destructive=allow_destructive)
 
     for tool_class in (ClusterHealthTool, IndicesTool, LogsTool, MetricsTool, CorrelateTool, SearchTool, RequestTool):
         api.register_tool(tool_class(es, settings))
@@ -531,10 +533,19 @@ def register(api):
     api.register_system_prompt_section("es-doctor", lambda: PROMPT_NOTE + "\n" + es_admin.ES_ADMIN_PROMPT_NOTE)
 
     async def guard(event, rt):
-        """Block destructive es_request calls unless the user opted in."""
+        """Block a destructive es_request before it is dispatched, rather than after.
+
+        The client refuses the same call, so this is not what makes the gate hold - it is what
+        makes the refusal legible. Blocking here names the tool and the setting in the result the
+        model reads, and the call never leaves the process, so nothing is timed or logged at the
+        cluster. Only ``es_request`` is checked because it is the only tool that takes a method
+        and a path from the model; every other tool builds its own path and is gated in the
+        client, where a tool written later is gated too.
+        """
         if event["name"] == "es_request" and not settings.allow_destructive \
                 and is_destructive(event["args"].get("method", "GET"), event["args"].get("path", "")):
-            return {"block": True, "reason": "destructive Elasticsearch call; set allow_destructive = true in [plugins.es-doctor] to permit"}
+            return {"block": True, "reason": destructive_refusal(event["args"].get("method", "GET"),
+                                                                 event["args"].get("path", ""))}
         return None
     api.on("tool_call", guard)
 

@@ -67,6 +67,10 @@ class Runtime:
         # or "next_turn" (carried in ahead of the next user prompt). Every kind has a
         # draining site in AgentLoop; a kind without one accumulates here unseen forever.
         self.queue: list[tuple[str, str]] = []
+        # The provider error the current run ended on, or None. Cleared at the top of every run
+        # and set only when nothing retried, so it answers "did this run reach the model at all?"
+        # for a caller with no frontend to read - see cli.run_agent's exit code.
+        self.provider_error: str | None = None
         self._busy = False
 
     def is_idle(self) -> bool:
@@ -171,6 +175,7 @@ class AgentLoop:
         rt = self.rt
         rt._busy = True
         rt.abort.clear()
+        rt.provider_error = None
         try:
             system = await self._prepare(prompt, images or [], carried or [])
             await self._turns(system)
@@ -270,11 +275,21 @@ class AgentLoop:
         return message
 
     async def _on_provider_error(self, error: str, system: str) -> Message | None:
-        """Report the error; a plugin (e.g. compaction) may fix things and ask for a retry."""
+        """Report the error; a plugin (e.g. compaction) may fix things and ask for a retry.
+
+        An error nobody retried is recorded on the runtime as well as shown. Every other reader of
+        this failure is a person watching a stream, and ``picoagent -p`` is called by programs: one
+        that cannot tell a model with nothing to add from a run that never reached the model is
+        left parsing stderr for it. Nothing is recorded when a plugin retried and the retry
+        answered - that run did get its answer.
+        """
         rt = self.rt
         await rt.frontend.emit("error", {"text": error})
         event = await rt.events.emit("provider_error", {"error": error, "retry": False}, rt)
-        return await self._model_turn(system) if event.get("retry") else None
+        if event.get("retry"):
+            return await self._model_turn(system)
+        rt.provider_error = error
+        return None
 
     # ------------------------------------------------------------------ tools
     async def _execute_tools(self, calls: list[ToolCall]) -> list[ToolResult]:

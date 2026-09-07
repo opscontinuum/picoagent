@@ -2,12 +2,16 @@
 against the fake Elasticsearch incident (errors + CPU + latency spike at 10:15-10:20)."""
 import statistics, tempfile, unittest
 from pathlib import Path
+import sys
 from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 from picoagent.testing.fake_es import FakeES
 
 PLUGIN = ROOT / "examples/plugins/es-doctor"
+if str(PLUGIN) not in sys.path:
+    sys.path.insert(0, str(PLUGIN))
+import es_client                                       # noqa: E402 - needs the path above
 WINDOW = {"since": "2026-09-02T10:00:00Z", "until": "2026-09-02T10:30:00Z"}
 
 
@@ -128,6 +132,69 @@ class GuardTests(EsDoctorBase):
     def test_raw_search_passthrough_works(self):
         r = self.tool("es_search", index="traces-apm*", body={"size": 1, "query": {"term": {"event.outcome": "failure"}}})
         self.assertIn("POST /checkout", r.content)
+
+
+#: Six calls that change a cluster without a DELETE and without any of the words a denylist
+#: enumerated: cluster-wide settings, a bulk body that can carry deletes, a stored script, an
+#: alias swap (what every read resolves to), a restore over live indices, and forged evidence
+#: written into the very logs an assessor is reading.
+WRITES_THAT_ARE_NOT_DELETES = [
+    ("PUT", "/_cluster/settings"),
+    ("POST", "/logs-app/_bulk"),
+    ("PUT", "/_scripts/backdoor"),
+    ("POST", "/_aliases"),
+    ("POST", "/_snapshot/backups/nightly/_restore"),
+    ("POST", "/logs-app/_doc"),
+]
+
+
+class WriteGateTests(EsDoctorBase):
+    """``allow_destructive = false`` has to hold for writes nobody enumerated.
+
+    This plugin is fed logs and traces, which is data an attacker can write, so the realistic
+    path to a destructive call is an injected instruction the model follows. A gate that lists
+    the destructive endpoints leaves every endpoint nobody listed open, and Elasticsearch has
+    hundreds that mutate.
+    """
+
+    def _run_request(self, method, path):
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[call("es_request", method=method, path=path)],
+                                                               [text("ok")]]))
+        rt.cfg["plugins"]["es-doctor"] = {"url": self.es.url}
+        loader.load_plugin(PLUGIN, rt, loader.TrustStore(self.tmp / "home"), allow_untrusted=True)
+        run(AgentLoop(rt).run("do it"))
+        return rt.frontend.tool_results()[0]
+
+    def test_every_write_is_refused_and_none_of_them_reaches_the_cluster(self):
+        for method, path in WRITES_THAT_ARE_NOT_DELETES:
+            with self.subTest(call=f"{method} {path}"):
+                self.es.requests.clear()
+                result = self._run_request(method, path)
+                self.assertTrue(result.is_error, result.content)
+                self.assertEqual([r["path"] for r in self.es.requests], [])
+
+    def test_a_read_over_post_is_still_allowed(self):
+        """``_search`` carries its query in a body, so refusing every POST would refuse reading."""
+        result = self._run_request("POST", "/logs-*/_search")
+        self.assertFalse(result.is_error, result.content)
+        self.assertTrue([r for r in self.es.requests if r["path"].endswith("/_search")])
+
+    def test_the_client_refuses_a_write_no_tool_gate_saw(self):
+        """Defence in depth: the ``tool_call`` guard only sees ``es_request``'s arguments, so a
+        tool that builds a path itself would be gated by nothing without this."""
+        client = es_client.ESClient(url=self.es.url)
+        with self.assertRaises(es_client.ESError):
+            client.request("PUT", "/_cluster/settings", {"persistent": {}})
+        self.assertEqual([r["path"] for r in self.es.requests], [])
+
+    def test_allow_destructive_still_lets_a_write_through(self):
+        client = es_client.ESClient(url=self.es.url, allow_destructive=True)
+        client.request("PUT", "/logs-app/_settings", {"index.number_of_replicas": 0})
+        self.assertEqual([r["method"] for r in self.es.requests if r["path"] == "/logs-app/_settings"], ["PUT"])
+
+    def test_the_tool_description_does_not_promise_more_than_the_gate_does(self):
+        described = self.rt.tools.get("es_request").description.lower()
+        self.assertIn("read-only", described)
 
 
 class ApmLatencyTests(EsDoctorBase):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import threading
 import urllib.error
@@ -24,6 +25,8 @@ from typing import Any, AsyncIterator, Iterator, Protocol, runtime_checkable
 
 from .text import safe_for_display
 from .types import Message, StreamEvent, ToolCall, ToolSpec, new_id
+
+log = logging.getLogger("picoagent.provider")
 
 
 @runtime_checkable
@@ -43,10 +46,20 @@ class Provider(Protocol):
 
 # --------------------------------------------------------------------------- mapping
 
+#: What the model is told about a tool call the log never recorded a result for. Everything it
+#: says has to be true of every way that happens - a Ctrl-C during a long batch, a crash, a kill
+#: - so it claims only what is known: the call was recorded, the result was not, and the effect
+#: is undetermined. Saying "it failed" would invite the model to retry a command that may have
+#: already run; saying "it succeeded" would invite it to build on work that may not exist.
+INTERRUPTED_TOOL_RESULT = ("[picoagent: no result was recorded for this tool call - the session "
+                           "ended before the tool batch finished. Whether it ran at all, and what "
+                           "it changed, is unknown. Check the current state before retrying it.]")
+
+
 def to_openai_messages(system: str, messages: list[Message]) -> list[dict]:
     """Map neutral messages to the OpenAI chat format (system first, tool results as ``role: tool``)."""
     out: list[dict] = [{"role": "system", "content": system}]
-    for message in messages:
+    for index, message in enumerate(messages):
         if message.role == "user":
             out.append(_user_message(message))
         elif message.role == "assistant":
@@ -56,10 +69,46 @@ def to_openai_messages(system: str, messages: list[Message]) -> list[dict]:
                                         "function": {"name": c.name, "arguments": json.dumps(c.args)}}
                                        for c in message.tool_calls]
             out.append(entry)
+            out.extend(_stand_in_results(message, messages[index + 1:]))
         elif message.role == "tool":
             out.extend({"role": "tool", "tool_call_id": r.tool_call_id, "content": r.content or "(no output)"}
                        for r in message.tool_results)
     return out
+
+
+def _stand_in_results(assistant: Message, later: list[Message]) -> list[dict]:
+    """``role: tool`` entries for the calls in ``assistant`` that no later message answers.
+
+    OpenAI, and every strict server that copies it, rejects an assistant message carrying
+    ``tool_calls`` unless a ``role: tool`` message answering each one follows it - with a 400, on
+    every subsequent turn, not just the one that produced the gap. The loop appends the assistant
+    message when the model stops streaming and the results only once the whole batch has run, so a
+    ``KeyboardInterrupt`` in between (a batch can be one long shell command) ends the process with
+    the log in exactly that shape. Resuming it then wedges the session permanently, and what the
+    user sees is an opaque provider error rather than anything naming the cause.
+
+    The repair belongs here rather than in the log because this is the constraint's own layer: it
+    is one dialect's rule about a request body, not a fact about what happened. The session file
+    keeps recording what actually happened - a call with no result - which is what an append-only
+    log with parent pointers is for, and no other reader has to know about this rule. A provider
+    with a different dialect maps messages itself and answers for its own format.
+
+    Answered ids are collected from every later message, not just the ``role: tool`` one that
+    should immediately follow, because emitting a second entry for an id that is answered further
+    down would trade this 400 for a duplicate-id one.
+    """
+    if not assistant.tool_calls:
+        return []
+    answered = {result.tool_call_id for message in later for result in message.tool_results}
+    missing = [call for call in assistant.tool_calls if call.id not in answered]
+    if missing:
+        # Not a warning: this renders the same history on every turn for the rest of the session,
+        # so a warning would repeat until the user stopped reading it. `-v` shows it once per turn
+        # to whoever is asking why the model is talking about an unknown outcome.
+        log.info("answering %d interrupted tool call(s) for this request: %s",
+                 len(missing), ", ".join(call.id for call in missing))
+    return [{"role": "tool", "tool_call_id": call.id, "content": INTERRUPTED_TOOL_RESULT}
+            for call in missing]
 
 
 def _user_message(message: Message) -> dict:

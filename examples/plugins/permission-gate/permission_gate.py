@@ -3,7 +3,9 @@
 What it does
 ------------
 * Asks the user before running shell commands that match a "dangerous" pattern.
-* Refuses to read or write protected paths (secrets, keys, ``.git`` internals).
+* Refuses to read or write protected paths (secrets, keys, ``.git`` internals). The path is
+  resolved through ``picoagent.core.tools.resolve_tool_path`` first, so the gate decides about
+  the file the tool will open rather than about the way the model spelled it.
 * Adds ``/yolo [ask|yolo|readonly]`` to switch modes mid-session.
 * Tells the model (via a system-prompt section) that some actions may be blocked.
 
@@ -11,7 +13,7 @@ Configuration (``[plugins.permission-gate]`` in config.toml)::
 
     mode = "ask"                              # ask | yolo | readonly   - your config only
     dangerous = ["\\brm\\s+-rf", "\\bsudo\\b"]  # regexes matched against bash commands - your config only
-    protected = [".env", "**/*.pem"]           # fnmatch patterns (full path or basename)
+    protected = [".env", "**/*.pem"]           # fnmatch patterns, matched against the resolved path
 
 A repository's ``.picoagent/config.toml`` may add ``protected`` patterns, which only ever
 refuses more. It may not set ``mode`` or ``dangerous``: those are how the gate decides to ask,
@@ -23,12 +25,33 @@ import fnmatch
 import re
 from pathlib import Path
 
+from picoagent.core.tools import resolve_tool_path
+
 DEFAULT_DANGEROUS = [r"\brm\s+-[a-z]*r[a-z]*f", r"\bsudo\b", r"git\s+push\s+.*--force",
                      r"curl[^|]*\|\s*(ba)?sh", r"\bmkfs\b", r"\bdd\s+if="]
 DEFAULT_PROTECTED = [".env", ".env.*", "**/*.pem", "**/id_rsa*", ".git/**"]
 MUTATING_TOOLS = {"write", "edit"}
 PROMPT_NOTE = ("# Safety\nSome shell commands need user confirmation and some paths are protected. "
                "If a tool call comes back blocked, explain why and propose an alternative.")
+
+
+def _spellings(path: Path) -> list[str]:
+    """Every way a pattern could name ``path``: the whole path, and each trailing run of it.
+
+    Patterns are written the way a person thinks about a repository - ``.env``, ``**/*.pem``,
+    ``.git/**`` - and a resolved path is absolute, so matching only the absolute form would
+    quietly retire every relative pattern in the default list and in every user's config. So
+    ``/home/u/proj/.git/hooks/pre-commit`` is offered as itself, then ``proj/.git/hooks/...``,
+    ``.git/hooks/pre-commit``, ``hooks/pre-commit`` and finally ``pre-commit``. ``.git/**``
+    matches the third, ``.env`` and ``*.pem`` match the last - the basename check this
+    replaces - and the absolute spelling the gate used to miss matches the first.
+
+    It also means ``.git/**`` now covers a ``.git`` directory anywhere the agent can reach,
+    not only the one directly under the project. That is the direction to be wrong in: this
+    list only ever refuses, and a repository may add to it but never shorten it.
+    """
+    parts = path.parts
+    return [path.as_posix()] + ["/".join(parts[i:]) for i in range(1, len(parts))]
 
 
 class PermissionGate:
@@ -63,10 +86,17 @@ class PermissionGate:
                                      + cfg.from_project("protected", []))
 
     # ------------------------------------------------------------------ policy
-    def is_protected(self, path: str) -> bool:
-        """True if ``path`` (as given, or its basename) matches a protected pattern."""
-        return any(fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(Path(path).name, pattern)
-                   for pattern in self.protected)
+    def is_protected(self, path: Path) -> bool:
+        """True if the file at ``path`` matches a protected pattern.
+
+        ``path`` is resolved - what :func:`resolve_tool_path` says the tool will open - and not
+        the string the model wrote. Matching the string was a bypass by respelling:
+        ``.git/hooks/pre-commit`` was refused while ``<project>/.git/hooks/pre-commit``,
+        ``./.git/config`` and ``@.git/config`` all named the same files and were allowed, so a
+        commit hook could be planted through the gate that exists to stop exactly that.
+        """
+        return any(fnmatch.fnmatch(spelling, pattern)
+                   for spelling in _spellings(path) for pattern in self.protected)
 
     def is_dangerous(self, command: str) -> bool:
         return any(pattern.search(command) for pattern in self.dangerous)
@@ -77,8 +107,15 @@ class PermissionGate:
         name, args = event["name"], event["args"]
         if self.mode == "readonly" and name in MUTATING_TOOLS | {"shell"}:
             return self._block("read-only mode (/yolo to change)")
-        if name in MUTATING_TOOLS | {"read"} and self.is_protected(args.get("path", "")):
-            return self._block(f"{args.get('path')} is protected")
+        raw = args.get("path")
+        if name in MUTATING_TOOLS | {"read"} and isinstance(raw, str) and raw:
+            # rt.cfg is the dictionary the tool will get as ctx.config, so the gate and the
+            # tool resolve the same string the same way - the point of the seam. An empty or
+            # non-string path is left alone: it resolves to the project directory, which every
+            # directory pattern would then match, and the tool answers a missing argument
+            # itself with a message the model can act on.
+            if self.is_protected(resolve_tool_path(raw, rt.cfg).path):
+                return self._block(f"{raw} is protected")
         if name == "shell" and self.mode == "ask" and self.is_dangerous(args.get("command", "")):
             ui = self.api.ui
             allowed = await ui.ask("confirm", f"Run dangerous command?\n  {args['command']}") if ui else False

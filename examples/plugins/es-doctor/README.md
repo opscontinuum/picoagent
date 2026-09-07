@@ -12,9 +12,12 @@ shards and why they are unassigned, node heap/disk/breaker pressure, thread-pool
 hot threads, index lifecycle management, snapshots, index internals, templates and the slow
 log. Six runbook skills turn those tools into procedures.
 
-No client library: everything is plain HTTP through the standard library. Everything reads,
-with exactly one exception (`es_slowlog enable|disable`, three named settings, after you
-confirm); every other write goes through `es_request` and its `allow_destructive` gate.
+No client library: everything is plain HTTP through the standard library. Everything reads:
+with `allow_destructive = false` the only methods that reach your cluster are `GET`, `HEAD` and
+four `POST` paths that search rather than change anything. The two exceptions are writes you are
+shown in full and agree to first - `es_slowlog enable|disable` (three named settings) and
+`es_snapshots verify=true` (a test blob per node) - and both skip the write when there is nobody
+to ask.
 
 ## Install
 
@@ -46,7 +49,7 @@ api_key = "..."                          # or ELASTICSEARCH_API_KEY; username/pa
 | `es_metrics` | bucketed avg/max of a metric; aliases `cpu`, `memory`, `load`, `disk`, `net_in`, `net_out`, `container_*`, `k8s_*`, `jvm_heap` |
 | `es_correlate` | errors + metrics + APM per bucket, Pearson r, spike detection, top error messages in the spike |
 | `es_search` | raw query DSL |
-| `es_request` | raw REST; DELETE, `_delete_by_query`, `_close`, settings changes etc. are blocked unless `allow_destructive = true` |
+| `es_request` | raw REST; reads only (`GET`, `HEAD`, and `_search` / `_count` / allocation explain / index-template simulation over POST) unless `allow_destructive = true` |
 
 ### Cluster administration
 
@@ -71,8 +74,10 @@ cluster summary for you.
 ### What it will not do
 
 No SSH and no log-file access: everything is an API call. No restore, reroute, ILM
-retry/move, index deletion or settings change other than the three slow-log keys - those
-remain `es_request` plus `allow_destructive`, and the skills say so at every branch. No
+retry/move, index deletion, bulk write, alias swap, stored script or settings change other
+than the three slow-log keys - those all need `allow_destructive`, and the skills say so at
+every branch. The gate names what may be sent rather than what may not, so an endpoint nobody
+listed is refused instead of allowed; `docs/security/trust-boundaries.md` has the list. No
 Kibana, Fleet or Watcher APIs, no cross-cluster search or CCR, no security diagnostics, and
 no "auto-fix" mode: the tools gather evidence and the user decides.
 

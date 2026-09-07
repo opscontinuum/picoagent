@@ -335,6 +335,84 @@ Rules of thumb:
 * If you write files, wrap the read-modify-write in `async with file_lock(path):` so you
   cooperate with the built-in `edit`/`write` when tool calls run in parallel.
 * Registering a tool named `read`, `write`, `edit` or `shell` replaces the built-in.
+* Take the path from `resolve_path(ctx, args["path"])`, never from `args["path"]` directly.
+  It is the same resolution the built-ins use, and it is what a gate is inspecting.
+
+## Gating a path argument
+
+**A `tool_call` handler that decides about a path must resolve it with
+`resolve_tool_path(raw, rt.cfg)` from `picoagent.core.tools`, and decide about what comes
+back.** Never about the string the model wrote, and never about your own `Path(raw).resolve()`.
+
+```python
+from picoagent.core.tools import resolve_tool_path
+
+async def guard(event, rt):
+    raw = event["args"].get("path")
+    if not isinstance(raw, str) or not raw:
+        return None
+    target = resolve_tool_path(raw, rt.cfg)        # rt.cfg is the tool's ctx.config
+    if target.path in protected_files:
+        return {"block": True, "reason": "protected"}
+    return None
+```
+
+The reason is not tidiness. A guard runs *before* the tool, on the argument string, and the
+tool then opens whatever `resolve_path` makes of that string. If the two do not agree on which
+file that is, the guard is inspecting one file while the tool opens another, and every
+difference between them is a way past the guard. Three shipped bypasses came from exactly this,
+each from a guard doing its own resolution:
+
+| The spelling | What the guard saw | What the tool opened |
+|---|---|---|
+| `@~/.picoagent/credentials` | a filename with an `@` in it, which nothing opens | the credentials file, key into a tool result and from there into the next prompt |
+| `../../.picoagent/credentials` under `picoagent -C project` | a path under the directory the *process* was started in | a path under the *session* directory, which `-C` moved |
+| `<project>/.git/hooks/pre-commit` | a string that did not match the pattern `.git/**` | the hook that runs on the user's next commit |
+
+`resolve_tool_path` is the one place those decisions are taken: it strips a leading `@` (models
+copy it from `@file` mentions), expands `~`, resolves a relative path against the session
+directory rather than the process's, and follows symlinks - including for a file that does not
+exist yet, whose parents `write` is about to create.
+
+What it returns, and why it is not a `Path`:
+
+```python
+ResolvedPath(path=PosixPath("/home/u/proj/.git/config"), refusal=None)
+```
+
+* `path` is always there, always absolute, always symlink-resolved. Even for a path the tool
+  is going to refuse. A guard asking "which file is this?" about a refused path needs an
+  answer, and `None` is not one: `None` reads as *no file here*, which is what an unrelated
+  argument looks like, so a guard that reads it that way allows the call.
+* `refusal` is the sentence explaining why the tool will not open it (outside the project under
+  `confine_to_project`, or a path the OS cannot resolve at all), or `None`. Ignoring it is fine
+  and usually right - blocking a call the tool would refuse anyway costs nothing. Reading it as
+  "there is no file" is the mistake.
+* Nothing raises. An expected failure is a value here, following the same rule tools follow, so
+  a guard never needs a `try` around the question.
+
+**Matching patterns against a resolved path.** A resolved path is absolute, so a relative
+pattern like `.git/**` or `.env` will not `fnmatch` it. Match against every trailing run of the
+path's components instead - `permission_gate._spellings` is nine lines of it:
+
+```python
+def _spellings(path):
+    parts = path.parts
+    return [path.as_posix()] + ["/".join(parts[i:]) for i in range(1, len(parts))]
+```
+
+`/home/u/proj/.git/hooks/pre-commit` offers itself, then `proj/.git/hooks/pre-commit`,
+`.git/hooks/pre-commit`, `hooks/pre-commit` and `pre-commit`. `.git/**` matches the third,
+`.env` and `**/*.pem` match the last, and the absolute spelling that used to slip past matches
+the first. Patterns people already wrote keep working, and each of them now covers every way of
+naming the same file. It also widens `.git/**` to any `.git` the agent can reach rather than
+only the project's - the direction a protected list should be wrong in, since it refuses more
+and never less.
+
+A plugin that reads paths without gating them - `rules`, which uses tool arguments to work out
+which file the agent is on - has the same drift with a smaller cost: a rule that quietly does
+not fire rather than a guard that quietly does not guard. Resolve through the seam there too,
+and the two stay in step.
 
 ## Writing a provider
 

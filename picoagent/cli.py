@@ -15,8 +15,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -42,18 +44,52 @@ from .plugins.manifest import ManifestError
 #: carry no mark, so the one line worth stopping for does not look like the rest.
 URGENT_MARK = "!!"
 
-#: Exit codes for the two startup refusals the plugin loader raises. They are separate from each
-#: other, and from 1 (every other failure, ``open_session``'s ``SystemExit`` refusals included) and 2
-#: (argparse's usage error), because the answers differ and a wrapper should not have to read
-#: English to tell them apart: 3 means a control someone approved is not going to run and a person
-#: has to look at it, 4 means a config file could not be read so no plugin decision was made at all.
+#: Exit codes for the two startup refusals the plugin loader raises, and for a headless run whose
+#: model call failed. They are separate from each other, and from 1 (every other failure,
+#: ``open_session``'s ``SystemExit`` refusals included) and 2 (argparse's usage error), because the
+#: answers differ and a wrapper should not have to read English to tell them apart: 3 means a
+#: control someone approved is not going to run and a person has to look at it, 4 means a config
+#: file could not be read so no plugin decision was made at all, 5 means the session started but
+#: the model was never reached - a key, a URL or the network, none of which the prompt can fix.
 EXIT_REQUIRED_PLUGIN = 3
 EXIT_PLUGIN_PROVENANCE = 4
+EXIT_MODEL_ERROR = 5
+
+#: How much of the project path goes into a session directory's name before the digest. Long
+#: enough to recognise a checkout, short enough that a deep path stays under the 255-byte
+#: filename limit every common filesystem has.
+SESSION_NAME_CHARS = 80
 
 
 def session_dir(cfg: dict, cwd: Path) -> Path:
-    """Sessions live under the user dir, one folder per project path."""
-    return Path(cfg["_user_dir"]) / "sessions" / cwd.as_posix().strip("/").replace("/", "--")
+    """Sessions live under the user dir, one folder per project path.
+
+    A directory written under the old name keeps being used, because the alternative is worse
+    than the collision it leaves in place: the sessions are still on disk, ``-r last`` stops
+    finding them, and nothing says why. Only a project that has never had a session here gets the
+    new name, so a directory that already mixed two projects goes on mixing them until somebody
+    separates it by hand.
+    """
+    sessions = Path(cfg["_user_dir"]) / "sessions"
+    legacy = sessions / cwd.as_posix().strip("/").replace("/", "--")
+    return legacy if legacy.is_dir() else sessions / project_dir_name(cwd)
+
+
+def project_dir_name(cwd: Path) -> str:
+    """A session directory name that names this project path and no other.
+
+    The readable half is the path with its separators flattened, which is what a person scans for
+    when they open the sessions folder. That half alone was the whole name, and it is not
+    reversible: ``/a/b--c`` and ``/a/b/c`` flatten to the same string, so two projects shared a
+    directory and ``-r last`` in one resumed the other - whose history then went to the model.
+
+    So the digest decides and the flattened path is only a label. It is taken from
+    ``os.fsencode`` rather than a decoded string because a path is bytes to the operating system,
+    and a name that will not encode is exactly the kind that ends up sharing a directory.
+    """
+    flattened = cwd.as_posix().strip("/").replace("/", "--")
+    digest = hashlib.sha256(os.fsencode(cwd)).hexdigest()[:12]
+    return f"{flattened[:SESSION_NAME_CHARS]}-{digest}"
 
 
 def open_session(cfg: dict, cwd: Path, resume: str | None) -> Session:
@@ -305,6 +341,18 @@ async def warn_about_unreadable_project_config(rt) -> None:
 # ---------------------------------------------------------------------------- commands
 
 async def run_agent(args: argparse.Namespace) -> int:
+    """Drive one prompt (``-p``) or the REPL, and say in the exit code how the one prompt went.
+
+    A provider failure is an ``error`` event and nothing more: the loop stops and the frontend
+    writes the sentence to stderr. For a person that is the whole story, but ``-p`` and ``--json``
+    exist to be called by programs, and a program that gets 0 either way has to parse stderr to
+    tell "the model had nothing to add" from "the model was never reached". The condition is that
+    the turn errored, not that it produced no text - a model choosing to say nothing succeeded.
+
+    Only the one-shot path reports it. A REPL session runs many prompts, and the state of the last
+    one is not a verdict on the session; somebody who watched an error scroll past and carried on
+    working has not had a failed run.
+    """
     rt = build_runtime_or_refuse(args)
     agent = AgentLoop(rt)
     await warn_about_unreadable_project_config(rt)
@@ -319,7 +367,7 @@ async def run_agent(args: argparse.Namespace) -> int:
             await rt.frontend.run(agent)
     finally:
         await rt.events.emit("session_end", {}, rt)
-    return 0
+    return EXIT_MODEL_ERROR if args.prompt and rt.provider_error else 0
 
 
 def upgrade_command(args: argparse.Namespace) -> int:

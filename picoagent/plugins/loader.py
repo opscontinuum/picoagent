@@ -61,16 +61,18 @@ import hashlib
 import importlib.util
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
-import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import __version__
+from ..core.config import PROJECT_ENABLED_KEY
 from ..core.loop import Runtime
 from .api import PluginAPI
 from .manifest import Manifest, unmet_requirements
@@ -96,33 +98,33 @@ USER, PROJECT, CLI = "user", "project", "cli"
 
 
 def project_enabled(cfg: dict) -> list[str] | None:
-    """The specs the *repository's* config.toml adds to ``[plugins].enabled``, or ``None``.
+    """The specs the *repository's* config.toml added to ``[plugins].enabled``, or ``None``.
 
-    Read from the file rather than from the merged config, because the merge deliberately
-    loses the distinction: the two lists are concatenated so a repository can suggest a
-    plugin, and after that nothing downstream can say which entries the repository wrote.
+    Read off ``cfg``, where :func:`~picoagent.core.config.load_config` put it. It is not
+    derivable from the merged list - the two layers are concatenated so a repository can
+    suggest a plugin, and the join is invisible afterwards - so the layer that knows travels
+    with the answer instead of being asked again.
 
-    ``[]`` and ``None`` are different answers and were once the same one. ``[]`` means the
-    repository asked for nothing, which is knowable: there is no config file, or it has no
-    ``[plugins].enabled``. ``None`` means nobody can say what it asked for - no ``_cwd`` to look
-    under, a file that will not open, a file that will not parse. Collapsing the second into the
-    first attributed every spec to the user, the layer allowed to write into the user's own
-    plugin directory, which is precisely the attribution this module exists to withhold.
+    This used to open ``<project>/.picoagent/config.toml`` itself, and being the *second*
+    reader of that file was the whole fault. ``config.load_config`` reads it behind a catch
+    broad enough for a file an attacker chose, on the rule that a repository you cloned must
+    not be able to deny you your own tool; this one had a narrower catch, so a config that is
+    not UTF-8 or is nested past the parser's stack raised straight through ``discover`` and
+    ended the session in a traceback the other reader exists to prevent. The two also read at
+    different moments, so a file swapped in between made them describe different bytes.
+
+    ``[]`` and ``None`` are still different answers. ``[]`` means the repository asked for
+    nothing - no config, no ``[plugins].enabled``, or a config that could not be read, in which
+    case nothing of the repository's is in the concatenated list either and every spec in it is
+    the user's own. ``None`` means nobody can say: a config that never came from ``load_config``
+    and carries no record of the layer. Collapsing that second case into the first would
+    attribute a repository's spec to the user, the layer allowed to write into the user's own
+    plugin directory, which is the attribution this module exists to withhold.
     """
-    cwd = cfg.get("_cwd")
-    if cwd is None:
+    specs = cfg.get(PROJECT_ENABLED_KEY)
+    if specs is None:
         return None
-    path = Path(cwd) / ".picoagent" / "config.toml"
-    if not path.exists():
-        return []                    # a repository that wrote no config asked for nothing
-    try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError):
-        return None
-    plugins = data.get("plugins")
-    enabled = plugins.get("enabled") if isinstance(plugins, dict) else None
-    return [spec for spec in enabled if isinstance(spec, str)] if isinstance(enabled, list) else []
+    return [spec for spec in specs if isinstance(spec, str)]
 
 
 def _is_spec(spec: object, cfg: dict) -> bool:
@@ -144,18 +146,23 @@ def _is_spec(spec: object, cfg: dict) -> bool:
 def enabled_by_layer(cfg: dict) -> list[tuple[str, str]]:
     """``[plugins].enabled`` paired with the layer each spec came from.
 
-    When the repository's own list cannot be read at all, neither rule applies and this raises
-    rather than picking one. Guessing was the bug: an unreadable ``.picoagent/config.toml``
-    produced an empty project list, an empty project list put every spec in the user layer, and
-    a user-layer spec resolves with the off-limits check switched off - so a config the loader
-    could not read got the one privilege reading it was meant to decide. The alternative, calling
-    unplaceable specs the repository's, is safe for that check and quietly wrong everywhere else:
-    it relocates the user's own installs into ``<project>/.picoagent/plugins`` and sends them
-    back to the trust prompt, a second silent failure to fix the first. Raising says which file
-    could not be read. It costs nothing in the shipped CLI, where ``load_config`` sets ``_cwd``
-    and already refuses a project config that will not parse; an embedder assembling ``enabled``
-    by hand gets told to set ``_cwd`` instead of being handed a security decision made by
-    coin flip.
+    When the config carries no record of the repository's own list, neither rule applies and
+    this raises rather than picking one. Guessing was the bug: an empty project list puts every
+    spec in the user layer, and a user-layer spec resolves with the off-limits check switched
+    off, so a list nobody could place got the one privilege placing it was meant to decide. The
+    alternative, calling unplaceable specs the repository's, is safe for that check and quietly
+    wrong everywhere else: it relocates the user's own installs into
+    ``<project>/.picoagent/plugins`` and sends them back to the trust prompt, a second silent
+    failure to fix the first.
+
+    A repository's config that would not parse is *not* that case, and treating it as one was
+    its own bug: ``load_config`` drops such a file with a notice and continues, so the
+    concatenated list holds the user's specs and nothing else, and refusing to place them ended
+    the session of every user with a plugin of their own the moment they cloned a repository
+    with a broken config. That is the outcome the layering exists to prevent, arrived at from
+    the other side. The case that remains is a config assembled some other way - a test, an
+    embedder wiring its own ``Runtime`` - which is told to build it with ``load_config`` rather
+    than being handed a security decision made by coin flip.
 
     Every pair this returns has a string in it, which is what everything downstream assumes. A
     ``[plugins].enabled`` entry that is not a string names no plugin, so it is dropped here and
@@ -176,14 +183,13 @@ def enabled_by_layer(cfg: dict) -> list[tuple[str, str]]:
     if project is None:
         if not enabled:
             return []                # nothing to place, so nothing to be wrong about
-        cwd = cfg.get("_cwd")
-        source = (str(Path(cwd) / ".picoagent" / "config.toml") if cwd
-                  else "the project config (no '_cwd' set)")
         raise PluginProvenanceError(
             f"cannot tell which config layer these plugin specs came from: "
-            f"{', '.join(map(str, enabled))}. Reading {source} failed, and a spec whose layer is "
-            "unknown is not resolved: the layer decides which plugin directory it may write to. "
-            "Fix or remove that file, or set '_cwd' on the config.")
+            f"{', '.join(map(str, enabled))}. This config carries no record of what "
+            f"{Path(cfg.get('_cwd', '<project>')) / '.picoagent' / 'config.toml'} asked for, and "
+            "a spec whose layer is unknown is not resolved: the layer decides which plugin "
+            f"directory it may write to. Build the config with picoagent.core.config.load_config, "
+            f"or set '{PROJECT_ENABLED_KEY}' on it yourself.")
     return _attributed(enabled, project)
 
 
@@ -219,13 +225,23 @@ def resolve_source(spec: str, cfg: dict, project: bool = False) -> Path:
     decides two things: the clone lands in the repository's own plugin directory, and it may
     not touch the user's. ``picoagent plugin add`` is the user acting, so it passes ``False``
     and keeps the whole upgrade path - an ``add`` on an installed plugin still moves it.
+
+    A path spec faces the same off-limits check as a git one, for a reason that is not about
+    writing. Resolving a spec also *tags* the directory with the layer that asked for it, and
+    ``discover`` keeps the first tag it is given for a directory, so a repository naming a path
+    inside ``~/.picoagent/plugins`` took the user's own plugin over as project-layer code: the
+    stop that protects a changed ``required`` plugin does not fire at the project layer, and the
+    user was told their own edited plugin was "offered by this repository", at a path the
+    repository chose. Neither is a claim a repository gets to make about a directory the user's
+    plugin directory owns.
     """
     if _GIT_SPEC.match(spec):
         rewrites = cfg.get("plugins", {}).get("rewrite") or {}
         return _clone_or_update(spec, plugins_dir(cfg, project), rewrites,
                                 off_limits=plugins_dir(cfg) if project else None)
     path = Path(spec).expanduser()
-    return path if path.is_absolute() else Path(cfg["_cwd"]) / path
+    path = path if path.is_absolute() else Path(cfg["_cwd"]) / path
+    return _refuse_off_limits(path, plugins_dir(cfg) if project else None)
 
 
 def parse_spec(spec: str, rewrites: dict[str, str] | None = None) -> tuple[str, str]:
@@ -294,11 +310,20 @@ def checkout_path(dest_root: Path, url: str, off_limits: Path | None = None) -> 
     name = checkout_name(url)
     if name in ("", ".", "..") or "/" in name or "\\" in name:
         raise PluginOwnershipError(f"refusing plugin checkout directory {name!r} from {url}")
-    dest = dest_root / name
+    return _refuse_off_limits(dest_root / name, off_limits)
+
+
+def _refuse_off_limits(dest: Path, off_limits: Path | None) -> Path:
+    """``dest``, unless it is inside a directory this spec's layer does not own.
+
+    One function for the git and the path spellings of the same claim, because two of them is
+    how the path spelling came to have no check at all. ``off_limits`` is ``None`` when the
+    spec is the user's own, and their plugin directory when it is the repository's.
+    """
     if off_limits is not None and _within(dest, off_limits):
         raise PluginOwnershipError(
-            f"a plugin spec from this repository's config would write to {dest}, which your own "
-            f"plugin directory owns; a repository's plugins install under its own .picoagent/plugins")
+            f"a plugin spec from this repository's config names {dest}, which your own plugin "
+            f"directory owns; a repository's plugins live under its own .picoagent/plugins")
     return dest
 
 
@@ -427,9 +452,47 @@ class TrustStore:
 
     def __init__(self, user_dir: Path):
         self.path = user_dir / "trust.json"
-        raw = json.loads(self.path.read_text()) if self.path.exists() else {}
+        raw = self._read()
         self.data: dict[str, dict] = {key: {"fingerprint": rec} if isinstance(rec, str) else rec
                                       for key, rec in raw.items()}
+
+    def _read(self) -> dict:
+        """The store as it is on disk, or an empty one when it cannot be read.
+
+        Empty, never "everything is still approved". The store is the record of what the user
+        allowed to run with their privileges, and a file nobody can parse says nothing about
+        that; reading a damaged one as permissive would let a truncated write grant what only
+        the user may grant. Empty is the other direction: every plugin reads as ``new``, nothing
+        loads until it is approved again, and a recorded ``required`` stop cannot fire from a
+        record nobody can read either - so the session starts and the CLI can put it right.
+
+        Which is the point of not raising here. ``TrustStore`` is the first thing every session,
+        ``plugin list`` and ``plugin untrust`` construct, so an exception out of this
+        constructor takes the recovery commands with it, and
+        ``docs/security/trust-boundaries.md`` stakes the ``required`` stop on ``plugin untrust``
+        being one command away from any refusal. A crash or a full disk between the first byte
+        and the last of a write is enough to leave a file that parses nowhere.
+
+        Said out loud at ``error``, because an empty store and a first run look identical from
+        the outside and are not the same thing: one of them needs every approval given again.
+        The damaged bytes are left where they are - overwriting them is the next ``trust`` or
+        ``untrust``'s business, and only after the user has asked for one.
+        """
+        if not self.path.exists():
+            return {}
+        try:
+            raw = json.loads(self.path.read_text())
+            # Shape checked here rather than at every reader: a file that parses as JSON and is
+            # not a table of approvals is as unusable as one that does not parse, and finding
+            # that out in `record()` puts the same crash one call further from the explanation.
+            if not isinstance(raw, dict) or not all(isinstance(rec, (str, dict)) for rec in raw.values()):
+                raise ValueError("not a table of plugin approvals")
+        except (OSError, ValueError) as exc:
+            log.error("%s could not be read (%s), so no plugin counts as approved this run. "
+                      "Every plugin will report as new until you approve it again: "
+                      "picoagent plugin list", self.path, exc)
+            return {}
+        return raw
 
     @staticmethod
     def key(root: Path) -> str:
@@ -543,8 +606,7 @@ class TrustStore:
             "required": manifest.required,
             "required_reason": manifest.required_reason,
             "approved_at": int(time.time())}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2))
+        self._save()
 
     def approved_requirements(self) -> list[tuple[str, Path, str]]:
         """Every recorded requirement as ``(name, directory, reason)`` - what must still be there.
@@ -575,8 +637,41 @@ class TrustStore:
         withdrawing is the one whose directory is gone and which has no manifest left to load.
         """
         record = self.data.pop(label)
-        self.path.write_text(json.dumps(self.data, indent=2))
+        self._save()
         return record
+
+    def _save(self) -> None:
+        """Write the store so that a reader sees either all of it or none of it.
+
+        Overwriting the file in place gives a window in which it holds a prefix of the new
+        content and none of the old, and a crash or a full disk inside that window leaves the
+        file that every session and both recovery commands open unparseable. The read above
+        survives that; it survives it by discarding every approval, which is a real cost to pay
+        for a write that went wrong.
+
+        So the new content is written beside the store and renamed over it. ``os.replace`` is
+        atomic on POSIX and on Windows, and the temp file is in the same directory so the rename
+        stays on one filesystem. ``fsync`` before the rename because the rename can otherwise be
+        durable while the bytes it publishes are not: after a power loss the store would name a
+        file of zeros. Whatever fails, the previous store is still there and still says what the
+        user approved.
+
+        The published file carries ``mkstemp``'s owner-only mode rather than the umask's, which
+        is the mode a record of security decisions should have had all along.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle, temp = tempfile.mkstemp(dir=self.path.parent, prefix=".trust-", suffix=".json")
+        try:
+            with os.fdopen(handle, "w") as fh:
+                fh.write(json.dumps(self.data, indent=2))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp, self.path)
+        except BaseException:
+            # The half-written file is this method's litter, not a state anybody can use, and
+            # leaving it behind would put a second trust-shaped file next to the store.
+            Path(temp).unlink(missing_ok=True)
+            raise
 
     def _label(self, manifest: Manifest, root: str) -> str:
         """What to file this approval under: its plugin name, or a longer form when that is taken.

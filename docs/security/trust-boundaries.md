@@ -107,12 +107,22 @@ The fix is that a spec carries the layer that wrote it as far as the directory i
 
 * `enabled_by_layer` recovers the provenance the merge discards. `load_config` builds the list
   user-first, so the repository's specs are its tail; a config assembled any other way is
-  attributed by membership, which errs towards calling a spec the repository's. When the
-  repository's own list cannot be read - no `_cwd` to look under, a `.picoagent/config.toml`
-  that will not open or will not parse - neither rule applies, and `enabled_by_layer` raises
-  `PluginProvenanceError` instead of picking one. An unreadable file used to arrive as an empty
-  repository list, which put every spec in the *user* layer and so switched the off-limits check
-  off: the config nobody could read got the privilege that reading it was meant to decide.
+  attributed by membership, which errs towards calling a spec the repository's. What the
+  repository asked for is recorded on the config (`_project_enabled`) by the read that built
+  the list, not re-derived by opening `.picoagent/config.toml` again. That second read was its
+  own hole: `load_config` catches everything a hostile file can raise, and the loader's copy
+  caught two exception types, so a config that is not UTF-8 or is nested past the parser's stack
+  ended the session in a traceback from inside `discover` - the exact outcome the broad catch
+  exists to prevent, arrived at from the other side. Two reads can also disagree, because the
+  file may change between them.
+* A repository's config that would not parse is therefore **not** a provenance failure. It was
+  dropped by `load_config`, so nothing of the repository's is in the concatenated list and every
+  spec in it is the user's own; the session runs on the user's settings, with the notice that
+  says the file was dropped. Refusing instead let one broken committed file stop the tool for
+  every user who had a plugin of their own. `enabled_by_layer` still raises
+  `PluginProvenanceError` for a config that carries no record of the layer at all - one an
+  embedder assembled by hand - because an empty repository list puts every spec in the *user*
+  layer, and that is the layer with the off-limits check switched off.
 * An entry that is not a string names no plugin, so `enabled_by_layer` drops it and logs which
   files to check. It used to be carried: the repository's list dropped such entries and the
   merged list kept them, so the two no longer lined up, the membership rule handed the stray
@@ -123,6 +133,14 @@ The fix is that a spec carries the layer that wrote it as far as the directory i
   is off limits to it, compared after resolving symlinks so a `.picoagent/plugins` symlink
   committed in the repository does not get there either, and a checkout directory name that is
   not a single path component (`..`) is refused outright.
+* A **path** spec from the repository faces that same off-limits check, for a reason that is not
+  about writing. Resolving a spec tags the directory with the layer that asked for it, and
+  `discover` keeps the first tag a directory gets, so `enabled = ["/home/you/.picoagent/plugins/gate"]`
+  committed to a repository took over the user's own plugin as project-layer code: the stop that
+  refuses to start a session when a `required` plugin has changed does not fire at the project
+  layer, and the user was told their own edited plugin was "offered by this repository", at a
+  path the repository chose. A repository does not get to write the layer tag for a directory
+  the user's plugin directory owns.
 * The user's own specs are unchanged. `picoagent plugin add` is the user acting, so an `add` on
   an installed plugin is still an upgrade and still moves the checkout.
 
@@ -255,6 +273,43 @@ layer - but a plugin reading `api.config["_project_plugin_config"]` directly get
 values with no ceremony at all. There is no sandbox around plugin code, so this is a seam that
 makes the safe thing the default and the unsafe thing explicit, not an enforced boundary. The
 boundary around plugin code remains the load-time trust decision.
+
+### What `allow_destructive` refuses
+
+`allow_destructive` is in the table above because a repository must not be able to switch it
+on. That is only worth anything if the gate holds when it is off, and for a while it did not.
+It was a denylist: method `DELETE`, plus seven substrings of a path. Elasticsearch has hundreds
+of endpoints that change something, so everything nobody had enumerated went through with
+`allow_destructive = false` - `PUT /_cluster/settings` to stop allocation across the cluster,
+`POST /<index>/_bulk` carrying delete actions, `PUT /_scripts/<id>` to store a script,
+`POST /_aliases` to change what every read resolves to, `_restore` over live indices, and
+`POST /<index>/_doc` to write forged evidence into the logs somebody is reading. This plugin is
+fed logs and traces, which is data an attacker writes, so the realistic route to any of those is
+an instruction injected into a document and followed by the model.
+
+The gate is now a list of what is permitted, so an endpoint nobody has thought about is refused
+rather than allowed:
+
+* `GET` and `HEAD` reach the cluster. Nothing else does.
+* Except four `POST` paths that only read, because Elasticsearch takes the query in a request
+  body and a body on a GET does not survive every proxy in front of a cluster:
+  `<index>/_search`, `<index>/_count`, `_cluster/allocation/explain`, and
+  `_index_template/_simulate_index/<index>`. Whole-path matches, not substrings, with `%2f` and
+  `..` refused before the list is consulted.
+* The gate lives in `ESClient.request`, which every module in the plugin goes through, so it
+  covers the tools in `es_admin.py` and the next tool somebody writes as well as `es_request`.
+  The `tool_call` guard still blocks `es_request` first, so the model reads a refusal that names
+  the setting and nothing is dispatched, but it is not what makes the gate hold.
+* `ESClient.request_after_confirmation` is the only bypass, and it exists for the two writes a
+  person is shown in full and agrees to before they happen: `es_slowlog enable|disable` (three
+  named threshold keys) and `es_snapshots verify` (a test blob per node). Both skip the write
+  outright when there is no interactive session to ask. Grep for the name to see every call that
+  takes it.
+
+What this does not cover: a call that is genuinely a read but is not on the list is refused too,
+so a person who needs one either uses `es_search` or sets `allow_destructive` - a false refusal
+rather than a false permit. And with `allow_destructive = true` the gate is not a gate; it is
+the user saying this cluster is one the model may change.
 
 ## Where an endpoint's key lives
 
@@ -401,6 +456,18 @@ this check told them exactly that, which is what made it a lockout rather than a
 **That property is load-bearing.** If `plugin untrust` or `plugin list` ever grew a plugin load,
 this stop would become a wedge again. Both are deliberately runtime-free, and
 `tests/test_plugin_untrust.py` drives them through `cli.plugin_command` with no runtime in sight.
+
+Reading the store is part of that property, because both commands open it before they do
+anything else. `trust.json` used to be overwritten in place, so a crash or a full disk between
+the first byte and the last left a file that parsed nowhere, and every session *and* both
+recovery commands then died on a `JSONDecodeError` - the recovery path broken by the same
+accident, leaving hand-editing the security file this design exists to avoid. Two halves now:
+the store is written to a temp file in the same directory and renamed over the old one, so a
+reader sees all of a write or none of it; and a store that cannot be read is treated as
+**empty**, said out loud at `error`, never as "everything is still approved". Empty is the
+fail-closed direction - every plugin reads as `new` and nothing loads until it is approved
+again - and it is also what keeps the session startable while the approvals are given back.
+`tests/test_torn_state_files.py` pins both halves.
 
 A user who wants the plugin but not the requirement has two ways out that do not involve this
 check: drop `required = true` from the plugin's own `plugin.toml`, or withdraw the approval that

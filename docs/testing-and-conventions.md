@@ -21,12 +21,14 @@ in `picoagent/testing/fakes.py`.
 | `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, and where a redirect may take a credentialed request |
 | `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
 | `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
+| `test_torn_state_files.py` | `trust.json` and the session log caught mid-write: the store is published by rename and reads as empty when it is damaged, a partial last line in the log is dropped and a hole in the middle is not |
 | `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
 | `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
 | `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |
-| `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident) |
+| `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident), including the read-only gate `allow_destructive` opens |
+| `test_headless_run.py` | what a program driving `-p` reads: the exit code of a run whose model call failed, and which project's sessions `-r last` resumes |
 | `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
 | `test_mcp_live.py` | live end-to-end against a real MCP server in a container (opt-in, skipped by default) |
 

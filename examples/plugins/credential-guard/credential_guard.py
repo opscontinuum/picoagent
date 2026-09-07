@@ -43,6 +43,8 @@ import sys
 import threading
 from pathlib import Path
 
+from picoagent.core.tools import resolve_tool_path
+
 log = logging.getLogger("credential_guard")
 
 _WRITE_LOCK = threading.Lock()   # read-modify-write on the store must not interleave
@@ -255,11 +257,23 @@ def _same_file(a: Path, b: Path) -> bool:
     return (sa.st_ino, sa.st_dev) == (sb.st_ino, sb.st_dev)
 
 
-def _resolve(raw: str) -> Path | None:
-    try:
-        return Path(raw).expanduser().resolve()
-    except (OSError, RuntimeError):
-        return None
+def _resolve(raw: str, cfg: dict) -> Path:
+    """The file a tool would actually open for ``raw``, resolved picoagent's way.
+
+    Not the guard's own resolution of the raw string, which is what this used to be, and which
+    was a bypass twice over: ``resolve_path`` strips a leading ``@`` (models copy it from
+    ``@file`` mentions) and resolves a relative path against the *session* directory, not the
+    process directory, and the two differ whenever picoagent was started with ``-C``. So
+    ``@~/.picoagent/credentials`` was checked as a filename with an ``@`` in it - which nothing
+    opens - and ``read`` then opened the credentials file and put the key in a tool result,
+    which the session log replays into the next prompt. One seam, so the guard and the tool
+    cannot disagree about which file is being named.
+
+    The refusal is ignored on purpose: a path the tool would refuse anyway is still worth
+    blocking, and blocking it costs nothing, while reading ``refusal`` as "no file" is the
+    mistake this guard just came out of.
+    """
+    return resolve_tool_path(raw, cfg).path
 
 
 def _path_arguments(args: dict) -> list[str]:
@@ -281,17 +295,16 @@ def _path_arguments(args: dict) -> list[str]:
     return found
 
 
-def _targets_protected_file(args: dict, protected: list[Path]) -> bool:
+def _targets_protected_file(args: dict, protected: list[Path], cfg: dict) -> bool:
     """True if any path argument names a protected file (directly, or via a link alias)."""
     for raw in _path_arguments(args):
-        target = _resolve(raw)
-        if target is not None and any(target == _resolve(str(p)) or _same_file(target, p)
-                                      for p in protected):
+        target = _resolve(raw, cfg)
+        if any(target == _resolve(str(p), cfg) or _same_file(target, p) for p in protected):
             return True
     return False
 
 
-def _would_recurse_into_protected(args: dict, protected: list[Path]) -> bool:
+def _would_recurse_into_protected(args: dict, protected: list[Path], cfg: dict) -> bool:
     """True if a *recursive* tool is pointed at a directory containing a protected file.
 
     This is the hole that made the direct-path check useless: ``grep_search`` takes a
@@ -299,13 +312,9 @@ def _would_recurse_into_protected(args: dict, protected: list[Path]) -> bool:
     credentials file's contents into a tool result without ever naming the file.
     """
     for raw in _path_arguments(args) or ["."]:
-        target = _resolve(raw)
-        if target is None:
-            continue
-        for path in protected:
-            resolved = _resolve(str(path))
-            if resolved is not None and target in resolved.parents:
-                return True
+        target = _resolve(raw, cfg)
+        if any(target in _resolve(str(path), cfg).parents for path in protected):
+            return True
     return False
 
 
@@ -331,6 +340,10 @@ async def guard_tool_call(event: dict, rt) -> dict | None:
     read and pretty-print the key straight out of config.toml, and any tool added later would
     have inherited the same hole. Fail closed - if a call names a protected path, it's blocked
     whatever the tool is called.
+
+    Every argument is resolved through ``resolve_tool_path`` with ``rt.cfg``, which is the same
+    dictionary the tool receives as ``ctx.config``, so this handler and the tool it is guarding
+    cannot end up talking about two different files. See ``_resolve``.
     """
     name, args = event["name"], event["args"]
     protected = protected_files(rt)
@@ -338,9 +351,9 @@ async def guard_tool_call(event: dict, rt) -> dict | None:
     recursive = tuple(rt.cfg.get("plugins", {}).get("credential-guard", {})
                       .get("recursive_tools", _RECURSIVE_TOOLS))
 
-    if _targets_protected_file(args, protected):
+    if _targets_protected_file(args, protected, rt.cfg):
         return {"block": True, "reason": reason}
-    if name in recursive and _would_recurse_into_protected(args, protected):
+    if name in recursive and _would_recurse_into_protected(args, protected, rt.cfg):
         return {"block": True, "reason": f"that search would recurse into a file {reason}"}
     if name == "shell" and _shell_command_targets_protected(args, protected):
         return {"block": True, "reason": reason}

@@ -12,7 +12,8 @@ from picoagent.core.loop import AgentLoop, Runtime                  # noqa: E402
 from picoagent.core.session import Session                          # noqa: E402
 from picoagent.core.tools import BUILTIN_TOOLS                      # noqa: E402
 from picoagent.core.provider import (OpenAICompatProvider, RedirectRefused,  # noqa: E402
-                                     _SameOriginRedirects)
+                                     _SameOriginRedirects, to_openai_messages)
+from picoagent.core.types import Message, ToolCall, ToolResult      # noqa: E402
 from picoagent.plugins import loader                                # noqa: E402
 from picoagent import cli                                           # noqa: E402
 from picoagent.testing.fakes import FakeServer  # noqa: E402
@@ -483,6 +484,75 @@ class RefusedRedirectClosesTheResponse(unittest.TestCase):
         response = _OpenResponse()
         self.assertIsNotNone(self._refuse(response, "https://gateway.example/v2/models"))
         self.assertFalse(response.closed)
+
+
+class InterruptedToolBatchTests(unittest.TestCase):
+    """An assistant message whose tool calls were never answered must not reach the wire that way.
+
+    A Ctrl-C between the assistant message and its results (the tool batch can run for minutes)
+    leaves the log ending on ``tool_calls`` with no ``role: tool`` after it. OpenAI and the strict
+    compatible servers reject that shape with a 400 on *every* later turn, so a resumed session is
+    wedged for good and the user only sees an opaque provider error.
+    """
+
+    def _mapped(self, messages):
+        return to_openai_messages("sys", messages)
+
+    def test_an_unanswered_call_gets_an_answer_before_the_request_is_sent(self):
+        messages = [Message(role="user", text="run it"),
+                    Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {"cmd": "sleep 600"})])]
+        answered = [entry for entry in self._mapped(messages) if entry["role"] == "tool"]
+        self.assertEqual([entry["tool_call_id"] for entry in answered], ["c1"])
+
+    def test_the_answer_claims_neither_success_nor_failure(self):
+        """The one thing known about an interrupted call is that its outcome is not known."""
+        messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})])]
+        content = [e for e in self._mapped(messages) if e["role"] == "tool"][0]["content"]
+        self.assertIn("unknown", content.lower())
+        self.assertNotIn("failed", content.lower())
+        self.assertNotIn("succeeded", content.lower())
+
+    def test_a_batch_that_finished_is_left_exactly_as_it_was(self):
+        messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "read", {})]),
+                    Message(role="tool", tool_results=[ToolResult("c1", "file contents")])]
+        answered = [e for e in self._mapped(messages) if e["role"] == "tool"]
+        self.assertEqual([(e["tool_call_id"], e["content"]) for e in answered], [("c1", "file contents")])
+
+    def test_only_the_calls_nobody_answered_are_answered_here(self):
+        """A half-answered batch is a plugin's history rewrite, not something the loop writes.
+        Every id has to be answered exactly once; which of the two entries comes first is the
+        server's business, since it matches them by ``tool_call_id``."""
+        calls = [ToolCall("c1", "read", {}), ToolCall("c2", "read", {})]
+        messages = [Message(role="assistant", tool_calls=calls),
+                    Message(role="tool", tool_results=[ToolResult("c1", "first")])]
+        answered = [e for e in self._mapped(messages) if e["role"] == "tool"]
+        self.assertEqual(sorted(e["tool_call_id"] for e in answered), ["c1", "c2"])
+        self.assertEqual([e["content"] for e in answered if e["tool_call_id"] == "c1"], ["first"])
+
+    def test_the_answer_sits_between_the_call_and_whatever_the_user_typed_next(self):
+        """On ``-r`` the next entry is the new prompt, and a tool message after it is the same 400."""
+        messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})]),
+                    Message(role="user", text="what happened?")]
+        roles = [entry["role"] for entry in self._mapped(messages)]
+        self.assertEqual(roles, ["system", "assistant", "tool", "user"])
+
+    def test_a_resumed_interrupted_session_answers_every_call_it_replays(self):
+        """End to end: the log an interrupt leaves behind, read back the way ``-r`` reads it."""
+        tmp = Path(tempfile.mkdtemp())
+        session = Session(tmp / "s.jsonl", tmp)
+        session.append_message(Message(role="user", text="run it"))
+        session.append_message(Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})]))
+        before = (tmp / "s.jsonl").read_text()
+
+        resumed = Session(tmp / "s.jsonl", tmp, resume=True)
+        resumed.append_message(Message(role="user", text="are you there?"))
+        mapped = to_openai_messages("sys", resumed.messages())
+
+        called = [call["id"] for entry in mapped if entry["role"] == "assistant"
+                  for call in entry.get("tool_calls", [])]
+        self.assertEqual([entry["tool_call_id"] for entry in mapped if entry["role"] == "tool"], called)
+        self.assertTrue((tmp / "s.jsonl").read_text().startswith(before),
+                        "the repair is a rendering decision; the log keeps what actually happened")
 
 
 if __name__ == "__main__":

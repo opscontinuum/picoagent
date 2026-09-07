@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import ssl
 import urllib.error
 import urllib.parse
@@ -33,6 +34,56 @@ DEFAULT_LOGS_INDEX = "logs-*,filebeat-*"
 DEFAULT_METRICS_INDEX = "metrics-*,metricbeat-*"
 DEFAULT_TRACES_INDEX = "traces-apm*,apm-*"
 
+#: The methods that cannot change anything, whatever endpoint they are aimed at.
+#:
+#: This gate used to be a denylist: ``DELETE`` plus seven path substrings. Elasticsearch has
+#: hundreds of mutating endpoints, so everything nobody had thought to enumerate went through -
+#: ``PUT /_cluster/settings`` to stop allocation cluster-wide, ``POST /<index>/_bulk`` carrying
+#: delete actions, ``PUT /_scripts/<id>`` to store a script, ``POST /_aliases`` to change what
+#: every read resolves to, ``_restore`` over live indices, and ``POST /<index>/_doc`` to write
+#: forged evidence into the logs an assessor is reading. A list of what is *permitted* cannot
+#: fail that way: an endpoint nobody has thought about is refused rather than allowed.
+READ_ONLY_METHODS = frozenset({"GET", "HEAD"})
+
+#: The POST endpoints that only read. Elasticsearch takes a query in a request body, and a body
+#: on a GET does not survive every proxy and client in front of a cluster, so these are POSTs
+#: with no way around it - refusing every POST would refuse searching, which is the plugin's job.
+#:
+#: Each entry matches a whole path, not a substring, and the list is deliberately short: it is
+#: what this plugin's own tools call plus ``_count``, the one obvious sibling of ``_search``.
+#: Anything else a person genuinely wants is what ``allow_destructive`` is for.
+READ_ONLY_POST_PATHS = (
+    re.compile(r"(?:[^/]+/)?_search"),                    # es_search, es_logs, es_metrics, es_correlate
+    re.compile(r"(?:[^/]+/)?_count"),                     # the same query shape, counting instead
+    re.compile(r"_cluster/allocation/explain"),           # es_shards explain=true; the body names the shard
+    re.compile(r"_index_template/_simulate_index/[^/]+"), # es_templates: which template an index would win
+)
+
+#: Path spellings that are refused before the allowlist is consulted: a percent-encoded slash and
+#: a parent reference are both ways to write one endpoint and have the server read another, and
+#: an allowlist that matches on the spelling is only as good as the two agreeing on it.
+_PATH_TRICKS = re.compile(r"%2f|\.\.", re.I)
+
+
+def is_destructive(method: str, path: str) -> bool:
+    """True unless ``method`` cannot change anything, or ``path`` is a read that needs a body."""
+    if method.upper() in READ_ONLY_METHODS:
+        return False
+    if method.upper() != "POST":
+        return True
+    endpoint = path.split("?")[0].split("#")[0].strip("/")
+    if _PATH_TRICKS.search(endpoint):
+        return True
+    return not any(pattern.fullmatch(endpoint) for pattern in READ_ONLY_POST_PATHS)
+
+
+def destructive_refusal(method: str, path: str) -> str:
+    """Why the call was refused, and the one setting that permits it. Read by the model and the user."""
+    return (f"refusing {method.upper()} {path}: es-doctor makes read-only calls only - GET, HEAD, "
+            "and the few POST endpoints that read (_search, _count, allocation explain, index "
+            "template simulation). This is a destructive Elasticsearch call; set "
+            "allow_destructive = true in [plugins.es-doctor] to permit it.")
+
 
 class ESError(Exception):
     """Anything the cluster refused or the network swallowed. Tools turn it into a result."""
@@ -42,13 +93,19 @@ class ESClient:
     """Minimal REST client. Raises ``ESError`` with the server's message on non-2xx."""
 
     def __init__(self, url: str, api_key: str = "", username: str = "", password: str = "",
-                 verify_tls: bool = True, ca_cert: str = ""):
+                 verify_tls: bool = True, ca_cert: str = "", allow_destructive: bool = False):
         """``ca_cert`` is the secure answer to a self-signed cluster: trust that CA rather than
         nobody. ``verify_tls=False`` remains as a last resort, but it disables certificate *and*
         hostname checking, which makes the connection interceptable by anything on the path -
         so it is the wrong tool for the common case it tends to get used for.
+
+        ``allow_destructive`` lives on the client, not only on the tool that takes a method and a
+        path from the model, because every module in this plugin reaches the cluster through
+        :meth:`request`. A gate on one tool's arguments protects that tool; a gate here protects
+        the next tool somebody writes, including one that builds a path out of a log document.
         """
         self.url = url.rstrip("/")
+        self.allow_destructive = allow_destructive
         self._auth = (f"ApiKey {api_key}" if api_key
                       else "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode() if username else "")
         # One context, built secure, then weakened only on the explicit opt-out. Written this
@@ -82,7 +139,32 @@ class ESClient:
 
     def request(self, method: str, path: str, body: dict | None = None, raw: bool = False) -> Any:
         """``raw=True`` returns the decoded body unparsed - ``_nodes/hot_threads`` answers plain
-        text, not JSON, and ``json.loads`` on it would raise where the caller wants the text."""
+        text, not JSON, and ``json.loads`` on it would raise where the caller wants the text.
+
+        Anything that is not a read is refused here unless the user set ``allow_destructive``. The
+        refusal is an ``ESError`` like any other expected failure, so it reaches the model as a
+        tool result naming the setting rather than unwinding out of a tool.
+        """
+        if is_destructive(method, path) and not self.allow_destructive:
+            raise ESError(destructive_refusal(method, path))
+        return self._send(method, path, body, raw)
+
+    def request_after_confirmation(self, method: str, path: str, body: dict | None = None) -> Any:
+        """The gate's one bypass: a write the user was shown in full and agreed to.
+
+        Two tools ask before they write - ``es_slowlog`` for three named threshold keys, and
+        ``es_snapshots`` for the test blob repository verification puts on every node - and both
+        skip the write outright when there is nobody to ask. A person who has just read the exact
+        change and said yes is a stronger authority than a config key, so refusing them because
+        ``allow_destructive`` is unset would refuse the write they just approved.
+
+        A separate method rather than a flag on :meth:`request`: this is the whole bypass, and
+        grepping for its name lists every call that is allowed to take it.
+        """
+        return self._send(method, path, body)
+
+    def _send(self, method: str, path: str, body: dict | None = None, raw: bool = False) -> Any:
+        """The HTTP itself. Everything above decides whether the call may be made at all."""
         req = urllib.request.Request(self.url + (path if path.startswith("/") else "/" + path), method=method,
                                      data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json", **({"Authorization": self._auth} if self._auth else {})})

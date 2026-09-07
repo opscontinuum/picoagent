@@ -109,7 +109,10 @@ You get a prompt. Type what you want done. Useful things to know:
 | `/exit` or Ctrl-D | leaves |
 
 Sessions are saved as JSONL under `~/.picoagent/sessions/<project>/`. Resume the last one with
-`picoagent -r`.
+`picoagent -r`. The folder is named after the project path with a short digest of it on the end:
+the readable part is for you, and the digest is what stops two projects whose paths flatten to
+the same name from sharing a folder and resuming each other's history. Folders created before
+the digest existed keep their old name and go on being used.
 
 ## Scripting
 
@@ -120,6 +123,17 @@ echo "summarise this" | picoagent -p -                         # prompt from std
 ```
 
 `--json` gives you every tool call and result, which is handy for CI logs.
+
+The exit code says how the run went, so a script does not have to read the output to find out:
+
+| Code | Meaning |
+|---|---|
+| 0 | the run finished. An empty answer counts: a model with nothing to add has answered |
+| 1 | any other failure, including a `-r` path picoagent refused to append to |
+| 2 | the command line was wrong (argparse) |
+| 3 | a plugin you approved is not running, and the session did not start |
+| 4 | a config file could not be read, so no plugin decision was made at all |
+| 5 | the session started but the model was never reached - a key, a URL or the network |
 
 ## Adding behaviour
 
