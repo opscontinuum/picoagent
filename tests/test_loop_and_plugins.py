@@ -1,8 +1,8 @@
 """The agent loop end-to-end with a scripted provider, plus the plugin loader and trust store."""
-import asyncio, hashlib, io, json, tempfile, unittest
+import asyncio, hashlib, io, json, unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.frontends.plain import PlainFrontend
 from picoagent.plugins import loader
@@ -27,7 +27,7 @@ class _TtyStream(io.TextIOBase):
 
 class LoopTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _rt(self, turns):
         self.provider = ScriptedProvider(turns)
@@ -327,7 +327,7 @@ class LoopTests(unittest.TestCase):
 
 class PluginLoaderTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.plug = self.tmp / "myplug"; self.plug.mkdir()
         (self.plug / "plugin.toml").write_text('name="myplug"\nentry="myplug:register"\nskills=["skills"]\n')
         (self.plug / "myplug.py").write_text(
@@ -370,7 +370,7 @@ class TrustChangeTests(unittest.TestCase):
     the first is code the user vetted being replaced, and needs a different response."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.plug = self.tmp / "myplug"
         self.plug.mkdir()
         (self.plug / "plugin.toml").write_text('name="myplug"\nentry="myplug:register"\n')
@@ -452,7 +452,7 @@ class TrustChangeTests(unittest.TestCase):
 
 class LoadReportTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.plug = self.tmp / "myplug"
         self.plug.mkdir()
         (self.plug / "plugin.toml").write_text('name="myplug"\nentry="myplug:register"\n')
@@ -485,7 +485,7 @@ class ResumePathTests(unittest.TestCase):
     """`-r` appends to the file it is given, so it is checked before being opened."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         import os
         os.environ["PICOAGENT_HOME"] = str(self.tmp / "home")
         from picoagent.core.config import load_config

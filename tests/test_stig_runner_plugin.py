@@ -13,13 +13,12 @@ Three properties matter more than the rest, and each has its own class below:
   same flag must not switch the gate off, and must be told that it did not.
 """
 import re
-import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
 
-from helpers import CaptureFrontend, ScriptedProvider, ROOT, make_runtime, run, text, tool_ctx
+from helpers import CaptureFrontend, ScriptedProvider, ROOT, make_runtime, run, text, tool_ctx, temp_dir
 from picoagent.plugins import loader
 from picoagent.testing.fake_ckl import build_ckl, build_repo
 
@@ -63,7 +62,7 @@ class StigBase(unittest.TestCase):
     plugin_config: dict = {}
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.ckl_path = self.tmp / "asd.ckl"
         self.raw = build_ckl()
         self.ckl_path.write_bytes(self.raw)
@@ -329,7 +328,7 @@ class EvidenceCase(unittest.TestCase):
     """
 
     def _repo(self, files: dict[str, str]) -> Path:
-        root = Path(tempfile.mkdtemp()) / "repo"
+        root = temp_dir() / "repo"
         root.mkdir()
         for relative, content in files.items():
             path = root / relative
@@ -349,6 +348,35 @@ class EvidenceCase(unittest.TestCase):
     def _exists(self, files: dict[str, str], max_hits: int):
         probe = evidence.Probe(kind="exists", globs=("*.py",), serves="a test's probe")
         return evidence.run_probes(self._repo(files), [probe], max_hits=max_hits).results[0]
+
+
+class UnresolvedRootsFindTheirFiles(EvidenceCase):
+    """An unresolved root makes the scan find nothing and call it a clean pass.
+
+    ``_inside`` compares a resolved candidate against the root it was handed. Hand it a root
+    that resolves elsewhere - a symlink, which is what ``TMPDIR`` is on macOS - and every file
+    in the tree reads as outside it. Nothing raises: the probe reports zero hits, and zero hits
+    is what a repository that genuinely complies looks like. A STIG determination could be
+    signed against a scan that never opened a file.
+    """
+
+    def test_a_root_reached_through_a_symlink_still_finds_its_files(self):
+        repo = self._repo({"tls.py": "verify=False\n"})
+        link = temp_dir() / "by-link"
+        link.symlink_to(repo, target_is_directory=True)
+        probe = evidence.Probe(kind="grep", globs=("*.py",), pattern="verify=False",
+                               serves="a test's probe")
+        found = evidence.run_probes(link, [probe], max_hits=5).results[0]
+        self.assertEqual(len(found.hits), 1, "the scan resolved away from its own root")
+
+    def test_an_unresolved_root_is_not_reported_as_a_clean_pass(self):
+        """The failure this guards is silence, so the assertion is on the count, not an error."""
+        repo = self._repo({"tls.py": "verify=False\n"})
+        through_dotdot = repo.parent / ".." / repo.parent.name / repo.name
+        probe = evidence.Probe(kind="grep", globs=("*.py",), pattern="verify=False",
+                               serves="a test's probe")
+        found = evidence.run_probes(through_dotdot, [probe], max_hits=5).results[0]
+        self.assertEqual(len(found.hits), 1)
 
 
 class EvidenceTruncationTests(EvidenceCase):
@@ -740,7 +768,7 @@ class ControlCharacterTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.path = self.tmp / "c.ckl"
         self.path.write_bytes(build_ckl(rules=3))
         self.original = self.path.read_bytes()
@@ -796,7 +824,7 @@ class ProjectConfigLayerTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.ckl_path = self.tmp / "asd.ckl"
         self.ckl_path.write_bytes(build_ckl())
         (self.tmp / ".picoagent").mkdir()

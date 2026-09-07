@@ -15,13 +15,12 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
 
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 from picoagent.plugins.api import PluginAPI
@@ -34,7 +33,7 @@ class LayeredConfigCase(unittest.TestCase):
     """A temp project with both config layers present, loaded the way the CLI loads them."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / "home").mkdir()
         (self.tmp / ".picoagent").mkdir()
         self.layers()

@@ -15,11 +15,10 @@ for anything imported later.
 from __future__ import annotations
 
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import make_runtime, run
+from helpers import make_runtime, run, temp_dir
 from picoagent.plugins import loader
 
 #: A plugin whose entry module imports a sibling at import time, calls one at command time,
@@ -59,7 +58,7 @@ def write_plugin(root: Path, name: str, marker: str) -> Path:
 
 class PluginIsolationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp)
         self.trust = loader.TrustStore(self.tmp / "home")
         self.alpha = write_plugin(self.tmp, "alpha", "alpha-utils")
@@ -187,7 +186,7 @@ class SubpackageIsolationTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp)
         self.trust = loader.TrustStore(self.tmp / "home")
         self.delta = write_subpackage_plugin(self.tmp)

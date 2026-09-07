@@ -16,13 +16,12 @@ from __future__ import annotations
 import argparse
 import io
 import os
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from helpers import ROOT  # noqa: F401  (puts picoagent on sys.path)
+from helpers import ROOT, temp_dir  # noqa: F401  (puts picoagent on sys.path)
 from picoagent import cli
 from picoagent.plugins import loader
 
@@ -39,7 +38,7 @@ class PluginAddConsentTests(unittest.TestCase):
     """Drive ``plugin_command(add)`` with recorders in place of pip and the prompt."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         self.project.mkdir(parents=True)

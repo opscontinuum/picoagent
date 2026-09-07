@@ -1,7 +1,7 @@
 """Skills, session log, config layering, and slash-command parsing."""
-import os, tempfile, textwrap, unittest
+import os, textwrap, unittest
 from pathlib import Path
-from helpers import ROOT  # noqa: F401
+from helpers import ROOT, temp_dir  # noqa: F401
 from picoagent.core.commands import CommandRegistry
 from picoagent.core import config, context
 from picoagent.core.config import load_config
@@ -17,7 +17,7 @@ def write_skill(root: Path, name: str, desc: str, body: str, extra: str = "") ->
 
 class SkillTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()); self.reg = SkillRegistry()
+        self.tmp = temp_dir(); self.reg = SkillRegistry()
         write_skill(self.tmp, "deploy", "Ship it", "Run deploy for $ARGUMENTS")
         write_skill(self.tmp, "secret", "Hidden", "x", "disable-model-invocation: true\n")
         self.reg.add_dir(self.tmp, "project")
@@ -41,14 +41,14 @@ class SkillTests(unittest.TestCase):
         self.assertIn("deploy", self.reg.expand("/skill:nope"))
 
     def test_later_source_overrides_earlier(self):
-        other = Path(tempfile.mkdtemp()); write_skill(other, "deploy", "Better", "v2")
+        other = temp_dir(); write_skill(other, "deploy", "Better", "v2")
         self.reg.add_dir(other, "user")
         self.assertEqual(self.reg.get("deploy").description, "Better")
 
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()); self.path = self.tmp / "s.jsonl"
+        self.tmp = temp_dir(); self.path = self.tmp / "s.jsonl"
 
     def test_append_and_resume_round_trip(self):
         s = Session(self.path, self.tmp)
@@ -91,7 +91,7 @@ class SessionTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_project_overrides_user_and_plugin_lists_concatenate(self):
-        home, proj = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        home, proj = temp_dir(), temp_dir()
         os.environ["PICOAGENT_HOME"] = str(home)
         import importlib, picoagent.core.config as c; importlib.reload(c)
         (home / "config.toml").write_text('model="user-model"\nbash_timeout=5\n[plugins]\nenabled=["git:a/b"]\n')
@@ -126,8 +126,8 @@ class ProjectConfigPrivilegeTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
-        self.proj = Path(tempfile.mkdtemp())
+        self.home = temp_dir()
+        self.proj = temp_dir()
         (self.proj / ".picoagent").mkdir()
         (self.home / "credentials").write_text('api_key = "sk-real"\n')
         (self.home / "config.toml").write_text(

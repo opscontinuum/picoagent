@@ -12,8 +12,8 @@ that string means the rule is Open is a human's call, and the tool layer says so
 Path containment
 ----------------
 Probes run against a repository root the model supplied, so containment is the security
-property that matters. :func:`walk` resolves the root once and then, for every candidate,
-resolves the path and requires ``is_relative_to(root)``. That check runs on the *resolved*
+property that matters. :func:`run_probes` resolves the root once and then, for every
+candidate, :func:`walk` resolves the path and requires ``is_relative_to(root)``. That check runs on the *resolved*
 path, so a symlink pointing outside the tree is skipped no matter how it was reached, and
 ``os.walk`` is called with ``followlinks=False`` so a symlinked directory is never descended
 into. Callers still resolve the root itself through picoagent's ``resolve_path`` first, which
@@ -138,15 +138,22 @@ class ContainmentError(Exception):
 
 # --------------------------------------------------------------------------- containment
 
-def _inside(root: Path, candidate: Path) -> bool:
-    """Is ``candidate`` inside ``root`` once both are fully resolved?
+def _inside(resolved_root: Path, candidate: Path) -> bool:
+    """Is ``candidate`` inside ``resolved_root``, once the candidate is resolved?
 
-    Resolving first is the whole point: it collapses ``..`` and follows symlinks, so a link
-    inside the tree that points at ``/etc`` fails this check even though its literal path is a
-    child of the root.
+    Resolving the candidate is the whole point: it collapses ``..`` and follows symlinks, so a
+    link inside the tree that points at ``/etc`` fails this check even though its literal path
+    is a child of the root.
+
+    ``resolved_root`` must already be resolved, and the caller owes that: this runs once per
+    directory and once per file, so resolving a constant here would be work repeated thousands
+    of times. The cost of getting it wrong is not a crash but silence - an unresolved root that
+    the candidates resolve away from makes every file read as outside the tree, so the scan
+    finds nothing and reports a clean pass. ``run_probes`` resolves it once for that reason,
+    and every caller reaches this through ``run_probes``.
     """
     try:
-        return candidate.resolve().is_relative_to(root)
+        return candidate.resolve().is_relative_to(resolved_root)
     except (OSError, RuntimeError, ValueError):
         return False               # unresolvable (broken link, loop, permission) => not inside
 
@@ -168,6 +175,10 @@ def walk(root: Path, scan: ScanResult) -> list[Path]:
 
     ``scan`` is updated in place with the skip counters so callers can report what was not
     looked at - "no hits" and "we never opened the file" are different answers.
+
+    ``root`` must already be resolved; ``run_probes`` is where that happens, and its docstring
+    says what goes wrong when it does not. Resolving again here would be harmless but would put
+    the decision in two places, and the next caller would have to guess which one owns it.
     """
     files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
@@ -258,7 +269,14 @@ def run_probes(root: Path, probes: list[Probe], max_hits: int = 20) -> ScanResul
     One helper per probe kind, so the four promises the module docstring makes are four
     functions a reader can check one at a time. A kind handled inline here while another sits
     in a helper costs that reader two shapes to learn before they can read either one.
+
+    The root is resolved once, here, and everything below works from that. Containment compares
+    the root against resolved candidates, so a root that resolves elsewhere - a symlink, which
+    is what ``TMPDIR`` is on macOS - puts every file in the tree outside it. That failure is
+    silent: the scan reports no hits, and no hits is also what a compliant repository looks
+    like, so a determination could be signed against a walk that never opened a file.
     """
+    root = root.resolve()
     scan = ScanResult(results=[ProbeResult(probe) for probe in probes])
     files = walk(root, scan)
     relatives = {path: path.relative_to(root).as_posix() for path in files}

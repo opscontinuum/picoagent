@@ -16,12 +16,11 @@ from __future__ import annotations
 import argparse
 import io
 import os
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from helpers import ROOT, make_runtime  # noqa: F401  (ROOT puts picoagent on sys.path)
+from helpers import ROOT, make_runtime, temp_dir  # noqa: F401  (ROOT puts picoagent on sys.path)
 from picoagent import cli
 from picoagent.plugins import loader
 from picoagent.plugins.manifest import Manifest, ManifestError
@@ -41,7 +40,7 @@ class _PluginDirs(unittest.TestCase):
     """A user plugin directory under a temp ``PICOAGENT_HOME``, with the CWD in a temp project."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         (self.home / "plugins").mkdir(parents=True)

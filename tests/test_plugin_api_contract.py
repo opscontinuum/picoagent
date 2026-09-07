@@ -23,7 +23,6 @@ import logging
 import os
 import re
 import sys
-import tempfile
 import time
 import unittest
 import warnings
@@ -31,7 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from helpers import CaptureFrontend, ROOT, ScriptedProvider, call, make_runtime, run, text
+from helpers import CaptureFrontend, ROOT, ScriptedProvider, call, make_runtime, run, text, temp_dir
 from picoagent import __version__
 from picoagent.core.events import CORE_EVENTS
 from picoagent.core.loop import AgentLoop
@@ -128,7 +127,7 @@ class UnknownEventNames(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp)
         self.api = PluginAPI(self.rt, "probe", self.tmp)
 
@@ -161,7 +160,7 @@ class DocumentedPluginApi(unittest.TestCase):
     """One test per call in ``docs/plugin-authoring.md``, written the way the docs write it."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _api(self, provider=None, frontend=None) -> PluginAPI:
         self.rt = make_runtime(self.tmp, provider=provider, frontend=frontend)
@@ -395,7 +394,7 @@ class ShippedManifestFields(unittest.TestCase):
                 self.assertTrue(all(isinstance(entry, str) for entry in manifest.requires))
 
     def test_a_requires_value_of_the_wrong_shape_costs_the_value_not_the_plugin(self):
-        root = Path(tempfile.mkdtemp())
+        root = temp_dir()
         (root / "plugin.toml").write_text('name = "p"\nentry = "p:register"\nrequires = 3\n')
         self.assertEqual(Manifest.load(root).requires, [])
 
@@ -408,7 +407,7 @@ class RequiresIsCheckedAndWarnedAbout(unittest.TestCase):
     field nobody's declaration was ever tested against is no ground to withhold a plugin on."""
 
     def _manifest(self, requires: str) -> Manifest:
-        root = Path(tempfile.mkdtemp())
+        root = temp_dir()
         (root / "plugin.toml").write_text(f'name = "p"\nentry = "p:register"\n{requires}\n')
         return Manifest.load(root)
 
@@ -449,7 +448,7 @@ class RequiresAtLoadTime(unittest.TestCase):
     the trust check - and that one the user can answer; a version mismatch they cannot."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.plug = self.tmp / "myplug"
         self.plug.mkdir()
         (self.plug / "myplug.py").write_text(
@@ -523,7 +522,7 @@ class TimedOutExecLeavesNothingBehind(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.pidfile = self.tmp / "child.pid"
 
     def _timed_out(self, *argv: str, timeout: float = 0.4) -> tuple[int, str]:

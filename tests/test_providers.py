@@ -17,7 +17,7 @@ from picoagent.core.types import Message, ToolCall, ToolResult      # noqa: E402
 from picoagent.plugins import loader                                # noqa: E402
 from picoagent import cli                                           # noqa: E402
 from picoagent.testing.fakes import FakeServer  # noqa: E402
-from helpers import ROOT  # noqa: E402,F811
+from helpers import ROOT, temp_dir  # noqa: E402,F811
 
 
 class ErrorScrubbingTests(unittest.TestCase):
@@ -269,7 +269,7 @@ class BaseUrlSchemeTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / "models").write_text('{"data": [{"id": "leaked-from-disk"}]}')
         (self.tmp / "chat").mkdir()
         (self.tmp / "chat" / "completions").write_text('data: {"choices":[{"delta":{"content":"hi"}}]}\n')
@@ -538,7 +538,7 @@ class InterruptedToolBatchTests(unittest.TestCase):
 
     def test_a_resumed_interrupted_session_answers_every_call_it_replays(self):
         """End to end: the log an interrupt leaves behind, read back the way ``-r`` reads it."""
-        tmp = Path(tempfile.mkdtemp())
+        tmp = temp_dir()
         session = Session(tmp / "s.jsonl", tmp)
         session.append_message(Message(role="user", text="run it"))
         session.append_message(Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})]))

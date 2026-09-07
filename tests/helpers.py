@@ -1,6 +1,6 @@
 """Shared test fixtures. Keeps individual test files short and readable."""
 from __future__ import annotations
-import asyncio, logging, os, sys
+import asyncio, logging, os, sys, tempfile
 from pathlib import Path
 
 logging.disable(logging.CRITICAL)   # plugin-failure tests log on purpose; keep output clean
@@ -19,6 +19,29 @@ from picoagent.core.types import StreamEvent, ToolCall       # noqa: E402
 def run(coro):
     """Run a coroutine to completion (tests stay synchronous and readable)."""
     return asyncio.run(coro)
+
+
+def temp_dir() -> Path:
+    """A fresh temporary directory, already symlink-resolved. Use this, never bare ``mkdtemp``.
+
+    ``mkdtemp`` returns the path as ``TMPDIR`` spells it, links and all. On macOS that is
+    ``/var/folders/...``, and ``/var`` is a symlink to ``/private/var``; a ``TMPDIR`` pointed at
+    any linked directory does the same thing on Linux.
+
+    picoagent resolves the paths it reports, deliberately and in several places at once -
+    ``resolve_tool_path`` so a gate and a tool agree on which file they mean,
+    ``TrustStore.key`` so one directory is not two approvals, ``evidence.resolve_root`` so a
+    scan's containment check holds. So a test that compares something picoagent reported against
+    a raw ``mkdtemp`` string is comparing two spellings of one directory, and fails on every
+    machine whose ``TMPDIR`` goes through a link while passing on the machine it was written on.
+    Twenty-two assertions here did exactly that.
+
+    Resolving once, where the directory is made, is what keeps that out of the assertions. The
+    alternative - ``.resolve()`` on each expected value - has to be remembered by every test
+    written afterwards, and is invisible when it is forgotten: the test still passes locally.
+    ``test_suite_shape`` fails the run if a test file calls ``mkdtemp`` directly again.
+    """
+    return Path(tempfile.mkdtemp()).resolve()
 
 
 class CaptureFrontend:

@@ -3,12 +3,11 @@ import asyncio
 import os
 import stat
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 
@@ -24,7 +23,7 @@ def load(rt, name="credential-guard"):
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.path = cg.credentials_path(self.tmp)
 
     def test_missing_file_reads_as_empty(self):
@@ -137,7 +136,7 @@ class GuardedShellToolTests(unittest.TestCase):
         os.environ["PICOAGENT_TEST_API_KEY"] = "totally-secret"
         try:
             tool = cg.GuardedShellTool()
-            ctx = _ctx(Path(tempfile.mkdtemp()))
+            ctx = _ctx(temp_dir())
             result = run(tool.execute({"command": "echo $PICOAGENT_TEST_API_KEY"}, ctx))
             self.assertNotIn("totally-secret", result.content)
         finally:
@@ -145,14 +144,14 @@ class GuardedShellToolTests(unittest.TestCase):
 
     def test_ordinary_command_still_works(self):
         tool = cg.GuardedShellTool()
-        ctx = _ctx(Path(tempfile.mkdtemp()))
+        ctx = _ctx(temp_dir())
         result = run(tool.execute({"command": "echo hello"}, ctx))
         self.assertIn("hello", result.content)
         self.assertFalse(result.is_error)
 
     def test_timeout_is_reported_and_does_not_hang(self):
         tool = cg.GuardedShellTool()
-        ctx = _ctx(Path(tempfile.mkdtemp()))
+        ctx = _ctx(temp_dir())
         result = run(tool.execute({"command": "sleep 5", "timeout": 1}, ctx))
         self.assertTrue(result.is_error)
         self.assertIn("timed out", result.content)
@@ -165,7 +164,7 @@ def _ctx(tmp: Path):
 
 class ToolCallGuardTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.creds_path = cg.credentials_path(self.tmp)
         cg.write_credential(self.creds_path, "openai", "sk-secret")
 
@@ -212,7 +211,7 @@ class ToolCallGuardTests(unittest.TestCase):
         self.assertTrue(result and result.get("block"))
 
     def test_grep_search_on_an_unrelated_directory_is_still_allowed(self):
-        elsewhere = Path(tempfile.mkdtemp())
+        elsewhere = temp_dir()
         result = run(cg.guard_tool_call({"name": "grep_search", "args": {"path": str(elsewhere)}}, self._rt()))
         self.assertIsNone(result)
 
@@ -261,7 +260,7 @@ class ToolCallGuardTests(unittest.TestCase):
 
 class SecretsCommandTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _rt(self):
         return make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
@@ -304,7 +303,7 @@ class SecretsCommandTests(unittest.TestCase):
 
 class PluginIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_shell_tool_is_overridden_and_secrets_command_registered(self):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
@@ -356,7 +355,7 @@ class ArgumentNameCoverageTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.creds = cg.credentials_path(self.tmp)
         self.creds.parent.mkdir(parents=True, exist_ok=True)
         cg.write_credential(self.creds, "openai", "sk-secret")

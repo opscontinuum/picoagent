@@ -10,13 +10,16 @@ These run real git against local `file://` remotes, no network.
 """
 from __future__ import annotations
 
+import argparse
+import io
 import os
 import subprocess
-import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
-from helpers import CaptureFrontend  # noqa: F401  (puts picoagent on sys.path)
+from helpers import CaptureFrontend, temp_dir  # noqa: F401  (puts picoagent on sys.path)
+from picoagent import cli
 from picoagent.core.config import PROJECT_ENABLED_KEY, load_config
 from picoagent.core.loop import Runtime
 from picoagent.core.session import Session
@@ -53,7 +56,7 @@ class ProjectSpecFixture(unittest.TestCase):
     """A user who trusts `gate` at `v2`, and a repository whose config names `gate` at `v0`."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_plugin_repo(self.tmp / "gate")
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
@@ -119,7 +122,7 @@ class ARepositoryMaySuggestAPlugin(unittest.TestCase):
     """The feature the concatenation exists for. The trust prompt is its control."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_plugin_repo(self.tmp / "helper", name="helper")
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
@@ -150,7 +153,7 @@ class TheUpgradePathStillMovesACheckout(unittest.TestCase):
     """`picoagent plugin add` on an installed plugin is an upgrade: the user may move it."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_plugin_repo(self.tmp / "gate")
         self.project = self.tmp / "project"
         self.project.mkdir()
@@ -172,7 +175,7 @@ class CheckoutOwnership(unittest.TestCase):
     """Where a spec's checkout is allowed to land."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.user_plugins = self.tmp / "home" / "plugins"
         self.user_plugins.mkdir(parents=True)
 
@@ -200,7 +203,7 @@ class SpecProvenance(unittest.TestCase):
     """Which layer wrote which entry in the concatenated `enabled` list."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / ".picoagent").mkdir(parents=True)
         os.environ["PICOAGENT_HOME"] = str(self.tmp / "home")
         (self.tmp / ".picoagent" / "config.toml").write_text(
@@ -250,7 +253,7 @@ class ProvenanceThatCannotBeEstablished(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / ".picoagent").mkdir(parents=True)
         self.config = self.tmp / ".picoagent" / "config.toml"
         self.spec = "git:evil.example/attacker/credential-guard@bad"
@@ -307,7 +310,7 @@ class MovedVersusEdited(unittest.TestCase):
     """A trusted plugin that stops loading: did the user edit it, or did something move it?"""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_plugin_repo(self.tmp / "gate")
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
@@ -402,7 +405,7 @@ class ASpecThatIsNotAString(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.project = self.tmp / "project"
@@ -452,7 +455,7 @@ class ARepositoryConfigThatWillNotParse(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.project = self.tmp / "project"
@@ -509,7 +512,7 @@ class ARepositoryConfigOfTheWrongShape(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.home.mkdir()
         self.project = self.tmp / "project"
@@ -549,7 +552,7 @@ class APathSpecFromARepository(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         (self.project / ".picoagent").mkdir(parents=True)
@@ -634,6 +637,67 @@ class APathSpecFromARepository(unittest.TestCase):
         self._edit(root)
         notice = next(entry for entry in self._load().notices if entry.root == root)
         self.assertNotIn("this repository", notice.text)
+
+
+class RefusingAnAddOnTheCommandLine(unittest.TestCase):
+    """The ownership refusal reaching the person who typed the command.
+
+    ``resolve_source`` is the check; this is what the user sees when it fires. ``plugin add``
+    caught only ``CalledProcessError`` around it, so both spellings that raise
+    ``PluginOwnershipError`` - a ``--project`` path aimed inside the user's own plugin directory,
+    and a git spec whose checkout name would land there or traverse out of the destination - came
+    back as an uncaught traceback. A traceback is not a refusal: it says picoagent broke rather
+    than that the command was declined, and it buries the one sentence explaining where a
+    repository's plugins are allowed to live.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.home = self.tmp / "home"
+        self.project = self.tmp / "project"
+        self.project.mkdir(parents=True)
+        self.user_plugin = self.home / "plugins" / "gate"
+        self.user_plugin.mkdir(parents=True)
+        (self.user_plugin / "plugin.toml").write_text(PLUGIN_TOML)
+        (self.user_plugin / "gate.py").write_text(ENTRY.format(mark="V0"))
+        self._old_home = os.environ.get("PICOAGENT_HOME")
+        self._old_cwd = Path.cwd()
+        os.environ["PICOAGENT_HOME"] = str(self.home)
+        os.chdir(self.project)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        if self._old_home is None:
+            os.environ.pop("PICOAGENT_HOME", None)
+        else:
+            os.environ["PICOAGENT_HOME"] = self._old_home
+
+    def _add(self, spec: str, project: bool = True) -> tuple[int, str]:
+        args = argparse.Namespace(pcmd="add", spec=spec, project=project, yes=True)
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = cli.plugin_command(args)
+        return code, buffer.getvalue()
+
+    def test_a_project_path_inside_the_users_plugin_directory_is_refused_not_raised(self):
+        code, out = self._add(str(self.user_plugin))
+        self.assertEqual(code, 1)
+        self.assertIn(str(self.user_plugin), out)
+
+    def test_the_refusal_says_where_a_repositorys_plugins_belong(self):
+        """The user has to be able to act on it, and the action is a different directory."""
+        self.assertIn(".picoagent/plugins", self._add(str(self.user_plugin))[1])
+
+    def test_a_relative_spelling_of_the_same_directory_is_refused_the_same_way(self):
+        spec = os.path.relpath(self.user_plugin, self.project)
+        self.assertEqual(self._add(spec)[0], 1)
+
+    def test_a_git_spec_with_a_traversing_checkout_name_is_refused_too(self):
+        """``checkout_path`` raises this one whether or not ``--project`` was passed, so the
+        catch cannot be conditional on the flag either."""
+        code, out = self._add("file:///anywhere/plugins/..", project=False)
+        self.assertEqual(code, 1)
+        self.assertIn("refusing", out)
 
 
 if __name__ == "__main__":

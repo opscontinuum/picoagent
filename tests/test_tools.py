@@ -1,15 +1,15 @@
 """Built-in tools: read/write/edit/shell, truncation, and the per-file mutation lock."""
-import asyncio, tempfile, unittest
+import asyncio, unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from helpers import run, tool_ctx
+from helpers import run, tool_ctx, temp_dir
 from picoagent.core.tools import (ShellTool, EditTool, ReadTool, ToolRegistry, WriteTool, truncate,
                                   spawn_shell, kill_process_tree)
 
 
 class ReadToolTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()); (self.tmp / "f.txt").write_text("a\nb\nc\nd\n")
+        self.tmp = temp_dir(); (self.tmp / "f.txt").write_text("a\nb\nc\nd\n")
 
     def test_numbers_lines(self):
         r = run(ReadTool().execute({"path": "f.txt"}, tool_ctx(self.tmp)))
@@ -39,7 +39,7 @@ class ReadToolTests(unittest.TestCase):
 
 class WriteEditTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_write_creates_parents(self):
         run(WriteTool().execute({"path": "a/b/c.txt", "content": "x"}, tool_ctx(self.tmp)))
@@ -78,7 +78,7 @@ class WriteEditTests(unittest.TestCase):
 
 class ShellToolTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_captures_output_and_exit_code(self):
         r = run(ShellTool().execute({"command": "echo hi; exit 3"}, tool_ctx(self.tmp)))
@@ -142,7 +142,7 @@ class ShellDispatchTests(unittest.TestCase):
 
     @staticmethod
     def tmp_path() -> Path:
-        return Path(tempfile.mkdtemp())
+        return temp_dir()
 
 
 class TruncateAndRegistryTests(unittest.TestCase):
@@ -172,9 +172,9 @@ class ConfinementTests(unittest.TestCase):
     sibling repos and files outside its start directory. On, it refuses them."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / "inside.txt").write_text("in\n")
-        self.outside = Path(tempfile.mkdtemp()) / "outside.txt"
+        self.outside = temp_dir() / "outside.txt"
         self.outside.write_text("out\n")
 
     def test_absolute_outside_path_is_allowed_by_default(self):

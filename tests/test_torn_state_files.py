@@ -24,13 +24,12 @@ import io
 import json
 import logging
 import os
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from helpers import ROOT  # noqa: F401  - puts the package on sys.path
+from helpers import ROOT, temp_dir  # noqa: F401  - puts the package on sys.path
 from picoagent import cli
 from picoagent.core.session import Session
 from picoagent.core.types import Message
@@ -48,7 +47,7 @@ class _TornTrustStore(unittest.TestCase):
     """A user home with one approved plugin, and a way to damage the store behind it."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         self.project.mkdir(parents=True)
@@ -161,7 +160,7 @@ class ATornSessionLog(unittest.TestCase):
     """`-r` is wanted exactly when the last run crashed, which is when the log is torn."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.path = self.tmp / "session.jsonl"
         session = Session(self.path, self.tmp)
         session.append_message(Message(role="user", text="first"))

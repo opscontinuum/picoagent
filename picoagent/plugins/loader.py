@@ -452,6 +452,13 @@ class TrustStore:
 
     def __init__(self, user_dir: Path):
         self.path = user_dir / "trust.json"
+        #: True when the file exists and could not be read, so ``data`` is empty because nothing
+        #: could be parsed rather than because nothing was ever approved. Both leave an empty
+        #: store, and they call for opposite responses from the user - one is a first run, the
+        #: other is a file to restore or delete before every plugin comes back as new. The
+        #: distinction is only knowable here, at the read, so it is answered here instead of by
+        #: each caller opening the file again and possibly disagreeing with this one.
+        self.unreadable = False
         raw = self._read()
         self.data: dict[str, dict] = {key: {"fingerprint": rec} if isinstance(rec, str) else rec
                                       for key, rec in raw.items()}
@@ -477,6 +484,12 @@ class TrustStore:
         the outside and are not the same thing: one of them needs every approval given again.
         The damaged bytes are left where they are - overwriting them is the next ``trust`` or
         ``untrust``'s business, and only after the user has asked for one.
+
+        Recorded on ``unreadable`` as well as logged, because a log line is not what someone
+        running a CLI command reads. A caller describing this store has to be able to say which
+        of the two happened in its own output; ``untrust`` said "records nothing at all" for
+        both, which is true of the parsed store and false of the file the user then goes and
+        opens.
         """
         if not self.path.exists():
             return {}
@@ -488,6 +501,7 @@ class TrustStore:
             if not isinstance(raw, dict) or not all(isinstance(rec, (str, dict)) for rec in raw.values()):
                 raise ValueError("not a table of plugin approvals")
         except (OSError, ValueError) as exc:
+            self.unreadable = True
             log.error("%s could not be read (%s), so no plugin counts as approved this run. "
                       "Every plugin will report as new until you approve it again: "
                       "picoagent plugin list", self.path, exc)

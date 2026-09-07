@@ -12,12 +12,11 @@ import io
 import json
 import os
 import socket
-import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from helpers import run
+from helpers import run, temp_dir
 from picoagent import cli
 from picoagent.core.config import load_config
 from picoagent.testing.fakes import FakeServer
@@ -43,7 +42,7 @@ class HeadlessExitCodeTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.project = self.tmp / "project"
         self.project.mkdir()
         os.environ["PICOAGENT_HOME"] = str(self.tmp / "home")
@@ -104,7 +103,7 @@ class SessionDirectoryTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         os.environ["PICOAGENT_HOME"] = str(self.tmp / "home")
         self.cfg = load_config(self.tmp)
 

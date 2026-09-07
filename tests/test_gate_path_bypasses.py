@@ -20,11 +20,10 @@ where the defect is rather than at an import. The seam itself is covered in
 """
 import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import CaptureFrontend, ROOT, ScriptedProvider, call, make_runtime, run, text, tool_ctx
+from helpers import CaptureFrontend, ROOT, ScriptedProvider, call, make_runtime, run, text, tool_ctx, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.core.tools import ReadTool, WriteTool
 from picoagent.plugins import loader
@@ -55,7 +54,7 @@ class CredentialGuardSpellingTests(unittest.TestCase):
     """Symptom A: the guard read one file's name while the tool opened another."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.project = self.tmp / "project"
         self.project.mkdir()
         self.user_dir = self.tmp / "home"
@@ -98,7 +97,7 @@ class PermissionGateSpellingTests(unittest.TestCase):
     """Symptom B: the gate matched how the model spelled the path, not which file it named."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / ".git" / "hooks").mkdir(parents=True)
         self.gate = pg.PermissionGate(FakeApi())
 
@@ -147,7 +146,7 @@ class ConfinedSymlinkTests(unittest.TestCase):
     """Symptom C: confinement checked a textual path for a file that did not exist yet."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.project = self.tmp / "confined"
         self.project.mkdir()
         self.outside = self.tmp / "outside"

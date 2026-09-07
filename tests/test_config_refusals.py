@@ -16,11 +16,10 @@ from __future__ import annotations
 import logging
 import os
 import re
-import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import ROOT  # noqa: F401  - puts the package on sys.path
+from helpers import ROOT, temp_dir  # noqa: F401  - puts the package on sys.path
 from picoagent.core import config
 
 
@@ -28,8 +27,8 @@ class _ConfigDirs(unittest.TestCase):
     """A user dir and a project dir, with ``PICOAGENT_HOME`` pointed at the first."""
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
-        self.proj = Path(tempfile.mkdtemp())
+        self.home = temp_dir()
+        self.proj = temp_dir()
         (self.proj / ".picoagent").mkdir()
         (self.home / "config.toml").write_text('model = "user-model"\nmax_tokens = 1234\n')
         self._prev = os.environ.get("PICOAGENT_HOME")

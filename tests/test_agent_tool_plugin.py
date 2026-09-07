@@ -4,9 +4,9 @@ Everything runs offline through ScriptedProvider: the parent registers it, the c
 the parent's provider registry, so one script drives both and ``provider.calls`` is a complete
 record of who asked the model for what.
 """
-import importlib.util, sys, tempfile, unittest
+import importlib.util, sys, unittest
 from pathlib import Path
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.core.tools import ToolContext
 from picoagent.plugins import loader
@@ -22,7 +22,7 @@ _spec.loader.exec_module(agent_tool)
 
 class AgentToolTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.provider = None
 
     def _rt(self, turns, answer=True):

@@ -17,12 +17,11 @@ from __future__ import annotations
 import io
 import logging
 import os
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from helpers import ROOT  # noqa: F401  (puts picoagent on sys.path)
+from helpers import ROOT, temp_dir  # noqa: F401  (puts picoagent on sys.path)
 from picoagent import cli
 
 #: Hides the rest of the line, then retitles the window: what an exception message can do today.
@@ -79,7 +78,7 @@ class FormatterIsInstalledTests(unittest.TestCase):
     """``main`` configures logging once, and that is the only place this can be wired."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self._old_home = os.environ.get("PICOAGENT_HOME")
         self._old_cwd = Path.cwd()
         os.environ["PICOAGENT_HOME"] = str(self.tmp / "home")

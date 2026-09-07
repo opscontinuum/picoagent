@@ -449,6 +449,21 @@ def plugin_command(args: argparse.Namespace) -> int:
         except subprocess.CalledProcessError:
             print(f"could not fetch {args.spec} (unreachable, or the ref does not exist)")
             return 1
+        except loader.PluginOwnershipError as exc:
+            # A refusal, not a crash. This fires for a `--project` spec of either spelling that
+            # would land inside the user's own plugin directory, and for a checkout name that
+            # would traverse out of the destination at all - which `checkout_path` raises with or
+            # without `--project`, so the catch cannot be conditional on the flag. Uncaught, both
+            # exited with a traceback: it reads as picoagent breaking rather than declining, and
+            # the loader's sentence, which is the only thing saying where a repository's plugins
+            # may live, is the part a traceback buries.
+            #
+            # 1, not a code of its own, and not one of 3/4/5. Those three are startup refusals
+            # about a *session* that is not going to run, which is a decision a wrapper takes
+            # differently; every way `plugin add` declines to install something already exits 1,
+            # and nothing downstream would act on a sixth code for this one.
+            print(f"cannot install {args.spec}: {safe_for_display(str(exc))}")
+            return 1
         try:
             manifest = loader.Manifest.load(root)
         except ManifestError as exc:
@@ -572,8 +587,18 @@ def untrust_command(spec: str, trust: loader.TrustStore) -> int:
         labels = [label for label, record in trust.data.items() if spec in (label, record.get("name"))]
     if not labels:
         print(f"no approval matches {spec!r}, so nothing was withdrawn.")
-        print(f"{trust.path} records nothing at all." if not trust.data
-              else f"Approvals in {trust.path} - pass a directory or a name from this list:")
+        # Three states, not two. An empty store is either a first run or a file that could not be
+        # parsed, and reporting both as "records nothing at all" is true of what was parsed and
+        # false of the file - which is where the user goes next. The damaged case is the one with
+        # something to do: every plugin is about to report as new, and the file is still on disk
+        # to restore or delete. `TrustStore` knows which it was, so nothing is re-read here.
+        if trust.unreadable:
+            print(f"{trust.path} could not be read, so no approval could be matched. It is still "
+                  "on disk, unchanged; until it parses, every plugin reports as new.")
+        elif not trust.data:
+            print(f"{trust.path} records nothing at all.")
+        else:
+            print(f"Approvals in {trust.path} - pass a directory or a name from this list:")
         for label, record in trust.data.items():
             print(f"  {record.get('name') or label:20} {record.get('root') or '(no directory recorded)'}")
         return 1

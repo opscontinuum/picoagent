@@ -4,10 +4,10 @@ Every test spawns the real fake server in ``picoagent/testing/fake_mcp.py`` as a
 so the JSON-RPC framing, the pipe and the process lifecycle are all under test - the parts a
 transport double would replace are exactly the parts that break.
 """
-import json, os, sys, tempfile, time, unittest
+import json, os, sys, time, unittest
 from pathlib import Path
 from unittest import mock
-from helpers import ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT
+from helpers import ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.tools import ReadTool
 from picoagent.plugins import api as plugin_api
 from picoagent.plugins import loader
@@ -56,7 +56,7 @@ def env_reporting_server(**overrides):
 
 class McpBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def load(self, servers, **plugin_config):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))

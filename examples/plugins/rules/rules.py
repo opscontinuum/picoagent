@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from picoagent.core.skills import parse_frontmatter
+from picoagent.core.tools import resolve_tool_path
 
 #: Rules the user wrote, relative to ``_user_dir``. The only ungated location there is.
 USER_RULES_DIR = "rules"
@@ -93,7 +94,11 @@ PATH_ARG_KEYS = ("path", "file", "file_path", "filename", "paths", "files")
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SHELL_SPLIT = re.compile(r"[\s;|&()<>\"']+")
-_LOOKS_LIKE_PATH = re.compile(r"^[\w.@+-]*(?:/[\w.@+-]*)+$|^[\w@+-][\w.@+-]*\.\w{1,8}$")
+#: ``~`` is in the first alternative because a token like ``~/notes.md`` is a path a person
+#: writes and :func:`resolve_tool_path` expands; dropping it here would keep it from ever
+#: reaching the seam. Only there: ``~`` leading a bare filename with no ``/`` is not a home
+#: reference, so the second alternative stays as it is.
+_LOOKS_LIKE_PATH = re.compile(r"^[\w.@~+-]*(?:/[\w.@~+-]*)+$|^[\w@+-][\w.@+-]*\.\w{1,8}$")
 _MAX_SHELL_TOKENS = 40
 
 INTRO = ("The following guidance applies to files touched in this turn. It is reference material "
@@ -478,15 +483,22 @@ class RuleEngine:
         Keeping outside-the-project files rather than dropping them lets a user rule with a
         glob like ``*.py`` still fire on a sibling repository, while a project rule scoped to
         ``picoagent/**`` correctly does not.
+
+        Through :func:`resolve_tool_path`, which is what the tool about to run will use, rather
+        than resolving here. This did its own resolving and drifted from that seam exactly the
+        way the gates did: no ``@`` stripped, no ``~`` expanded, so ``@src/main.py`` stayed
+        ``@src/main.py`` and matched ``src/*.py`` against nothing while ``read`` opened the file
+        regardless. Nothing is bypassed by the difference - this handler blocks no call - but a
+        rule that silently does not fire is indistinguishable from a rule that did not apply.
+
+        ``refusal`` is ignored on purpose. It says the *tool* will not open the path, which is
+        the tool's decision to make and announce; a rule is guidance, and whether it matched is
+        a separate question from whether the read goes ahead. ``path`` is filled in either way.
         """
         text = candidate.strip().strip("'\"")
         if not text:
             return None
-        try:
-            path = Path(text)
-            absolute = (path if path.is_absolute() else self.cwd / path).resolve()
-        except (OSError, RuntimeError, ValueError):
-            return None
+        absolute = resolve_tool_path(text, self.api.config, self.cwd).path
         try:
             return absolute.relative_to(self.cwd).as_posix()
         except ValueError:

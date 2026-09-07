@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import io
 import json
-import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from helpers import CaptureFrontend, make_runtime, run
+from helpers import CaptureFrontend, make_runtime, run, temp_dir
 from picoagent.core.commands import COMMAND_SOURCE
 from picoagent.core.loop import AgentLoop
 from picoagent.core.text import (MAX_MESSAGE_CHARS, describe_exception, safe_for_display,
@@ -137,7 +136,7 @@ class TerminalRenderingTests(unittest.TestCase):
     """The same text, through the two frontends that write to a terminal."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.hostile = f"{ESC}[2Jyour session did nothing{ESC}]0;pwned\x07"
 
     def test_the_repl_strips_a_notice(self):
@@ -204,7 +203,7 @@ class HostileExceptionTests(unittest.TestCase):
     """A plugin's exception reaching the user, through the two call-ins that catch one."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     @staticmethod
     def _hostile() -> Exception:
@@ -275,7 +274,7 @@ class UnencodableTextTests(unittest.TestCase):
     """Text that cannot become bytes, on its way to a stream that must make it bytes."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.hostile = f"plugin says {SURROGATE} everything is fine"
 
     # ---------------------------------------------------------------- the REPL
@@ -383,7 +382,7 @@ class HostileClassNameTests(unittest.TestCase):
     """The name half of ``describe_exception``: reading it can run a plugin's code."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     @staticmethod
     def _name_raises(error: BaseException | None = None):

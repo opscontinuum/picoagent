@@ -3,12 +3,11 @@ guarantee that every rendered sentence is either template text or a user's answe
 import json
 import re
 import sys
-import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
-from helpers import CaptureFrontend, ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.tools import PathRefused
 from picoagent.plugins import loader
 from picoagent.testing.fake_iac import (AWS_SAMPLE_TF, OCI_SAMPLE_TF, SAMPLE_ANSWERS,
@@ -125,7 +124,7 @@ class ScannerTests(unittest.TestCase):
     block boundaries but are not."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.terraform = write_sample_project(self.tmp)
         self.inventory = iac_inventory.scan_terraform_dir(self.terraform)
         self.by_address = {ci.address: ci for ci in self.inventory.cis}
@@ -205,7 +204,7 @@ class ScannerTests(unittest.TestCase):
 
 class OtherInputTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_terraform_show_json_resolves_values_and_walks_child_modules(self):
         inventory = iac_inventory.read_terraform_show_json(write_terraform_show_json(self.tmp))
@@ -236,7 +235,7 @@ class OtherInputTests(unittest.TestCase):
 
 class PluginBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]),
                                frontend=CaptureFrontend())
         loader.load_plugin(PLUGIN, self.rt, loader.TrustStore(self.tmp / "home"),
@@ -474,7 +473,7 @@ class ProvenanceTests(unittest.TestCase):
 
 class RunbookTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.cis = iac_inventory.scan_terraform_dir(write_sample_project(self.tmp)).cis
 
     def test_each_runbook_has_the_fixed_skeleton(self):
@@ -630,8 +629,8 @@ class ConfinementTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.proj = Path(tempfile.mkdtemp())
-        self.outside = Path(tempfile.mkdtemp())
+        self.proj = temp_dir()
+        self.outside = temp_dir()
         (self.outside / "main.tf").write_text('resource "aws_instance" "x" {}\n')
 
     def test_absolute_outside_path_is_allowed_when_confinement_is_off(self):
@@ -687,7 +686,7 @@ class ProjectConfigLayerTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / ".picoagent").mkdir()
         self.outside = self.tmp / "outside"
 

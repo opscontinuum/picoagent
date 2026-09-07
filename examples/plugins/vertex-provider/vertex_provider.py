@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import threading
@@ -48,7 +49,13 @@ from typing import Any
 # builder for one) as public API and say in docs/plugin-authoring.md that a plugin sending a
 # credential over HTTP is expected to use it; until it does, this is the honest import.
 from picoagent.core.provider import _OPENER as SAME_ORIGIN_OPENER
-from picoagent.core.types import Message, StreamEvent, ToolCall, new_id
+# The sentence core tells a model about an interrupted call, reused rather than reworded. What a
+# provider owes its own wire is the *shape* of the answer; what the model is told happened is the
+# same fact on every wire, and two wordings would be two chances to say something untrue.
+from picoagent.core.provider import INTERRUPTED_TOOL_RESULT
+from picoagent.core.types import Message, StreamEvent, ToolCall, ToolResult, new_id
+
+log = logging.getLogger("vertex_provider")
 
 # Gemini's function-declaration schema is an OpenAPI subset; anything else is rejected with 400.
 GEMINI_SCHEMA_KEYS = frozenset({"type", "description", "properties", "required", "items",
@@ -77,9 +84,17 @@ def to_gemini_contents(messages: list[Message], call_names: dict[str, str]) -> l
 
     Gemini has no tool-call ids: a ``functionResponse`` is matched by *name*, so we
     remember ``call_names[tool_call_id] = tool_name`` while walking assistant messages.
+
+    The response turn is built from the *calls*, pulling each result forward to sit beside the
+    call it answers, rather than emitted where the ``role: tool`` message happens to fall. Gemini
+    checks a count, not a set of ids - see :func:`_response_turn` - and a count only comes out
+    even if both halves are assembled in one place. A result nothing called (a plugin rewriting
+    history can leave one) still gets its own turn below, because dropping it would lose what a
+    tool reported.
     """
     contents: list[dict] = []
-    for message in messages:
+    paired: set[str] = set()
+    for index, message in enumerate(messages):
         if message.role == "user":
             parts = [{"inlineData": {"mimeType": img["media_type"], "data": img["data"]}} for img in message.images]
             parts.append({"text": message.text or "(empty)"})
@@ -90,12 +105,81 @@ def to_gemini_contents(messages: list[Message], call_names: dict[str, str]) -> l
                 call_names[call.id] = call.name
                 parts.append({"functionCall": {"name": call.name, "args": call.args}})
             contents.append({"role": "model", "parts": parts or [{"text": "…"}]})
+            responses = _response_turn(message, messages[index + 1:], paired)
+            if responses:
+                contents.append({"role": "user", "parts": responses})
         elif message.role == "tool":
-            contents.append({"role": "user", "parts": [
-                {"functionResponse": {"name": call_names.get(result.tool_call_id, "tool"),
-                                      "response": {"output": result.content, "error": result.is_error}}}
-                for result in message.tool_results]})
+            orphans = [result for result in message.tool_results if result.tool_call_id not in paired]
+            if orphans:
+                contents.append({"role": "user", "parts": [
+                    _response_part(call_names.get(result.tool_call_id, "tool"), result)
+                    for result in orphans]})
     return contents
+
+
+def _response_turn(assistant: Message, later: list[Message], paired: set[str]) -> list[dict]:
+    """The one user turn that answers ``assistant``'s calls, with stand-ins for the unanswered.
+
+    Gemini rejects a model turn whose ``functionCall`` parts outnumber the ``functionResponse``
+    parts of the turn after it - *"Please ensure that the number of function response parts is
+    equal to the number of function call parts of the function call turn"*, a 400 on every
+    subsequent request, not only the one that produced the gap. The loop appends the assistant
+    message when the model stops streaming and the results only once the whole batch has run, so
+    a ``KeyboardInterrupt`` in between (a batch can be one long shell command) ends the process
+    with the log in exactly that shape, and resuming it wedges the session behind a provider error
+    that names none of this.
+
+    Two things make this repair different from the OpenAI one in ``picoagent.core.provider``,
+    and both come from Gemini having no tool-call ids. A ``functionResponse`` is matched by
+    position and name, so the responses have to be *one turn* directly after the calls - a
+    stand-in in a turn of its own would leave the count of the following turn wrong, and add a
+    second user turn where the format allows one. And nothing can be matched afterwards, so the
+    pairing is done here, once, by walking the calls in order: ``paired`` tells the ``role: tool``
+    branch which results have already gone out so it cannot send them twice.
+
+    Results are looked for in every later message rather than only the one that should follow,
+    for the same reason core does it: a plugin that rewrites history can move a result, and
+    answering a call that *is* answered further down would put the same tool's output in twice.
+
+    The repair belongs here rather than in the session log, which goes on recording what actually
+    happened - a call with no result. This is one dialect's rule about a request body.
+    """
+    if not assistant.tool_calls:
+        return []
+    results = {result.tool_call_id: result for message in later for result in message.tool_results}
+    parts, missing = [], []
+    for call in assistant.tool_calls:
+        result = results.get(call.id)
+        if result is None:
+            missing.append(call)
+            parts.append(_stand_in_part(call))
+        else:
+            paired.add(call.id)
+            parts.append(_response_part(call.name, result))
+    if missing:
+        # Not a warning: this renders the same history on every turn for the rest of the session,
+        # so a warning would repeat until the user stopped reading it. `-v` shows it once per turn
+        # to whoever is asking why the model is talking about an unknown outcome.
+        log.info("answering %d interrupted tool call(s) for this request: %s",
+                 len(missing), ", ".join(call.name for call in missing))
+    return parts
+
+
+def _response_part(name: str, result: ToolResult) -> dict:
+    """What a tool actually reported, as the part Gemini pairs with a ``functionCall``."""
+    return {"functionResponse": {"name": name,
+                                 "response": {"output": result.content, "error": result.is_error}}}
+
+
+def _stand_in_part(call: ToolCall) -> dict:
+    """The answer to a call the log never recorded a result for.
+
+    No ``error`` key, unlike a real result. The field is a boolean and the outcome is not one:
+    ``false`` invites the model to build on work that may not exist, ``true`` invites it to retry
+    a command that may already have run. Gemini takes any JSON object as ``response``, so leaving
+    the field out says exactly as much as is known, and the text says the rest.
+    """
+    return {"functionResponse": {"name": call.name, "response": {"output": INTERRUPTED_TOOL_RESULT}}}
 
 
 class VertexProvider:

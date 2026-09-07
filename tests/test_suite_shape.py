@@ -12,6 +12,7 @@ import unittest
 TESTS = pathlib.Path(__file__).resolve().parent
 MAIN_BLOCK = re.compile(r'^if __name__ == "__main__":', re.M)
 CLASS_LINE = re.compile(r"^class ", re.M)
+RAW_MKDTEMP = re.compile(r"\btempfile\.mkdtemp\b")
 
 
 def test_files() -> list[pathlib.Path]:
@@ -44,6 +45,31 @@ class NothingIsDefinedBelowTheEntryPoint(unittest.TestCase):
         """The invariant above is vacuous for a file with no ``__main__`` block at all."""
         missing = [p.name for p in test_files() if not MAIN_BLOCK.search(p.read_text())]
         self.assertEqual(missing, [], "these files cannot be run directly")
+
+
+class TemporaryDirectoriesAreResolved(unittest.TestCase):
+    """``mkdtemp`` hands back the path as ``TMPDIR`` spells it, links included.
+
+    picoagent resolves the paths it reports, on purpose and in several places - the gate/tool
+    seam, the trust store's key, the evidence scanner's containment check. So an assertion
+    comparing something picoagent reported against a raw ``mkdtemp`` string compares two
+    spellings of one directory. It passes wherever ``TMPDIR`` has no link in it and fails
+    wherever it does, which on macOS is everywhere: ``mkdtemp`` returns ``/var/folders/...``
+    and ``/var`` is a symlink to ``/private/var``. Twenty-two assertions here did that.
+
+    ``helpers.temp_dir()`` resolves at the point the directory is made, which is the only place
+    the decision has to be taken once. This is a tripwire rather than a convention because the
+    failure it prevents is invisible on the machine the test is written on.
+
+    ``tempfile.TemporaryDirectory`` is deliberately not banned. Those sites own their cleanup
+    and use the directory as scratch space rather than comparing its path with a reported one,
+    and they pass under both shapes of ``TMPDIR`` today. The rule is *resolve a path before
+    comparing it*; if one of them ever compares, ``.resolve()`` belongs at that site.
+    """
+
+    def test_no_test_file_calls_mkdtemp_directly(self):
+        offenders = [path.name for path in test_files() if RAW_MKDTEMP.search(path.read_text())]
+        self.assertEqual(offenders, [], "use helpers.temp_dir() so the path is symlink-resolved")
 
 
 if __name__ == "__main__":

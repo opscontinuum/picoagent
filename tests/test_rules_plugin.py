@@ -5,12 +5,12 @@ must be shown and approved before its text can reach the model, and there must b
 (headless run, edited-after-approval, no matching glob) that slips text past that.
 """
 import json
-import tempfile
+import os
 import textwrap
 import unittest
 from pathlib import Path
 
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 
@@ -70,7 +70,7 @@ class HeadlessFrontend(CaptureFrontend):
 
 class RulesPluginTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / "a.py").write_text("print('hi')\n")
         (self.tmp / "a.ts").write_text("console.log('hi')\n")
 
@@ -249,7 +249,7 @@ class ProjectConfiguredDirectoryTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / "a.py").write_text("print('hi')\n")
         directory = self.tmp / "docs" / "rules"
         directory.mkdir(parents=True)
@@ -315,7 +315,7 @@ class DelegatedToolCallTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / "a.py").write_text("print('hi')\n")
         directory = self.tmp / "home" / "rules"
         directory.mkdir(parents=True, exist_ok=True)
@@ -354,6 +354,79 @@ class DelegatedToolCallTests(unittest.TestCase):
         order = [event for event, payload in rt.frontend.events
                  if event == "tool_result" or (event == "notice" and "rules applied" in payload["text"])]
         self.assertEqual(order, ["tool_result", "tool_result", "notice"])
+
+
+DIRECTORY_RULE = """---
+name: src-layout
+globs: src/*.py
+description: Conventions for the package itself, not for the tests beside it
+---
+DIRECTORY RULE BODY: the package keeps its imports at the top.
+"""
+
+
+class PathSpellingTests(unittest.TestCase):
+    """A rule fires on the file the tool opens, not on the string the model happened to write.
+
+    ``_relative`` resolved against the project and followed symlinks but did its own resolving,
+    so it drifted from ``resolve_tool_path`` in the two ways every hand-rolled resolver has
+    drifted from it: a leading ``@``, which models copy out of ``@file`` mentions, and a ``~``.
+    ``read`` opens the file in all of these spellings; the engine turned them into
+    ``"@src/main.py"`` and ``"~/src/main.py"`` and matched *those* against the globs.
+
+    The glob here is directory-scoped on purpose. A bare ``*.py`` hides the whole defect, because
+    ``fnmatch`` is also given the basename and ``@src/main.py`` still ends in ``.py`` - so the
+    rule fires for the wrong reason and a test written that way passes over the bug.
+
+    Nothing is bypassed by any of this: the handler returns ``None`` and blocks no call, so the
+    cost is a rule that quietly does not fire. Quietly is the problem. Guidance that is missing
+    looks exactly like guidance that did not apply, and the user cannot tell which they got.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        (self.tmp / "src").mkdir()
+        (self.tmp / "src" / "main.py").write_text("print('hi')\n")
+        rules = self.tmp / "home" / "rules"
+        rules.mkdir(parents=True)
+        (rules / "src-layout.md").write_text(DIRECTORY_RULE)
+        # `~` expands against HOME, and the file has to be somewhere the test owns.
+        self._old_home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.tmp)
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+
+    def _fires_on(self, event) -> bool:
+        """Did the rule reach the conversation after a turn making this one tool call?"""
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[event], [text("ok")]]),
+                          frontend=RecordingFrontend())
+        loader.load_plugin(PLUGINS / "rules", rt, loader.TrustStore(self.tmp / "home"),
+                           allow_untrusted=True)
+        run(AgentLoop(rt).run("look at it"))
+        return "DIRECTORY RULE BODY" in "\n".join(message.text or "" for message in rt.session.messages())
+
+    def test_a_plain_relative_path_fires_the_rule(self):
+        """The control: every spelling below names this same file."""
+        self.assertTrue(self._fires_on(call("read", path="src/main.py")))
+
+    def test_an_at_prefix_the_model_copied_from_a_mention_fires_it_too(self):
+        self.assertTrue(self._fires_on(call("read", path="@src/main.py")))
+
+    def test_a_home_relative_path_fires_it_too(self):
+        self.assertTrue(self._fires_on(call("read", path="~/src/main.py")))
+
+    def test_an_absolute_path_fires_it_too(self):
+        """Already worked, and stays working: the seam returns the same absolute path."""
+        self.assertTrue(self._fires_on(call("read", path=str(self.tmp / "src" / "main.py"))))
+
+    def test_a_home_relative_path_inside_a_shell_command_fires_it_too(self):
+        """The shell heuristic reads argument tokens, and ``~/x.py`` is one of the spellings a
+        person writes; dropping it there is the same miss one step earlier."""
+        self.assertTrue(self._fires_on(call("shell", command="cat ~/src/main.py")))
 
 
 if __name__ == "__main__":

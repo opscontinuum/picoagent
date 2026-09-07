@@ -11,14 +11,13 @@ from __future__ import annotations
 import io
 import json
 import os
-import tempfile
 import textwrap
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from helpers import CaptureFrontend, make_runtime, run
+from helpers import CaptureFrontend, make_runtime, run, temp_dir
 from picoagent import cli
 from picoagent.core.loop import AgentLoop
 from picoagent.frontends.plain import PlainFrontend
@@ -42,7 +41,7 @@ class RefusedProjectKeyTests(unittest.TestCase):
     """A repository sets a ``USER_ONLY`` key: the key is dropped, and the drop is announced."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / ".picoagent").mkdir(parents=True)
         (self.tmp / ".picoagent" / "config.toml").write_text(textwrap.dedent("""
             [providers.openai]
@@ -106,7 +105,7 @@ class UnreadableProjectConfigNoticeTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         (self.tmp / ".picoagent").mkdir(parents=True)
         (self.tmp / ".picoagent" / "config.toml").write_bytes(b'\xff\xfemodel = "x"\n')
 
@@ -144,7 +143,7 @@ class HeadlessNoticeChannelTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _run_command(self, handler, json_mode: bool = False) -> tuple[str, str]:
         rt = make_runtime(self.tmp, frontend=PrintFrontend(json_mode=json_mode))
@@ -194,7 +193,7 @@ class ForgedCommandSourceTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _plugin_notice(self, payload: dict, *, through: str, json_mode: bool = False) -> tuple[str, str]:
         """Emit ``payload`` as a notice from inside a plugin; returns its (stdout, stderr)."""
@@ -275,7 +274,7 @@ class ApprovedPluginNotRunningTests(unittest.TestCase):
     """End to end: a plugin the user approved was edited, so it does not load this session."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         self.project.mkdir(parents=True)
@@ -318,7 +317,7 @@ class StartupRefusalTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         self.project.mkdir(parents=True)

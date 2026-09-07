@@ -6,17 +6,16 @@ tool will refuse, where a relative path resolves against, and which file a not-y
 path under a symlink names.
 """
 import os
-import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import run, tool_ctx
+from helpers import run, tool_ctx, temp_dir
 from picoagent.core.tools import PathRefused, ReadTool, resolve_path, resolve_tool_path
 
 
 class SeamTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.project = self.tmp / "project"
         self.project.mkdir()
         self.cfg = {"_cwd": str(self.project)}

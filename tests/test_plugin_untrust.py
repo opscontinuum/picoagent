@@ -16,12 +16,11 @@ import argparse
 import io
 import json
 import os
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from helpers import ROOT, make_runtime  # noqa: F401  (ROOT puts picoagent on sys.path)
+from helpers import ROOT, make_runtime, temp_dir  # noqa: F401  (ROOT puts picoagent on sys.path)
 from picoagent import cli
 from picoagent.plugins import loader
 
@@ -42,7 +41,7 @@ class PluginUntrustTests(unittest.TestCase):
     """Drive ``plugin_command(untrust)`` against a trust store in a temp home."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.home = self.tmp / "home"
         self.project = self.tmp / "project"
         self.project.mkdir(parents=True)
@@ -233,6 +232,62 @@ class PluginUntrustTests(unittest.TestCase):
         self._run("untrust", str(root))
         data = json.loads((self.home / "trust.json").read_text())
         self.assertEqual([record["name"] for record in data.values()], ["keeper"])
+
+
+class ADamagedStoreIsNotAnEmptyOne(unittest.TestCase):
+    """``untrust`` has to tell "you have approved nothing" from "I could not read the file".
+
+    ``TrustStore`` fails closed on a ``trust.json`` it cannot parse: the store reads as empty so
+    the recovery commands still run, and the reason goes to the log. ``untrust`` then reported the
+    *parsed* store - "records nothing at all" - which is true of what it holds and false of the
+    file, and the file is what the user is about to go and look at. The two lines only added up
+    for someone who read both, and the log line is the one a user running a CLI command is least
+    likely to see. A command's own output has to be true on its own.
+
+    The distinction is load-bearing, not cosmetic: "you never approved anything" ends the
+    investigation, while "your approvals are unreadable" means every plugin is about to come back
+    as new and there is a damaged file to restore or delete.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.home = self.tmp / "home"
+        self.home.mkdir(parents=True)
+        self.store_path = self.home / "trust.json"
+
+    def _untrust(self) -> str:
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            cli.untrust_command("anything", loader.TrustStore(self.home))
+        return buffer.getvalue()
+
+    def test_a_store_that_cannot_be_parsed_is_not_reported_as_empty(self):
+        self.store_path.write_text('{"gate": {"fingerprint"')
+        self.assertNotIn("nothing at all", self._untrust())
+
+    def test_a_store_that_cannot_be_parsed_says_so_and_names_the_file(self):
+        self.store_path.write_text('{"gate": {"fingerprint"')
+        out = self._untrust()
+        self.assertIn(str(self.store_path), out)
+        self.assertIn("could not be read", out)
+
+    def test_a_store_that_is_json_but_not_approvals_is_reported_the_same_way(self):
+        """``_read`` refuses that shape for the same reason and by the same route."""
+        self.store_path.write_text('["gate"]')
+        self.assertIn("could not be read", self._untrust())
+
+    def test_a_store_that_is_genuinely_empty_still_says_so(self):
+        """The other half: the wording must not scare someone whose first run this is."""
+        out = self._untrust()
+        self.assertIn("nothing at all", out)
+        self.assertNotIn("could not be read", out)
+
+    def test_the_store_itself_says_which_of_the_two_happened(self):
+        """Asked of ``TrustStore``, so a second reader does not have to re-parse the file to
+        find out - and cannot disagree with the one that already did."""
+        self.assertFalse(loader.TrustStore(self.home).unreadable)
+        self.store_path.write_text("{oops")
+        self.assertTrue(loader.TrustStore(self.home).unreadable)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,9 @@
 """es-doctor plugin: log digging, metric queries, and log<->metric<->APM correlation
 against the fake Elasticsearch incident (errors + CPU + latency spike at 10:15-10:20)."""
-import statistics, tempfile, unittest
+import statistics, unittest
 from pathlib import Path
 import sys
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 from picoagent.testing.fake_es import FakeES
@@ -25,7 +25,7 @@ class EsDoctorBase(unittest.TestCase):
         cls.es.stop()
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.es.requests.clear()
         self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
         self.rt.cfg["plugins"]["es-doctor"] = {"url": self.es.url, "api_key": "abc123"}

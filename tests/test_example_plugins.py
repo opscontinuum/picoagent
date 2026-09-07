@@ -1,7 +1,7 @@
 """Behavioural tests for the example plugins, loaded through the real loader."""
-import tempfile, unittest
+import unittest
 from pathlib import Path
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.core.types import Message
 from picoagent.plugins import loader
@@ -15,7 +15,7 @@ def load(rt, name):
 
 class PermissionGateTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _rt(self, turns, answer=True):
         rt = make_runtime(self.tmp, provider=ScriptedProvider(turns), frontend=CaptureFrontend(answer=answer))
@@ -63,7 +63,7 @@ class PermissionGateTests(unittest.TestCase):
 
 class CompactionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_compact_command_summarises_and_keeps_recent(self):
         provider = ScriptedProvider([[text("SUMMARY OF OLD STUFF")]])
