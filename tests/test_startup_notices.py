@@ -16,9 +16,11 @@ import textwrap
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from helpers import CaptureFrontend, make_runtime, run
 from picoagent import cli
+from picoagent.core.loop import AgentLoop
 from picoagent.frontends.plain import PlainFrontend
 from picoagent.frontends.print import PrintFrontend
 from picoagent.plugins import loader
@@ -30,6 +32,9 @@ entry = "gate:register"
 version = "0.1.0"
 description = "refuses dangerous commands"
 """
+
+REQUIRED_TOML = PLUGIN_TOML + ('required = true\n'
+                               'required_reason = "the only check on destructive commands"\n')
 
 
 class RefusedProjectKeyTests(unittest.TestCase):
@@ -60,12 +65,19 @@ class RefusedProjectKeyTests(unittest.TestCase):
             run(cli.warn_about_ignored_project_keys(rt))
         self.assertIn("providers", out.getvalue())
 
-    def test_a_headless_prompt_run_prints_it(self):
+    def test_a_headless_prompt_run_prints_it_on_stderr(self):
+        """In `-p` the answer owns stdout, so a warning about the repository goes beside it.
+
+        Interleaved with the model's reply, the sentence lands in the bytes a caller captured and
+        parsed, corrupting the answer and hiding the warning inside it. `_report_skipped` already
+        puts the comparable message on stderr, where a person still reads it and a pipe does not.
+        """
         rt = self._runtime(PrintFrontend(json_mode=False))
-        out = io.StringIO()
-        with redirect_stdout(out):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
             run(cli.warn_about_ignored_project_keys(rt))
-        self.assertIn("providers", out.getvalue())
+        self.assertIn("providers", err.getvalue())
+        self.assertEqual(out.getvalue(), "", "stdout carries the answer and nothing else")
 
     def test_a_json_run_carries_the_dropped_keys_as_data(self):
         rt = self._runtime(PrintFrontend(json_mode=True))
@@ -80,6 +92,56 @@ class RefusedProjectKeyTests(unittest.TestCase):
         rt = self._runtime(CaptureFrontend())
         run(cli.warn_about_ignored_project_keys(rt))
         self.assertEqual(rt.frontend.events, [])
+
+
+class HeadlessNoticeChannelTests(unittest.TestCase):
+    """Which channel a `notice` takes in `-p`, given that one event name carries two things.
+
+    A slash command's whole output arrives as a notice, and so does every advisory a plugin or the
+    startup path writes. The first is what the caller asked the run to produce, so it belongs on
+    stdout; the second is commentary about the session, so it belongs on stderr with the rest of
+    the diagnostics. The loop marks the command case at the point where it knows.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def _run_command(self, handler, json_mode: bool = False) -> tuple[str, str]:
+        rt = make_runtime(self.tmp, frontend=PrintFrontend(json_mode=json_mode))
+        rt.commands.register("where", handler, "prints a thing")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            run(AgentLoop(rt).handle_input("/where"))
+        return out.getvalue(), err.getvalue()
+
+    def test_a_slash_command_output_is_the_answer_and_stays_on_stdout(self):
+        """`picoagent -p "/model list" > out` has to put the listing in the file it was sent to."""
+        async def handler(args, rt):
+            return "provider: scripted"
+
+        out, err = self._run_command(handler)
+        self.assertIn("provider: scripted", out)
+        self.assertEqual(err, "")
+
+    def test_a_plugin_advisory_is_not_the_answer_and_goes_to_stderr(self):
+        """An unmarked notice is commentary until proven otherwise, so stdout stays clean."""
+        rt = make_runtime(self.tmp, frontend=PrintFrontend(json_mode=False))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            run(rt.frontend.emit("notice", {"text": "cache rebuilt"}))
+        self.assertIn("cache rebuilt", err.getvalue())
+        self.assertEqual(out.getvalue(), "", "stdout carries the answer and nothing else")
+
+    def test_a_json_run_keeps_every_notice_on_stdout_as_data(self):
+        """`--json` is one stream of records; splitting it across two files would break parsing."""
+        async def handler(args, rt):
+            return "provider: scripted"
+
+        out, err = self._run_command(handler, json_mode=True)
+        records = [json.loads(line) for line in out.splitlines() if line.strip()]
+        notices = [record for record in records if record["event"] == "notice"]
+        self.assertEqual([record["text"] for record in notices], ["provider: scripted"])
+        self.assertEqual(err, "")
 
 
 def _notice(name: str, reason: str, text: str, urgent: bool = False) -> loader.Notice:
@@ -158,6 +220,75 @@ class ApprovedPluginNotRunningTests(unittest.TestCase):
         self.assertEqual(len(urgent), 1, f"no urgent event in the stream: {records}")
         self.assertEqual(urgent[0]["name"], "gate")
         self.assertIn("CHANGED since you approved it", urgent[0]["text"])
+
+
+class StartupRefusalTests(unittest.TestCase):
+    """When the loader refuses to start a session, the user gets a line rather than a stack trace.
+
+    Both refusals carry a complete message: what happened, which plugin or file it concerns, and
+    the command that ends it. Uncaught, that sentence arrived wrapped in frames from a module the
+    user never called, which reads as picoagent breaking rather than picoagent refusing.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.project = self.tmp / "project"
+        self.project.mkdir(parents=True)
+        os.environ["PICOAGENT_HOME"] = str(self.home)
+
+    def _refuse(self) -> tuple[int, str]:
+        args = cli.build_parser().parse_args(["-p", "hello", "-C", str(self.project)])
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            cli.build_runtime_or_refuse(args)
+        return caught.exception.code, err.getvalue()
+
+    def _approved_then_edited(self) -> None:
+        """A required plugin the user approved, whose code has since been replaced."""
+        root = self.home / "plugins" / "gate"
+        root.mkdir(parents=True)
+        (root / "plugin.toml").write_text(REQUIRED_TOML)
+        (root / "gate.py").write_text("def register(api):\n    pass\n")
+        loader.TrustStore(self.home).trust(Manifest.load(root))
+        (root / "gate.py").write_text("def register(api):\n    import os\n")
+
+    def test_a_required_plugin_that_changed_stops_the_session_without_a_traceback(self):
+        self._approved_then_edited()
+        code, printed = self._refuse()
+        self.assertEqual(code, cli.EXIT_REQUIRED_PLUGIN)
+        self.assertNotIn("Traceback", printed)
+
+    def test_the_refusal_names_the_plugin_and_how_to_get_the_session_back(self):
+        self._approved_then_edited()
+        printed = self._refuse()[1]
+        self.assertIn("gate", printed)
+        self.assertIn("plugin trust", printed)
+
+    def test_the_user_is_told_once_rather_than_twice(self):
+        """The notice `load_all` had already worded says the plugin's checks are "off for this
+        session", which is written for a session that then continues. Printed above a line saying
+        the session is not starting, it contradicts it, so only the refusal is shown."""
+        self._approved_then_edited()
+        printed = self._refuse()[1]
+        self.assertNotIn("off for this session", printed)
+        self.assertEqual(printed.count("picoagent:"), 1)
+
+    def test_a_spec_whose_layer_is_unknown_exits_on_its_own_code(self):
+        """A different problem with a different answer - fix a file, rather than review code
+        somebody replaced - so a wrapper can tell the two apart without reading the sentence."""
+        def refuse(*_args, **_kwargs):
+            raise loader.PluginProvenanceError("cannot tell which config layer these specs came from")
+
+        with mock.patch.object(cli.loader, "load_all", refuse):
+            code, printed = self._refuse()
+        self.assertEqual(code, cli.EXIT_PLUGIN_PROVENANCE)
+        self.assertIn("which config layer", printed)
+
+    def test_neither_code_collides_with_success_a_plain_failure_or_a_usage_error(self):
+        """0, 1 and 2 are already spoken for, and a wrapper that cannot tell a security refusal
+        from a bad `-r` path is back to matching on English."""
+        self.assertEqual(len({cli.EXIT_REQUIRED_PLUGIN, cli.EXIT_PLUGIN_PROVENANCE, 0, 1, 2}), 5)
 
 
 if __name__ == "__main__":

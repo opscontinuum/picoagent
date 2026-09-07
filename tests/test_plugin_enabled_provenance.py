@@ -346,9 +346,70 @@ class ShadowedOnlyWhenTheUsersCopyIsRunning(ProjectSpecFixture):
         text = next(n.text for n in self._load().notices if n.root == project_copy)
         self.assertNotIn("MOVED", text)
 
-    def test_a_repository_copy_the_user_never_approved_is_urgent(self):
+    def test_the_users_own_copy_is_the_urgent_one(self):
+        """The plugin that stopped running is the one the user was relying on."""
         self._break_the_users_copy()
-        self.assertEqual([n.name for n in self._load().urgent()], ["gate", "gate"])
+        self.assertEqual([(n.name, n.root) for n in self._load().urgent()],
+                         [("gate", self.user_checkout)])
+
+    def test_the_repository_copy_is_announced_as_one_the_user_never_approved(self):
+        """An approval covers a directory, and this is not the directory the user approved.
+
+        It shares a name with their plugin and nothing else. Reporting it as "not the version
+        you approved" credits a repository's own checkout with an approval it never had, and
+        buries the notice that matters - their copy, at their path, not running - under a
+        second alarm about a copy that was never going to run in the first place.
+        """
+        self._break_the_users_copy()
+        project_copy = self.project / ".picoagent" / "plugins" / "gate"
+        notice = next(n for n in self._load().notices if n.root == project_copy)
+        self.assertEqual(notice.reason, "new")
+
+
+class ASpecThatIsNotAString(unittest.TestCase):
+    """One committed line of the wrong type must not be the end of every session in a project.
+
+    The two lists stop lining up: `project_enabled` drops non-strings, `load_config` keeps them.
+    So the membership fallback attributed the stray value to the *user* layer - the layer that
+    may write into `~/.picoagent/plugins` - and `discover` then handed it to `resolve_source`,
+    where matching a bool against the git-spec pattern raises a `TypeError` its catch list does
+    not name. `enabled = [true]` in a cloned repository killed every session in it.
+
+    A spec is a string that names a plugin. A value that is not one names nothing, so there is
+    nothing to resolve and nothing to attribute: it is a malformed config, which is an expected
+    failure, and the specs around it are still placed.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.project = self.tmp / "project"
+        (self.project / ".picoagent").mkdir(parents=True)
+        os.environ["PICOAGENT_HOME"] = str(self.home)
+        self._write_project('enabled = [true]\n')
+
+    def _write_project(self, body: str) -> None:
+        (self.project / ".picoagent" / "config.toml").write_text(f"[plugins]\n{body}")
+
+    def test_a_session_in_that_repository_still_starts(self):
+        cfg = load_config(self.project)
+        rt = Runtime(cfg, self.project, Session(self.project / "session.jsonl", self.project))
+        rt.frontend = CaptureFrontend()
+        self.assertEqual(loader.load_all(rt).loaded, [])
+
+    def test_the_value_never_reaches_the_resolver(self):
+        """Resolving is a clone and a checkout, so nothing unplaceable may get that far."""
+        self.assertEqual(loader.discover(load_config(self.project), []), [])
+
+    def test_a_stray_value_is_not_attributed_to_a_layer_at_all(self):
+        self.assertEqual(loader.enabled_by_layer(load_config(self.project)), [])
+
+    def test_the_specs_around_it_are_still_placed(self):
+        (self.home / "config.toml").write_text('[plugins]\nenabled = ["./mine"]\n')
+        self._write_project('enabled = [true, "./theirs"]\n')
+        self.assertEqual(loader.enabled_by_layer(load_config(self.project)),
+                         [("./mine", "user"), ("./theirs", "project")])
 
 
 if __name__ == "__main__":

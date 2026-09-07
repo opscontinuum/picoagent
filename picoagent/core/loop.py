@@ -92,9 +92,7 @@ class AgentLoop:
         rt = self.rt
         parsed = rt.commands.parse(text)
         if parsed:
-            notice = await self._run_command(*parsed)
-            if notice:
-                await rt.frontend.emit("notice", {"text": notice})
+            await self._run_command(*parsed)
             return
 
         event = await rt.events.emit("input", {"text": text, "images": images or [], "action": "continue"}, rt)
@@ -108,22 +106,54 @@ class AgentLoop:
         prompt = rt.skills.expand(event["text"])
         await self.run(prompt if prompt is not None else event["text"], event["images"], carried)
 
-    async def _run_command(self, command: Command, args: str) -> str | None:
-        """Run one slash command, turning any exception into an error the user is shown.
+    async def _run_command(self, command: Command, args: str) -> None:
+        """Run one slash command and show what it returned, reporting any failure to the user.
 
         Commands were the last plugin call-in without a catch: events and tools already have
         one, so a handler that raised unwound through here into ``PlainFrontend.run``, which
         stops at ``KeyboardInterrupt`` only. One broken ``/command`` ended the REPL and took
         the session with it. Reporting it leaves the user at a prompt with the rest of the
         session intact, which is the same trade ``_invoke`` makes for a tool that raises.
+
+        Showing the output belongs inside that catch, because a handler is as likely to return
+        the wrong type as to raise. A returned dict reached ``PlainFrontend._print``, which on a
+        colour terminal concatenates the text onto its escape codes, and the resulting TypeError
+        unwound to exactly where a raise used to. The type is checked here rather than left to
+        the frontend so the message names the plugin's mistake instead of describing string
+        concatenation, and so every frontend is handed the ``str`` its contract promises.
+
+        ``KeyboardInterrupt`` and ``CancelledError`` do not derive from ``Exception`` and so keep
+        travelling: the user asking to stop, and the loop being torn down, are not plugin bugs.
         """
         try:
-            return await command.handler(args, self.rt)
+            notice = await command.handler(args, self.rt)
+            if notice is None:
+                return
+            if not isinstance(notice, str):
+                raise TypeError(f"handler returned {type(notice).__name__}, expected str or None")
+            await self._tell_user("notice", {"text": notice, "source": "command"})
         except Exception as exc:  # noqa: BLE001 - plugin code is untrusted; the session outlives it
             log.exception("command /%s failed", command.name)
-            await self.rt.frontend.emit(
+            await self._tell_user(
                 "error", {"text": f"/{command.name} failed: {type(exc).__name__}: {exc}"})
-            return None
+
+    async def _tell_user(self, event: str, payload: dict) -> None:
+        """Emit to the frontend if one is attached. For paths that are not allowed to raise.
+
+        ``rt.frontend`` is ``None`` until the CLI or a frontend plugin sets it, and an embedder
+        that drives commands without a UI never sets it. Reporting a contained failure straight
+        through it raised ``AttributeError`` out of the one branch whose job is keeping the
+        session alive, so the containment became the thing it was preventing.
+
+        The streaming path deliberately does not use this. There a missing frontend means the
+        answer is going nowhere, which is the caller's bug and should say so loudly rather than
+        run a whole model turn into silence.
+        """
+        frontend = self.rt.frontend
+        if frontend is None:
+            log.warning("no frontend attached, dropping %s: %s", event, payload.get("text", ""))
+            return
+        await frontend.emit(event, payload)
 
     # ------------------------------------------------------------------ one prompt
     async def run(self, prompt: str, images: list[dict] | None = None,
@@ -149,7 +179,14 @@ class AgentLoop:
             rt._busy = False
 
     async def _prepare(self, prompt: str, images: list[dict], carried: list[str]) -> str:
-        """Build the system prompt, let plugins adjust it, and record the messages this prompt sends."""
+        """Build the system prompt, let plugins adjust it, and record the messages this prompt sends.
+
+        Every user-role message that goes to the model is announced, not only the one the user
+        typed. Text a plugin injected or queued spoke to the model in the user's voice while the
+        transcript showed nothing, so a person reading along could not tell which of their
+        instructions were theirs. ``kind`` says whose words these are, and a frontend that does
+        not care ignores the field exactly as it ignored the extra messages.
+        """
         rt = self.rt
         system = rt.prompt.build()
         skills = rt.skills.prompt_section()
@@ -159,10 +196,12 @@ class AgentLoop:
                                      {"prompt": prompt, "system_prompt": system, "message": None}, rt)
         if event.get("message"):
             rt.session.append_message(Message(role="user", text=event["message"], meta={"custom_type": "injected"}))
+            await rt.frontend.emit("user_message", {"text": event["message"], "kind": "injected"})
         for queued in carried:
             rt.session.append_message(Message(role="user", text=queued, meta={"custom_type": "queued"}))
+            await rt.frontend.emit("user_message", {"text": queued, "kind": "queued"})
         rt.session.append_message(Message(role="user", text=prompt, images=images))
-        await rt.frontend.emit("user_message", {"text": prompt})
+        await rt.frontend.emit("user_message", {"text": prompt, "kind": "typed"})
         return event["system_prompt"]
 
     async def _turns(self, system: str) -> None:
@@ -187,7 +226,9 @@ class AgentLoop:
             await rt.events.emit("turn_end", {"turn": turn, "message": assistant, "tool_results": results}, rt)
             steer = rt.take_queued("steer")
             if steer:
-                rt.session.append_message(Message(role="user", text="\n".join(steer)))
+                steered = "\n".join(steer)
+                rt.session.append_message(Message(role="user", text=steered))
+                await rt.frontend.emit("user_message", {"text": steered, "kind": "queued"})
 
     # ------------------------------------------------------------------ model call
     async def _model_turn(self, system: str) -> Message | None:

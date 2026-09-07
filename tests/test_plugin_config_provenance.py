@@ -12,6 +12,8 @@ merged silently and passes on the code that keeps the layers apart.
 """
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 import tempfile
 import textwrap
@@ -382,15 +384,8 @@ class RequiredPluginTests(LayeredConfigCase):
         self.assertIn("guarding the shell", str(caught.exception))
 
 
-class RequiredInTheManifestTests(LayeredConfigCase):
-    """`required = true` in plugin.toml: the same declaration, readable without running anything.
-
-    `api.declare_required` is a statement made from inside `register()`, so it cannot cover the
-    case it most needs to. A plugin the trust check refuses is skipped *before* `load_plugin`
-    runs: `register()` never executes, the declaration never happens, and the session carries on
-    with the control absent. A trusted credential-guard with one file edited left the built-in
-    shell in place and said so on one line of stderr.
-    """
+class RequiredPluginFixture(LayeredConfigCase):
+    """A plugin that declares itself required, installed where the user's own plugins live."""
 
     def user_plugins(self) -> Path:
         return self.tmp / "home" / "plugins"
@@ -414,6 +409,16 @@ class RequiredInTheManifestTests(LayeredConfigCase):
     def load(self, extra: list[str] | None = None):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
         return loader.load_all(rt, extra_paths=extra or [])
+
+class RequiredInTheManifestTests(RequiredPluginFixture):
+    """`required = true` in plugin.toml: the same declaration, readable without running anything.
+
+    `api.declare_required` is a statement made from inside `register()`, so it cannot cover the
+    case it most needs to. A plugin the trust check refuses is skipped *before* `load_plugin`
+    runs: `register()` never executes, the declaration never happens, and the session carries on
+    with the control absent. A trusted credential-guard with one file edited left the built-in
+    shell in place and said so on one line of stderr.
+    """
 
     def test_a_required_plugin_replaced_since_approval_stops_the_session(self):
         root = self.write(self.user_plugins())
@@ -479,6 +484,149 @@ class RequiredInTheManifestTests(LayeredConfigCase):
         self.edit(root)
         report = self.load()
         self.assertEqual([entry[:2] for entry in report.skipped], [("guard", "changed")])
+
+
+class TheIdentityOfAnApproval(RequiredPluginFixture):
+    """What a trust record is a record *of*, when the plugin's own name is under suspicion.
+
+    Keyed by the name in `plugin.toml`, an approval is only as durable as a field the replacing
+    code gets to rewrite. Change the name and the same directory reads as a plugin nobody has
+    ever seen: `new` rather than `changed`, a notice rather than a stop, and the requirement the
+    store recorded so it could not be deleted is answered by a record nothing looks up. Nobody
+    needs local access for it; a `fast_forward` onto a rewritten upstream does it.
+    """
+
+    def rename(self, root: Path, name: str) -> None:
+        """Replace the plugin in place: other code, under another name, same directory."""
+        (root / "guard.py").unlink()
+        (root / f"{name}.py").write_text("def register(api):\n    pass  # not what was approved\n")
+        (root / "plugin.toml").write_text(f'name = "{name}"\nentry = "{name}:register"\n')
+
+    def test_a_renamed_replacement_is_still_the_approved_plugin_having_changed(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.rename(root, "guard2")
+        self.assertEqual(loader.TrustStore(self.tmp / "home").status(Manifest.load(root)), "changed")
+
+    def test_a_rename_does_not_disarm_the_recorded_requirement(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.rename(root, "guard2")
+        with self.assertRaises(loader.RequiredPluginError) as caught:
+            self.load()
+        self.assertIn("guarding the shell", str(caught.exception))
+
+    def test_a_second_copy_of_a_plugin_is_a_separate_approval(self):
+        """Two checkouts may share a name; approving one is not approving the other."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        other = self.write(self.tmp / ".picoagent" / "plugins")
+        self.assertEqual(loader.TrustStore(self.tmp / "home").status(Manifest.load(other)), "new")
+        self.assertEqual(loader.TrustStore(self.tmp / "home").status(Manifest.load(root)), "trusted")
+
+    def test_an_approval_recorded_by_an_older_version_still_trusts_the_plugin(self):
+        """Records written before the key changed name nothing else; they must keep working."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        self.as_an_older_version_wrote_it()
+        self.assertEqual([m.name for m in self.load().loaded], ["guard"])
+
+    def as_an_older_version_wrote_it(self) -> None:
+        """Rewrite the store the way it was written before a record said which directory it covers."""
+        path = self.tmp / "home" / "trust.json"
+        data = json.loads(path.read_text())
+        path.write_text(json.dumps(
+            {record["name"]: {k: v for k, v in record.items() if k not in ("name", "root")}
+             for record in data.values()}))
+
+
+class ARecordedRequirementWithNothingBehindIt(RequiredPluginFixture):
+    """A requirement the user approved, and a directory that no longer answers for it.
+
+    `required` stops a session when approved code has been replaced. Deleting the code instead
+    of replacing it reached the same end by a quieter route: nothing loads, nothing is reported,
+    and the control the user was relying on is absent. The store is the only party that still
+    remembers the plugin was meant to be there.
+    """
+
+    def test_a_required_plugin_that_vanished_stops_the_session(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        shutil.rmtree(root)
+        with self.assertRaises(loader.RequiredPluginError) as caught:
+            self.load()
+        self.assertIn("guarding the shell", str(caught.exception))
+
+    def test_the_refusal_names_the_directory_the_plugin_was_approved_in(self):
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        shutil.rmtree(root)
+        with self.assertRaises(loader.RequiredPluginError) as caught:
+            self.load()
+        self.assertIn(str(root), str(caught.exception))
+
+    def test_a_required_plugin_whose_manifest_stopped_parsing_stops_the_session(self):
+        """Not loading is the same absence as not being there, and the store knows both."""
+        root = self.write(self.user_plugins())
+        self.approve(root)
+        (root / "plugin.toml").write_text("name = \n")
+        with self.assertRaises(loader.RequiredPluginError):
+            self.load()
+
+    def test_a_plugin_that_never_declared_itself_required_may_vanish_quietly(self):
+        root = self.write(self.user_plugins(), required="")
+        self.approve(root)
+        shutil.rmtree(root)
+        self.assertEqual(self.load().loaded, [])
+
+    def test_a_requirement_recorded_for_a_repositorys_copy_does_not_stop_the_session(self):
+        """`required` in a repository's plugin.toml is not a switch that stops the user's work."""
+        root = self.write(self.tmp / ".picoagent" / "plugins")
+        self.approve(root)
+        shutil.rmtree(root)
+        self.assertEqual(self.load().loaded, [])
+
+
+class AnImportThatFailsBeforeRegister(RequiredPluginFixture):
+    """The case between a refused trust check and a `register()` that raises.
+
+    `required` was read from the manifest after the entry module had already been imported, so
+    an import that failed reached the generic catch and was reported as a routine skip: not
+    urgent, "run with --verbose". A dependency uninstalled from the environment removes a
+    security control exactly as thoroughly as editing its code does.
+    """
+
+    BROKEN = """
+        import a_module_this_environment_does_not_have  # noqa: F401
+
+
+        def register(api):
+            pass
+    """
+
+    def test_a_required_plugin_that_cannot_be_imported_stops_the_session(self):
+        root = self.write(self.tmp / "cli", body=self.BROKEN)
+        with self.assertRaises(loader.RequiredPluginFailed) as caught:
+            self.load(extra=[str(root)])
+        self.assertIn("guarding the shell", str(caught.exception))
+
+    def test_the_refusal_names_what_the_import_could_not_find(self):
+        root = self.write(self.tmp / "cli", body=self.BROKEN)
+        with self.assertRaises(loader.RequiredPluginFailed) as caught:
+            self.load(extra=[str(root)])
+        self.assertIn("a_module_this_environment_does_not_have", str(caught.exception))
+
+    def test_a_dependency_that_disappeared_after_approval_stops_the_session(self):
+        """The real shape of it: approved code, unchanged, in an environment that moved."""
+        root = self.write(self.user_plugins(), body=self.BROKEN)
+        self.approve(root)
+        with self.assertRaises(loader.RequiredPluginFailed):
+            self.load()
+
+    def test_a_plugin_that_says_nothing_is_still_skipped_when_it_cannot_be_imported(self):
+        root = self.write(self.tmp / "cli", required="", body=self.BROKEN)
+        report = self.load(extra=[str(root)])
+        self.assertEqual([entry[:2] for entry in report.skipped], [("guard", "failed")])
 
 
 if __name__ == "__main__":

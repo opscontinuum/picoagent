@@ -1,6 +1,7 @@
 """Headless frontends for scripting and CI.
 
-* ``PrintFrontend()``          - ``picoagent -p "..."``: streams the answer to stdout.
+* ``PrintFrontend()``          - ``picoagent -p "..."``: streams the answer to stdout, and
+  everything that is not the answer to stderr, so a caller can redirect one and read the other.
 * ``PrintFrontend(json=True)`` - ``--json``: one JSON object per event on stdout, so other
   programs can consume the full trace (tool calls, results, errors).
 
@@ -31,9 +32,16 @@ class PrintFrontend:
         elif event == "assistant_end":
             sys.stdout.write("\n")
         elif event == "notice":
-            # A slash command's whole output is a notice; without this, `-p "/model list"`
-            # (and every other command) printed nothing at all in non-JSON mode.
-            sys.stdout.write(payload["text"] + "\n"); sys.stdout.flush()
+            # One event name carries two different things, so the channel is chosen per notice.
+            # A slash command's whole output is a notice, and it is what `-p "/model list"` was
+            # asked to produce, so it goes to stdout with the answer; without that, every command
+            # printed nothing at all in non-JSON mode. Anything else is commentary about the
+            # session (a startup warning, a plugin's own advisory) and on stdout it lands inside
+            # the bytes the caller captured and parsed, so it goes to stderr with the rest of the
+            # diagnostics, where a person still reads it and a pipe does not. Unmarked means
+            # commentary: a plugin has to say a notice is the answer before it can displace one.
+            stream = sys.stdout if payload.get("source") == "command" else sys.stderr
+            stream.write(payload["text"] + "\n"); stream.flush()
         elif event == "error":
             sys.stderr.write(payload["text"] + "\n")
 

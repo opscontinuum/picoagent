@@ -63,6 +63,9 @@ Worth knowing:
   relatively. The rewrite covers the files at the top of your plugin directory.
 * Every file in the directory is part of the trust fingerprint, so a change to any of them
   sends users back to the trust prompt, not only a change to the entry module.
+* An approval covers the directory the code was read from. Renaming your plugin is a change
+  like any other change, not a fresh start: users see "this changed" rather than "here is
+  something new". Two checkouts of your plugin get an approval each.
 
 ## If being skipped is not acceptable
 
@@ -77,10 +80,19 @@ required = true
 required_reason = "this session's only check on destructive commands"
 ```
 
-Read before any of your code runs, so it covers the case a runtime call cannot: a plugin the
-trust check refuses never reaches `register()`. With it set, a copy the user approved and that
-has since been replaced by different code stops the session instead of being announced, and so
-does a `register()` that raises.
+Read before any of your code runs, so it covers the cases a runtime call cannot: a plugin the
+trust check refuses never reaches `register()`, and neither does one whose entry module will
+not import. With it set, four things stop the session instead of being announced:
+
+* a copy the user approved that has since been replaced by different code,
+* the same replacement carrying a different `name` in its `plugin.toml`, because the approval
+  covers the directory rather than the name written in it,
+* an import that raises, including a dependency that left the environment after approval,
+* your plugin no longer being there at all, if the user had approved it in their own
+  `~/.picoagent/plugins`. The requirement is recorded when they approve, so it outlives the
+  directory that stated it, and a deleted checkout is as absent as a replaced one.
+
+A `register()` that raises stops the session too.
 
 Two things it deliberately does not do. A **first run**, before the user has ever approved you,
 is announced loudly and left to continue: install-then-run is the normal path, and being fatal
@@ -122,7 +134,11 @@ api.register_frontend(MyTUI())                                          # replac
 ```
 
 A command handler that raises is logged and shown to the user as `/deploy failed: ...`; the
-session stays up. Return a string for the normal case, since that is what the user is shown.
+session stays up. Return a string for the normal case, since that is what the user is shown, or
+`None` for a command that has nothing to say. Returning any other type is a bug and is reported
+the same way as a raise, because a frontend is handed that value to render: the plain REPL
+concatenates it onto its colour codes, and the TypeError from a returned dict used to end the
+session, which is the outcome the catch exists to prevent.
 
 **Change how the model is called**
 
@@ -140,6 +156,17 @@ api.send_message("Focus on the tests", deliver_as="steer")   # steer | follow_up
 ok = await api.ui.ask("confirm", "Delete build/?")            # confirm | select | input
 await api.ui.emit("notice", {"text": "done"})
 ```
+
+`send_message` text arrives as a user-role message, so the model reads it as the person's own
+words. It is announced to the frontend as `user_message` with `kind: "queued"` (`"injected"` for
+text returned from `before_agent_start`, `"typed"` for what the user actually wrote), so a
+transcript can show who said what instead of an instruction nobody gave appearing as theirs.
+
+A `notice` is the one frontend event that carries two different things: a slash command's output,
+and commentary about the session. In `picoagent -p "..."` stdout is the answer channel, which a
+caller redirects and parses, so only a command's own output goes there and a plain
+`api.ui.emit("notice", ...)` goes to stderr with the other diagnostics. The REPL prints both the
+same way, and `--json` puts both on stdout as events, since that stream is the whole trace.
 
 | `deliver_as` | The message arrives |
 |---|---|

@@ -94,6 +94,12 @@ The fix is that a spec carries the layer that wrote it as far as the directory i
   `PluginProvenanceError` instead of picking one. An unreadable file used to arrive as an empty
   repository list, which put every spec in the *user* layer and so switched the off-limits check
   off: the config nobody could read got the privilege that reading it was meant to decide.
+* An entry that is not a string names no plugin, so `enabled_by_layer` drops it and logs which
+  files to check. It used to be carried: the repository's list dropped such entries and the
+  merged list kept them, so the two no longer lined up, the membership rule handed the stray
+  value to the *user* layer, and `resolve_source` matched a bool against the git-spec pattern
+  and raised a `TypeError` nothing caught. `enabled = [true]` committed to a repository ended
+  every session opened in it. A malformed config is reported; the specs around it still place.
 * A repository's spec clones into `<project>/.picoagent/plugins/`. The user's plugin directory
   is off limits to it, compared after resolving symlinks so a `.picoagent/plugins` symlink
   committed in the repository does not get there either, and a checkout directory name that is
@@ -117,6 +123,16 @@ the wording, and whether it is `urgent`, meaning a plugin the user approved is n
 | `changed`, files edited in place | CHANGED since you approved it and NOT LOADED, whatever it enforces is off | yes |
 | `changed`, checkout on a different commit | MOVED to a revision you have not approved (`old -> new`), you did not edit it, check `[plugins].enabled` in both configs | yes |
 | `shadowed`, a repository offers a name the user's own loaded copy already provides | the repository's copy did not load and yours is the one running | no |
+| `missing`, a plugin approved as required is no longer running from the directory it was approved in | you approved this as REQUIRED and nothing loaded from that directory | yes |
+
+An approval covers the **directory** the code was read from, not the name written inside it.
+Keyed by name, an approval was only as durable as a field the replacing code also gets to
+write: changing `name` in the replaced `plugin.toml` made the same directory read as `new`
+rather than `changed`, so the enforcement below never fired and the requirement recorded at
+approval was answered by a record nothing looked up. `fast_forward` does that move without
+anyone touching the machine. Two checkouts sharing a name get an approval each; a record from
+a version that stored no directory is still honoured for the plugin of that name, and
+re-approving gives it one.
 
 `changed` splits on the commit in the trust record: nobody arrives at a different commit by
 editing a file, so "something moved your checkout" and "you edited this yourself" are separable
@@ -149,7 +165,7 @@ took a decision from it that a repository must not make - each confirmed by exec
 | A repo set | What happened |
 |---|---|
 | `[plugins.grok-provider] base_url` | Only the URL. The `api_key` beside it was still the user's, and went to the repo author's host on the first turn. Same for `[plugins.es-doctor] url` and the vertex provider's OAuth token |
-| `[plugins.mcp.servers.x] command` | Spawned at session start with the user's environment, before the first prompt and outside the trust store that gates every other way a repository gets code to run |
+| `[plugins.mcp.servers.x] command` | Spawned at session start, before the first prompt and outside the trust store that gates every other way a repository gets code to run. The child inherited the user's whole environment too; it now starts from a minimal allowlist, and a server entry's own `pass_env` names by hand anything else it may see |
 | `[plugins.permission-gate] mode = "yolo"` | The confirmation prompt the user installed the plugin for, switched off by the repository it was meant to guard against |
 | `[plugins.credential-guard] extra_allow_env` | Named variables the shell tool may expose. `DATABASE_URL` is not secret-shaped, so nothing else stopped it |
 
@@ -173,14 +189,23 @@ It may not choose a destination, a command, or a permission.
 | mcp | `timeout`, `startup_timeout` | `servers` |
 | permission-gate | `protected` (added to the user's list, never replacing it) | `mode`, `dangerous` |
 | credential-guard | `extra_deny_patterns` (added; it only refuses more) | `extra_allow_env` |
+| rules | `dirs` (a place to look, never a decision - see below) | `max_rules_per_turn` |
+| iscp-author | nothing | `answers`, `output` |
+| stig-runner | nothing | `interactive` |
 | grok-provider, vertex-provider | nothing | everything |
 
-One behaviour changed for `rules`, which had already spotted this hole and defended against it
-by treating *any* configured directory as repository-supplied and fingerprint-gating the text
-before it reaches the prompt. It reads `dirs` through `plugin_config()`, so a `dirs` entry set by
-a **repository's** config is no longer discovered at all. The hardcoded `.picoagent/rules/` path
-is unaffected, and that is where a repository's rules are meant to live; a repository that wants
-another directory read now has to move the files. `dirs` in the user's own config still works.
+`rules` is the plugin that takes a directory from a repository, and it is worth saying why that
+is not a hole. It had already spotted this surface and defended against it by trusting files
+rather than directories: any directory that is not `~/.picoagent/rules/` is treated as
+repository-supplied whatever named it, and every file found in one is fingerprinted, shown to
+the user, and approved before a byte of it reaches the prompt - the same gate `TrustStore` puts
+around plugin code, and it refuses outright in a run with no frontend to ask (`picoagent -p`).
+So it asks for the repository's `dirs` by name through `from_project` and keeps reading it. A
+repository saying "our rules live in `docs/rules`" buys nothing on its own, because the decision
+is still taken one file at a time by the person at the keyboard. What a repository may not
+choose is how much of the user's context window a turn spends, so `max_rules_per_turn` stays in
+the user layer, and a repository that sets it is told at session start that it did nothing. The
+hardcoded `.picoagent/rules/` path is unchanged, and `dirs` in the user's own config still works.
 
 What this does **not** cover: a plugin that reads `api.config["plugins"]` itself is reading the
 merged config, which no longer carries a repository's plugin tables, so it now sees the user
@@ -281,7 +306,8 @@ Untrusted or disabled, the built-in shell tool passes the entire environment thr
 A plugin can say that reporting is not enough. `required = true` in its `plugin.toml` is read
 before any of its code runs, so unlike `api.declare_required` - which is a statement made from
 inside `register()`, and so cannot cover a plugin that never reaches `register()` - it covers
-the trust check too. Both set the same field: the loader seeds the runtime declaration from the
+the two ways a plugin goes missing before that: the trust check refused it, or its entry module
+would not import. Both set the same field: the loader seeds the runtime declaration from the
 manifest, so a manifest requirement already makes a failing `register()` fatal.
 
 What it stops, and what it does not:
@@ -289,14 +315,23 @@ What it stops, and what it does not:
 | Situation | Outcome |
 |---|---|
 | A required plugin the user owns is `changed` - approved once, now different code | The session does not start. `RequiredPluginUntrusted` names the plugin, what changed, and the `plugin trust` command |
+| The same replacement, with a different `name` in its `plugin.toml` | The session does not start. The approval covers the directory, so renaming is a change like any other |
+| A required plugin's entry module raises on import - a dependency gone after a venv rebuild, an entry attribute that no longer exists | The session does not start. `RequiredPluginFailed` names what the import reported. It used to be an ordinary skip: not urgent, "run with --verbose", the control absent, `required` in hand and never read |
 | A required plugin's `register()` raises | The session does not start. `RequiredPluginFailed`, as before |
+| A required plugin in the user's own `~/.picoagent/plugins` is no longer there, or no longer loads at all | The session does not start. `RequiredPluginMissing` names the directory it was approved in and the store to edit if the removal was deliberate. Deleting approved code must not be the quiet way around a check that replacing it trips |
 | A required plugin is `new` - never approved | Announced as urgent, session continues. Install-then-run is the ordinary first-run path, and making it fatal means the plugin can never be trusted from a session that will no longer open |
-| A required plugin the *repository* owns is refused | Announced, session continues. `required` is a line a cloned repository wrote, and honouring it there would hand any repository a switch that stops the user's session on demand |
+| A required plugin the *repository* owns is refused, or its copy disappears | Announced, session continues. `required` is a line a cloned repository wrote, and honouring it there would hand any repository a switch that stops the user's session on demand |
 
 The requirement is recorded in `trust.json` at approval, not read from the directory under
 suspicion, so whoever replaced the code cannot delete the line that makes replacing it fatal.
-Approvals made before this field existed fall back to the manifest on disk, because reading
-them as *not required* would silently disarm them.
+The reason shown to the user is recorded with it, for the same reason. Because the record
+outlives the directory, it is also what catches a required plugin that is not there any
+more; that check is scoped to the user's own plugin directory, which every session of theirs
+reads, so absence from it means gone rather than unused in this project. Approvals made before
+these fields existed fall back to the manifest on disk, because reading them as *not required*
+would silently disarm them, and an approval that recorded no directory is not read as a
+disappearance - a bare name cannot tell "the plugin is gone" from "this project does not use
+it", and re-approving it once records the directory.
 
 A caller that needs a control the loader treats as optional still has to read `LoadReport` and
 decide for itself.

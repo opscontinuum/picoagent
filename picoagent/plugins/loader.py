@@ -36,13 +36,14 @@ matches and the plugin is skipped with a warning until you trust it again.
 
 Hashing the whole directory rather than just the entry module is deliberate: the entry
 imports its siblings, so a narrower fingerprint let ``helper.py`` be rewritten while the
-plugin still reported *trusted*.
+plugin still reported *trusted*. What the record is filed against is the directory, not the
+name in the manifest, for the same reason: the name is a line the replacing code also writes.
 
 A plugin that supplies a security control can say that being skipped is not an acceptable
 outcome - ``required = true`` in its ``plugin.toml``, or ``api.declare_required`` at runtime.
 Replacing code the user approved for such a plugin stops the session rather than printing a
-line about it. See ``RequiredPluginError`` for what that covers and what it deliberately
-does not.
+line about it, and so does removing it. See ``RequiredPluginError`` for what that covers and
+what it deliberately does not.
 
 One namespace per plugin
 ------------------------
@@ -122,6 +123,22 @@ def project_enabled(cfg: dict) -> list[str] | None:
     return [spec for spec in enabled if isinstance(spec, str)] if isinstance(enabled, list) else []
 
 
+def _is_spec(spec: object, cfg: dict) -> bool:
+    """Is this ``[plugins].enabled`` entry something that could name a plugin at all?
+
+    Says where to look when it is not. Either config file can hold the offending line and the
+    merged list no longer remembers which, so both are named: better two paths to check than a
+    value quoted with no file attached.
+    """
+    if isinstance(spec, str):
+        return True
+    cwd = cfg.get("_cwd")
+    where = f"{Path(cwd) / '.picoagent' / 'config.toml'} or your own config" if cwd else "your config"
+    log.error("ignoring [plugins].enabled entry %r: a plugin spec is a string (a git url or a "
+              "path). Check %s.", spec, where)
+    return False
+
+
 def enabled_by_layer(cfg: dict) -> list[tuple[str, str]]:
     """``[plugins].enabled`` paired with the layer each spec came from.
 
@@ -142,8 +159,18 @@ def enabled_by_layer(cfg: dict) -> list[tuple[str, str]]:
     and already refuses a project config that will not parse; an embedder assembling ``enabled``
     by hand gets told to set ``_cwd`` instead of being handed a security decision made by
     coin flip.
+
+    Every pair this returns has a string in it, which is what everything downstream assumes. A
+    ``[plugins].enabled`` entry that is not a string names no plugin, so it is dropped here and
+    said out loud rather than carried. It used to be carried: ``project_enabled`` dropped such
+    entries and ``load_config`` kept them, so the two lists no longer lined up, the membership
+    fallback handed the stray value to the *user* layer, and ``discover`` passed it to
+    ``resolve_source``, where matching a bool against the git-spec pattern raised a ``TypeError``
+    nothing was catching. ``enabled = [true]`` committed to a repository stopped every session
+    opened in it. A config that is wrong about one line is a config to report, not a session to
+    end, and dropping the entry keeps the tail comparison aligned so its neighbours still place.
     """
-    enabled = list(cfg.get("plugins", {}).get("enabled") or [])
+    enabled = [spec for spec in cfg.get("plugins", {}).get("enabled") or [] if _is_spec(spec, cfg)]
     project = project_enabled(cfg)
     if project is None:
         if not enabled:
@@ -360,36 +387,74 @@ def _git(root: Path, *args: str) -> str | None:
 
 
 class TrustStore:
-    """What the user approved, per plugin.
+    """What the user approved, and which *directory* they approved it in.
 
     Deliberately stores more than a fingerprint. A bare hash can only say *that* something
     changed, which leaves the user with one blunt option - re-approve and hope. Per-file
     hashes name the file that moved, and the commit (for a git checkout) lets the CLI show
     the incoming commits before asking. Records written by older versions are a plain
     fingerprint string; they still load, and simply can't describe a change in detail.
+
+    A record is a record of a *directory*. The plugin's name is only the label it is filed
+    under, because looking approvals up by name made an approval as durable as a field the
+    replacing code gets to rewrite: change ``name`` in the replaced ``plugin.toml`` and the same
+    directory read as ``new`` rather than ``changed``, the enforcement gate for a replaced plugin
+    never fired, and the requirement recorded at approval - recorded precisely so whoever
+    replaced the code could not delete it - was answered by a record nothing looked up again.
+    A ``fast_forward`` onto a rewritten upstream does that without an attacker touching the
+    machine. The directory is not the manifest's to rewrite: it is where the user pointed when
+    they approved, and it is where the loader reads the code from.
+
+    So a record matches a plugin when its ``root`` is that plugin's directory, whatever either
+    of them is called. Two checkouts may share a name and get an approval each; a record from a
+    version that stored no ``root`` is matched by name, so an upgrade sends nobody back to the
+    trust prompt, and re-approving gives it a directory.
     """
 
     def __init__(self, user_dir: Path):
         self.path = user_dir / "trust.json"
         raw = json.loads(self.path.read_text()) if self.path.exists() else {}
-        self.data: dict[str, dict] = {name: {"fingerprint": rec} if isinstance(rec, str) else rec
-                                      for name, rec in raw.items()}
+        self.data: dict[str, dict] = {key: {"fingerprint": rec} if isinstance(rec, str) else rec
+                                      for key, rec in raw.items()}
+
+    @staticmethod
+    def key(root: Path) -> str:
+        """A directory as an approval identifies it.
+
+        Resolved, because the same directory is reached by several spellings - ``plugin trust``
+        resolves its argument, discovery joins a configured plugin directory onto a name, and
+        either may run through a symlink. An approval that only covered one spelling would send
+        the other back to the prompt.
+        """
+        try:
+            return str(Path(root).resolve())
+        except OSError:
+            return str(Path(root).absolute())
+
+    def record(self, manifest: Manifest) -> dict:
+        """The approval covering this directory, or an older rootless one filed under its name."""
+        root = self.key(manifest.root)
+        for record in self.data.values():
+            if record.get("root") == root:
+                return record
+        filed = self.data.get(manifest.name)
+        return filed if filed is not None and not filed.get("root") else {}
 
     def is_trusted(self, manifest: Manifest) -> bool:
-        record = self.data.get(manifest.name)
+        record = self.record(manifest)
         return bool(record) and record.get("fingerprint") == plugin_fingerprint(manifest)
 
     def status(self, manifest: Manifest) -> str:
         """``trusted`` (approved, unchanged), ``changed`` (approved, but not this version),
         or ``new`` (never approved). ``changed`` is the interesting one: it means code the
         user vetted has been replaced by code they haven't."""
-        if manifest.name not in self.data:
+        if not self.record(manifest):
             return "new"
         return "trusted" if self.is_trusted(manifest) else "changed"
 
     def approved_commit(self, manifest: Manifest) -> str | None:
         """The commit the user approved, when the record has one."""
-        return (self.data.get(manifest.name) or {}).get("commit")
+        return self.record(manifest).get("commit")
 
     def approved_required(self, manifest: Manifest) -> bool:
         """Was this plugin ``required`` *when the user approved it*?
@@ -401,8 +466,31 @@ class TrustStore:
         to the manifest on disk - the only evidence they have - because reading them as *not
         required* would silently disarm every approval made before the feature shipped.
         """
-        record = self.data.get(manifest.name) or {}
-        return bool(record.get("required", manifest.required))
+        return bool(self.record(manifest).get("required", manifest.required))
+
+    def approved_required_reason(self, manifest: Manifest) -> str:
+        """Why the user was told this plugin had to run, as it read when they approved it.
+
+        Recorded for the same reason the flag is: the reason is part of what was approved, and
+        reading it back off a replaced manifest lets the replacement choose the sentence the
+        user sees when the session stops.
+        """
+        record = self.record(manifest)
+        return record.get("required_reason") or manifest.required_reason or _REQUIRED_UNSTATED
+
+    def approved_requirements(self) -> list[tuple[str, Path, str]]:
+        """Every recorded requirement as ``(name, directory, reason)`` - what must still be there.
+
+        Only records that name a directory. A record from a version that stored none cannot say
+        where the code it approved lived, and a bare name cannot distinguish "the plugin is
+        gone" from "this project does not use it" - the second would stop sessions that have
+        nothing wrong with them. Approving such a plugin once records its directory and brings
+        it under this check.
+        """
+        return [(record.get("name") or key, Path(record["root"]),
+                 record.get("required_reason") or _REQUIRED_UNSTATED)
+                for key, record in self.data.items()
+                if record.get("required") and record.get("root")]
 
     def change_kind(self, manifest: Manifest) -> str:
         """Why a *changed* plugin no longer matches: ``moved`` or ``edited``.
@@ -418,7 +506,7 @@ class TrustStore:
 
     def describe_change(self, manifest: Manifest) -> list[str]:
         """Lines describing what moved since approval, for a human deciding whether to accept."""
-        record = self.data.get(manifest.name) or {}
+        record = self.record(manifest)
         lines: list[str] = []
         approved, current = record.get("files") or {}, plugin_file_hashes(manifest)
         if not approved:
@@ -436,13 +524,42 @@ class TrustStore:
         return lines
 
     def trust(self, manifest: Manifest) -> None:
-        self.data[manifest.name] = {"fingerprint": plugin_fingerprint(manifest),
-                                    "files": plugin_file_hashes(manifest),
-                                    "commit": plugin_commit(manifest.root),
-                                    "required": manifest.required,
-                                    "approved_at": int(time.time())}
+        """Record this directory's current code as approved, replacing whatever covered it.
+
+        Any earlier record of this directory goes, however it was labelled, so a re-approval
+        after a rename leaves one record rather than two disagreeing ones. A rootless record
+        filed under this name goes too: it would otherwise go on vouching for whatever other
+        directory next claimed the name.
+        """
+        root = self.key(manifest.root)
+        stale = [label for label, record in self.data.items()
+                 if record.get("root") == root or (label == manifest.name and not record.get("root"))]
+        for label in stale:
+            del self.data[label]
+        self.data[self._label(manifest, root)] = {
+            "name": manifest.name,
+            "root": root,
+            "fingerprint": plugin_fingerprint(manifest),
+            "files": plugin_file_hashes(manifest),
+            "commit": plugin_commit(manifest.root),
+            "required": manifest.required,
+            "required_reason": manifest.required_reason,
+            "approved_at": int(time.time())}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=2))
+
+    def _label(self, manifest: Manifest, root: str) -> str:
+        """What to file this approval under: its plugin name, or a longer form when that is taken.
+
+        The label exists so a human reading ``trust.json`` can see what a record is about. It
+        decides nothing, which is why a second checkout of the same plugin can be filed beside
+        the first instead of overwriting it - approving a repository's copy of a plugin must not
+        quietly withdraw the approval of the user's own.
+        """
+        taken = self.data.get(manifest.name)
+        if taken is None or taken.get("root") == root:
+            return manifest.name
+        return f"{manifest.name}@{hashlib.sha256(root.encode()).hexdigest()[:8]}"
 
 
 # ------------------------------------------------------------------------ loading
@@ -586,23 +703,31 @@ class RequiredPluginError(RuntimeError):
     says it in two places that mean the same thing and set the same field:
 
     * ``required = true`` in ``plugin.toml``, read before any of the plugin's code runs. This is
-      the one that covers a plugin the *trust* check refused, because that skip happens before
-      ``register()`` is ever called.
+      the one that covers the two ways a plugin goes missing without reaching ``register()``:
+      the *trust* check refused it, or importing its entry module raised.
     * ``api.declare_required(reason)`` inside ``register()``, for a plugin that only discovers at
       runtime that it cannot do its job. ``load_plugin`` seeds the same field from the manifest
       first, so a manifest declaration already covers a failing ``register()`` and the two are
       one mechanism rather than two.
 
-    Subclasses name which of the two ways the plugin went missing.
+    A recorded requirement outlives the manifest that stated it, so the third way - the plugin
+    is not there at all - is caught from the trust store. See ``RequiredPluginMissing``.
+
+    Subclasses name which way the plugin went missing.
     """
 
 
 class RequiredPluginFailed(RequiredPluginError):
-    """A required plugin's ``register()`` raised."""
+    """A required plugin never got as far as running: its import or its ``register()`` raised.
+
+    Both, because both end the same way. A missing dependency takes a security control out of a
+    session exactly as thoroughly as a control that refuses to register, and the manifest's
+    ``required`` is readable before either happens.
+    """
 
     def __init__(self, name: str, reason: str, cause: BaseException):
         super().__init__(f"required plugin '{name}' failed to load: {cause}. {reason}. "
-                         "Fix what it objected to, or remove it from [plugins].enabled if you "
+                         "Fix what it reported, or remove it from [plugins].enabled if you "
                          "no longer want it - it will not be skipped silently.")
         self.name, self.reason, self.cause = name, reason, cause
 
@@ -633,6 +758,30 @@ class RequiredPluginUntrusted(RequiredPluginError):
         self.name, self.reason, self.root, self.change = name, reason, root, change
 
 
+class RequiredPluginMissing(RequiredPluginError):
+    """A plugin approved as required is not there to run, and nothing took its place.
+
+    The other two cases have a directory to look at and a diff to review. This one is the
+    absence itself: the checkout was deleted, or its ``plugin.toml`` stopped parsing, or its
+    entry no longer imports. Replacing approved code stops the session, so deleting it has to
+    as well, or the shorter route around the check is the one with nothing guarding it.
+
+    Only for a requirement recorded against a directory under the user's own plugin directory.
+    That is the directory every session of theirs reads, so absence from it means the plugin is
+    gone rather than unused here. A requirement recorded for a repository's copy is left alone
+    for the reason ``RequiredPluginUntrusted`` leaves it alone: ``required`` is a line a
+    repository wrote, and honouring it hands any repository a switch that stops the user's work.
+    """
+
+    def __init__(self, name: str, reason: str, root: Path, store: Path):
+        super().__init__(
+            f"required plugin '{name}' did not load and nothing is running in its place, so the "
+            f"session is not starting. You approved it at {root} and it was required then: "
+            f"{reason}. Put it back, or drop its entry from {store} if you meant to remove it - "
+            "a plugin you approved as required is not skipped quietly.")
+        self.name, self.reason, self.root, self.store = name, reason, root, store
+
+
 #: Said on a plugin's behalf when its manifest requires it but names no reason of its own.
 _REQUIRED_UNSTATED = "it declares itself required, so this session is not running without it"
 
@@ -644,7 +793,6 @@ def load_plugin(root: Path, rt: Runtime, trust: TrustStore, *, allow_untrusted: 
         log.warning("plugin '%s' is not trusted (new or changed). Run: picoagent plugin trust %s",
                     manifest.name, root)
         return None
-    register = _import_register(manifest)
     api = PluginAPI(rt, manifest.name, manifest.root)
     if manifest.required:
         # Seeded, not checked separately: a manifest declaration and a runtime one are the same
@@ -652,7 +800,13 @@ def load_plugin(root: Path, rt: Runtime, trust: TrustStore, *, allow_untrusted: 
         # more specific wording, whichever it wrote last.
         api.declare_required(manifest.required_reason or _REQUIRED_UNSTATED)
     try:
-        register(api)
+        # Imported inside the declaration, not before it. The manifest says this plugin has to
+        # run and says it without executing anything, so an import that fails - a dependency
+        # gone after a venv rebuild, an entry attribute that no longer exists - is covered by
+        # it. Importing first left that failure to the generic catch in `load_all`, which
+        # reported the plugin as an ordinary skip: not urgent, "run with --verbose", session
+        # continuing with the control absent while `manifest.required` sat in hand unread.
+        _import_register(manifest)(api)
     except Exception as exc:
         if api.required_reason:
             raise RequiredPluginFailed(manifest.name, api.required_reason, exc) from exc
@@ -711,7 +865,7 @@ class Notice:
     rather than something each frontend re-derives from a reason string.
     """
     name: str
-    reason: str           # new | changed | shadowed | invalid | failed
+    reason: str           # new | changed | shadowed | invalid | failed | missing
     root: Path
     text: str
     urgent: bool = False
@@ -751,7 +905,7 @@ class LoadReport:
 class Skip:
     """One plugin that did not load, carrying everything the wording depends on."""
     name: str
-    reason: str            # new | changed | shadowed | invalid | failed
+    reason: str            # new | changed | shadowed | invalid | failed | missing
     root: Path
     layer: str = USER
     manifest: Manifest | None = None
@@ -768,6 +922,11 @@ def _skip_notice(skip: Skip, trust: TrustStore) -> Notice:
     hint = f"  Review it and decide:  picoagent plugin trust {skip.root}"
     absent = "whatever it enforces is off for this session."
     off = f"and was NOT LOADED - {absent}"
+    if skip.reason == "missing":
+        return Notice(skip.name, skip.reason, skip.root,
+                      f"plugin '{skip.name}' is one you approved as REQUIRED and nothing loaded "
+                      f"from {skip.root} - {absent}\n"
+                      f"  Put it back there, or drop its entry from your trust store.", urgent=True)
     if skip.reason == "new":
         if skip.manifest is not None and skip.manifest.required:
             # A first run is not fatal (see RequiredPluginUntrusted), but a plugin that says the
@@ -886,7 +1045,7 @@ def load_all(rt: Runtime, extra_paths: list[str] | None = None,
             # and logged the same way every other skip is.
             if status == "changed" and entry.layer != PROJECT and trust.approved_required(manifest):
                 raise RequiredPluginUntrusted(manifest.name,
-                                              manifest.required_reason or _REQUIRED_UNSTATED,
+                                              trust.approved_required_reason(manifest),
                                               root, trust.change_kind(manifest))
             continue
         try:
@@ -898,4 +1057,28 @@ def load_all(rt: Runtime, extra_paths: list[str] | None = None,
             skip(Skip(manifest.name, "failed", root, entry.layer, manifest))
             continue
         report.loaded.append(manifest)
+    _enforce_recorded_requirements(rt.cfg, trust, report, skip)
     return report
+
+
+def _enforce_recorded_requirements(cfg: dict, trust: TrustStore, report: LoadReport,
+                                   skip: Callable[[Skip], None]) -> None:
+    """Stop the session for a requirement the user recorded that nothing answered.
+
+    Everything above is driven by what is on disk, so a plugin that is no longer on disk is
+    reached by none of it: a deleted checkout, a ``plugin.toml`` that stopped parsing, an entry
+    module that no longer imports. The trust store is the only party that still remembers the
+    plugin was supposed to be running, and a required plugin that vanished leaves exactly the
+    session ``required`` exists to prevent - the control absent, and nothing said about it.
+
+    Checked after the load rather than against discovery, because "did it load" is the question
+    the user cares about; a directory that was found and then failed is as absent as one that
+    was never there.
+    """
+    loaded = {TrustStore.key(manifest.root) for manifest in report.loaded}
+    owned = plugins_dir(cfg)
+    for name, root, reason in trust.approved_requirements():
+        if TrustStore.key(root) in loaded or not _within(root, owned):
+            continue
+        skip(Skip(name, "missing", root, USER))
+        raise RequiredPluginMissing(name, reason, root, trust.path)

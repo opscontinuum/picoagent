@@ -82,7 +82,8 @@ class CompactionTests(unittest.TestCase):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("x")]]))
         load(rt, "compaction")
         run(AgentLoop(rt).handle_input("/compact"))
-        self.assertIn(("notice", {"text": "nothing to compact"}), rt.frontend.events)
+        self.assertIn(("notice", {"text": "nothing to compact", "source": "command"}),
+                      rt.frontend.events)
 
     def test_context_overflow_error_triggers_compaction_and_retry(self):
         from picoagent.core.types import StreamEvent

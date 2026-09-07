@@ -7,14 +7,22 @@ HTTP server without touching core code.
 
 Events the core emits (payload keys in brackets):
 
-    user_message     [text]            the prompt that was just submitted
+    user_message     [text, kind]      a user-role message going to the model. ``kind`` is
+                                       ``typed`` (the person's own prompt), ``queued`` (text a
+                                       plugin sent for delivery) or ``injected`` (text a plugin
+                                       added at ``before_agent_start``); the last two speak in
+                                       the user's voice, so they are announced rather than
+                                       reaching the model unseen
     assistant_start  []                a model reply is starting
     assistant_delta  [text]            streamed text
     thinking_delta   [text]            streamed reasoning (if the provider exposes it)
     assistant_end    [message]         the full Message
     tool_start       [call]            a ToolCall is about to run
     tool_result      [call, result]    its ToolResult (also emitted for blocked calls)
-    notice           [text]            informational text (command output etc.)
+    notice           [text, source?]   informational text. ``source`` is ``command`` when the text
+                                       is a slash command's output, which is the answer in a
+                                       ``-p`` run; without it the notice is commentary about the
+                                       session and headless runs keep it off stdout
     error            [text]            something went wrong
     plugin_skipped   [name, reason, root, urgent, text]
                                        one plugin did not load, at startup; ``urgent`` marks

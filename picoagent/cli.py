@@ -39,6 +39,14 @@ from .plugins import upgrade as upgrade_mod
 #: carry no mark, so the one line worth stopping for does not look like the rest.
 URGENT_MARK = "!!"
 
+#: Exit codes for the two startup refusals the plugin loader raises. They are separate from each
+#: other, and from 1 (every other failure, ``open_session``'s ``SystemExit`` refusals included) and 2
+#: (argparse's usage error), because the answers differ and a wrapper should not have to read
+#: English to tell them apart: 3 means a control someone approved is not going to run and a person
+#: has to look at it, 4 means a config file could not be read so no plugin decision was made at all.
+EXIT_REQUIRED_PLUGIN = 3
+EXIT_PLUGIN_PROVENANCE = 4
+
 
 def session_dir(cfg: dict, cwd: Path) -> Path:
     """Sessions live under the user dir, one folder per project path."""
@@ -182,6 +190,36 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
     return rt
 
 
+def build_runtime_or_refuse(args: argparse.Namespace) -> Runtime:
+    """:func:`build_runtime`, with the loader's startup refusals turned into a line and a code.
+
+    Both are decisions the loader took deliberately, and both messages already name what happened,
+    which plugin or file it concerns, and the command that ends it. Reaching ``main`` uncaught
+    wrapped that wording in a stack trace, which reads as picoagent breaking rather than picoagent
+    refusing, and buries the sentence the user needs under frames from a module they did not call.
+
+    The notice ``load_all`` had already worded for the same plugin dies with the report it was
+    building, and that is the outcome to want. It says the plugin "was NOT LOADED - whatever it
+    enforces is off for this session", which is written for a session that then continues; printed
+    above a line saying the session is not starting, it contradicts it. One refusal, one message.
+    The loader logs every notice at ``info`` regardless, so ``--verbose`` still has them.
+
+    ``RequiredPluginError`` is caught by its base rather than only the untrusted case, because the
+    CLI owes the user the same thing either way. The ``exc_info`` line is for the other subclass:
+    a required plugin whose ``register()`` raised carries that exception as its cause, and those
+    frames are where a plugin author finds the actual fault, so ``--verbose`` keeps them.
+    """
+    try:
+        return build_runtime(args)
+    except loader.RequiredPluginError as exc:
+        logging.getLogger("picoagent").debug("required plugin refusal", exc_info=exc)
+        sys.stderr.write(f"picoagent: {exc}\n")
+        raise SystemExit(EXIT_REQUIRED_PLUGIN) from None
+    except loader.PluginProvenanceError as exc:
+        sys.stderr.write(f"picoagent: {exc}\n")
+        raise SystemExit(EXIT_PLUGIN_PROVENANCE) from None
+
+
 def _report_skipped(report: loader.LoadReport) -> None:
     """Print the loader's own wording for every plugin that did not load, on stderr.
 
@@ -244,7 +282,7 @@ async def warn_about_ignored_project_keys(rt) -> None:
 # ---------------------------------------------------------------------------- commands
 
 async def run_agent(args: argparse.Namespace) -> int:
-    rt = build_runtime(args)
+    rt = build_runtime_or_refuse(args)
     agent = AgentLoop(rt)
     await warn_about_ignored_project_keys(rt)
     await announce_load_report(rt)

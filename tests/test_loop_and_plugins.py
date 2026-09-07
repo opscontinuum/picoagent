@@ -1,10 +1,28 @@
 """The agent loop end-to-end with a scripted provider, plus the plugin loader and trust store."""
-import hashlib, json, tempfile, unittest
+import asyncio, hashlib, io, json, tempfile, unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
 from picoagent.core.loop import AgentLoop
+from picoagent.frontends.plain import PlainFrontend
 from picoagent.plugins import loader
 from picoagent.plugins.api import PluginAPI
+
+
+class _TtyStream(io.TextIOBase):
+    """A stdout that claims to be a terminal, which is what turns PlainFrontend colour on."""
+
+    def __init__(self, sink: io.StringIO):
+        self.sink = sink
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        return self.sink.write(text)
+
+    def flush(self) -> None:
+        self.sink.flush()
 
 
 class LoopTests(unittest.TestCase):
@@ -110,7 +128,8 @@ class LoopTests(unittest.TestCase):
         async def cmd(args, rt): return f"got {args}"
         rt.commands.register("echo", cmd)
         run(AgentLoop(rt).handle_input("/echo hi"))
-        self.assertEqual(self.provider.calls, []); self.assertIn(("notice", {"text": "got hi"}), rt.frontend.events)
+        self.assertEqual(self.provider.calls, [])
+        self.assertIn(("notice", {"text": "got hi", "source": "command"}), rt.frontend.events)
 
     def test_steer_message_is_delivered_after_tool_batch(self):
         rt = self._rt([[call("shell", command="true")], [text("ok")]])
@@ -190,6 +209,114 @@ class LoopTests(unittest.TestCase):
         self.assertIn("rule: prefer tests", sent)
         self.assertLess(sent.index("rule: prefer tests"), sent.index("second prompt"))
         self.assertEqual(rt.queue, [])
+
+    def test_a_command_returning_a_non_string_does_not_end_the_session(self):
+        """A handler is as likely to return the wrong type as to raise, and both must be contained.
+
+        `_run_command` caught what a handler raises, but the notice was emitted outside that catch,
+        so a returned dict travelled on to `PlainFrontend._print`, which on a colour terminal
+        concatenates the text onto its escape codes. The TypeError unwound `handle_input` and passed
+        `PlainFrontend.run`, which stops at KeyboardInterrupt only: the REPL and the session ended,
+        which is the outcome the containment exists to prevent.
+
+        A frontend on a pipe has colour off and never concatenates, so this drives a stdout that
+        claims to be a terminal to reach the failing line at all.
+        """
+        rt = self._rt([[text("still here")]])
+
+        async def wrong_type(args, runtime):
+            return {"model": "test"}
+
+        rt.commands.register("stats", wrong_type, "returns a dict", owner="myplug")
+        printed = io.StringIO()
+        with redirect_stdout(_TtyStream(printed)):
+            rt.frontend = PlainFrontend()
+            self.assertTrue(rt.frontend.color,
+                            "colour is off, so this run cannot reach the concatenation under test")
+            run(AgentLoop(rt).handle_input("/stats"))
+            run(AgentLoop(rt).handle_input("carry on"))
+        shown = printed.getvalue()
+        self.assertIn("stats", shown, "the user has to be told which command misbehaved")
+        self.assertIn("dict", shown, "and what it did, since a plugin author has to fix it")
+        self.assertIn("still here", shown, "the session has to survive to the next prompt")
+
+    def test_a_keyboard_interrupt_in_a_command_still_reaches_the_repl(self):
+        """Containment covers plugin bugs, not the user asking for the run to stop."""
+        rt = self._rt([[text("ok")]])
+
+        async def wait(args, runtime):
+            raise KeyboardInterrupt
+
+        rt.commands.register("wait", wait, "interrupted", owner="myplug")
+        with self.assertRaises(KeyboardInterrupt):
+            run(AgentLoop(rt).handle_input("/wait"))
+
+    def test_a_cancelled_command_still_cancels(self):
+        """Same for cancellation: swallowing it would leave a task that refuses to be shut down."""
+        rt = self._rt([[text("ok")]])
+
+        async def sleeper(args, runtime):
+            raise asyncio.CancelledError
+
+        rt.commands.register("sleep", sleeper, "cancelled", owner="myplug")
+        with self.assertRaises(asyncio.CancelledError):
+            run(AgentLoop(rt).handle_input("/sleep"))
+
+    def test_a_failing_command_is_contained_with_no_frontend_attached(self):
+        """`rt.frontend` is None until something sets it, and an embedder may never set one.
+
+        The contained path reported the failure by calling `rt.frontend.emit`, so with no frontend
+        the report raised AttributeError out of `handle_input` and took the session with it. The
+        containment became the thing it was preventing, for a caller who asked for no UI.
+        """
+        rt = self._rt([[text("ok")]])
+        rt.frontend = None
+
+        async def boom(args, runtime):
+            raise RuntimeError("handler bug")
+
+        rt.commands.register("boom", boom, "explodes", owner="myplug")
+        run(AgentLoop(rt).handle_input("/boom"))
+
+    def test_a_command_notice_with_no_frontend_attached_is_dropped_quietly(self):
+        """Nothing is listening, so there is nowhere to show it; ending the session is not better."""
+        rt = self._rt([[text("ok")]])
+        rt.frontend = None
+
+        async def report(args, runtime):
+            return "all good"
+
+        rt.commands.register("report", report, "says a thing", owner="myplug")
+        run(AgentLoop(rt).handle_input("/report"))
+
+    def test_text_carried_in_from_the_queue_is_announced_as_a_user_message(self):
+        """A plugin queuing text speaks in the user's voice, so the transcript has to show it.
+
+        `next_turn` and `steer` text becomes a user-role message the model reads as the person's
+        own. Announced nowhere, an instruction they never gave was indistinguishable from one they
+        did, and only the JSON trace could have shown the difference. `kind` says who said it.
+        """
+        rt = self._rt([[text("ok")]])
+        PluginAPI(rt, "notes", self.tmp).send_message("mind the style guide", deliver_as="next_turn")
+        run(AgentLoop(rt).handle_input("write a test"))
+        said = [(p["text"], p["kind"]) for e, p in rt.frontend.events if e == "user_message"]
+        self.assertEqual(said, [("mind the style guide", "queued"), ("write a test", "typed")])
+
+    def test_a_steer_delivered_inside_a_run_is_announced_too(self):
+        """Mid-run is where it matters most: the model changes course with nothing on screen."""
+        rt = self._rt([[call("shell", command="true")], [text("ok")]])
+        rt.queue.append(("steer", "focus on tests"))
+        run(AgentLoop(rt).run("x"))
+        said = [(p["text"], p["kind"]) for e, p in rt.frontend.events if e == "user_message"]
+        self.assertIn(("focus on tests", "queued"), said)
+
+    def test_a_message_injected_at_before_agent_start_is_announced(self):
+        """The same property, from the older injection point, so both arrive labelled."""
+        rt = self._rt([[text("ok")]])
+        rt.events.on("before_agent_start", lambda p, c: {"message": "recall the last review"})
+        run(AgentLoop(rt).run("x"))
+        said = [(p["text"], p["kind"]) for e, p in rt.frontend.events if e == "user_message"]
+        self.assertEqual(said, [("recall the last review", "injected"), ("x", "typed")])
 
     def test_provider_error_emits_error_and_stops(self):
         from picoagent.core.types import StreamEvent

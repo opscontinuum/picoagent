@@ -28,6 +28,22 @@ the payload for later handlers and for the core.
 Plugins can define their own events with `await api.emit("thing", {...})`; other plugins
 subscribe to `"<plugin-name>:thing"`.
 
+## Emitted to the frontend, not to the bus
+
+Some things happen outside a turn and go straight to the frontend. `api.on` does not reach
+them; they are what a `--json` consumer reads off stdout, alongside the `notice` that a slash
+command's output and a plugin's own warnings arrive as.
+
+| Event | When | Payload |
+|---|---|---|
+| `plugin_skipped` | startup, once per plugin that did not load | `name`, `reason` (`new`, `changed`, `shadowed`, `invalid` or `failed`), `root`, `urgent`, `text` |
+
+`urgent` is true when a plugin the user approved is not running. That is the case worth stopping
+for, because a security plugin that quietly did not load looks exactly like one that loaded and
+found nothing, so branch on the boolean rather than on `text`, which is prose for a person. The
+same wording also goes to stderr in every run mode; a frontend that renders only the events it
+knows about (the REPL, `-p` without `--json`) ignores this one, so nobody is told twice.
+
 ## Semantics worth knowing
 
 * **Blocking is first-wins.** Once a handler returns `block: True`, later handlers don't run
