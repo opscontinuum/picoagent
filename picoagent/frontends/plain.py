@@ -2,6 +2,12 @@
 
 It exists so picoagent works out of the box; anything fancier (scrollback,
 syntax highlighting, panes) belongs in a frontend plugin.
+
+Every write here goes out through :func:`~picoagent.core.text.safe_for_stream`, including the
+ones nothing strips - the model's deltas, a tool result's preview, a question's prompt. What a
+terminal *obeys* is a question about some of these strings; whether a string can become bytes at
+all is a question about all of them, and the answer has to be at the write, because that is the
+one place every string passes through and the only place that knows which codec the stream has.
 """
 from __future__ import annotations
 
@@ -10,7 +16,7 @@ import json
 import sys
 from typing import Any
 
-from ..core.text import strip_terminal_controls
+from ..core.text import safe_for_stream, strip_terminal_controls
 
 _ANSI = {"dim": "\033[2m", "bold": "\033[1m", "red": "\033[31m", "cyan": "\033[36m",
          "yellow": "\033[33m", "off": "\033[0m"}
@@ -24,16 +30,23 @@ class PlainFrontend:
     def _print(self, text: str, *styles: str, end: str = "\n") -> None:
         """Write one styled line. Callers pass text that is already safe to hand a terminal.
 
-        The sanitising is at the call site rather than here because this method is also how the
+        *Stripping* is at the call site rather than here because this method is also how the
         frontend writes its *own* escape codes, and a stripper that ran last would remove them.
+        *Encoding* is the opposite: it runs here, last, after the styling, because the question
+        is what this stream can carry and the answer must cover every byte leaving. Our own codes
+        are ASCII, so passing them through the same round trip costs nothing and means no path
+        into ``print`` skips it.
         """
         if self.color and styles:
             text = "".join(_ANSI[s] for s in styles) + text + _ANSI["off"]
-        print(text, end=end, flush=True)
+        print(safe_for_stream(text, sys.stdout), end=end, flush=True)
 
     async def emit(self, event: str, payload: dict) -> None:
         if event == "assistant_delta":
-            print(payload["text"], end="", flush=True)
+            # Unstripped, like every frontend's delta: an escape sequence can arrive split
+            # across two chunks, so a per-chunk stripper would be a filter that looks like a
+            # defence. Encodable is a per-chunk property, though, so that guard does apply.
+            print(safe_for_stream(payload["text"], sys.stdout), end="", flush=True)
         elif event == "thinking_delta":
             self._print(payload["text"], "dim", end="")
         elif event == "assistant_end":
@@ -57,7 +70,12 @@ class PlainFrontend:
 
     # ------------------------------------------------------------------ input
     async def _readline(self, prompt: str) -> str:
-        """``input()`` without blocking the event loop."""
+        """``input()`` without blocking the event loop.
+
+        The prompt is written to the stream by ``input`` itself, and a plugin asking the user
+        something chooses its wording, so it is guarded like anything else that is written.
+        """
+        prompt = safe_for_stream(prompt, sys.stdout)
         return await asyncio.get_running_loop().run_in_executor(None, input, prompt)
 
     async def ask(self, kind: str, prompt: str, **kw: Any) -> Any:
@@ -67,7 +85,7 @@ class PlainFrontend:
         if kind == "select":
             options = kw.get("options", [])
             for index, option in enumerate(options, 1):
-                print(f"  {index}. {option}")
+                print(safe_for_stream(f"  {index}. {option}", sys.stdout))
             answer = await self._readline(f"{prompt} [1-{len(options)}] ")
             try:
                 return options[int(answer) - 1]

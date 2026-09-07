@@ -1,7 +1,8 @@
 """Runs the full agent loop (prompt -> tool call -> tool exec -> second turn) against a fake server
 for each provider dialect. Standard library only:  python -m unittest discover -s tests -v"""
 from __future__ import annotations
-import asyncio, json, os, sys, tempfile, unittest
+import asyncio, json, os, sys, tempfile, threading, unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -311,3 +312,130 @@ class BaseUrlSchemeTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             asyncio.run(provider.list_models())
         self.assertNotIn("http or https", str(caught.exception))
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    """Records what it was sent, then either redirects or answers as a model server would."""
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._handle()
+
+    def _handle(self):
+        self.server.received.append((self.path, dict(self.headers)))
+        target = self.server.routes.get(self.path)
+        if target:
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = b'{"data": [{"id": "beyond-the-redirect"}]}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        """Silence: the test's own output is the assertion, not the access log."""
+
+
+class _RedirectServer:
+    """A real HTTP server on a loopback port, so the redirect is followed by urllib itself."""
+
+    def __init__(self, routes: dict[str, str] | None = None):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        self.httpd.routes = routes or {}
+        self.httpd.received = []
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    @property
+    def received(self) -> list:
+        return self.httpd.received
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class RedirectTests(unittest.TestCase):
+    """A credential must not leave the origin the user configured, and neither must the request.
+
+    urllib's ``HTTPRedirectHandler`` re-sends every header that is not about the body to whatever
+    ``Location`` names, so a gateway answering ``/models`` with a 302 to another host delivered
+    ``Authorization: Bearer <key>`` there. ``requests`` and ``curl`` both strip the header on a
+    cross-origin redirect; urllib does not. Dropping the header is not enough here either: the
+    body of a ``/chat/completions`` request is the user's conversation, so the redirect is refused
+    rather than followed without the key.
+    """
+
+    def setUp(self):
+        self.elsewhere = _RedirectServer()
+        self.gateway = _RedirectServer(routes={
+            "/v1/models": self.elsewhere.url + "/v1/models",
+            "/v1/chat/completions": self.elsewhere.url + "/v1/chat/completions"})
+        self.addCleanup(self.gateway.close)
+        self.addCleanup(self.elsewhere.close)
+        self.key = "sk-SECRET-KEY-12345"
+
+    def _provider(self, base: str) -> OpenAICompatProvider:
+        return OpenAICompatProvider(base_url=base + "/v1", api_key=self.key)
+
+    def _stream(self, provider):
+        async def collect():
+            return [event async for event in provider.stream(
+                system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+        return asyncio.run(collect())
+
+    def _headers_seen_elsewhere(self) -> list[str]:
+        return [headers.get("Authorization", "") for _, headers in self.elsewhere.received]
+
+    def test_a_cross_origin_redirect_never_delivers_the_key(self):
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self._provider(self.gateway.url).list_models())
+        self.assertNotIn(f"Bearer {self.key}", self._headers_seen_elsewhere())
+
+    def test_a_cross_origin_redirect_is_refused_rather_than_followed(self):
+        """The request body is the conversation, so the other host gets no request at all."""
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self._provider(self.gateway.url).list_models())
+        self.assertEqual(self.elsewhere.received, [])
+
+    def test_the_refusal_names_where_it_would_have_gone(self):
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(self._provider(self.gateway.url).list_models())
+        message = str(caught.exception)
+        self.assertIn(self.elsewhere.url.split("//")[1], message)
+        self.assertNotIn(self.key, message)
+
+    def test_stream_reports_it_as_an_error_event_not_an_exception(self):
+        events = self._stream(self._provider(self.gateway.url))
+        self.assertEqual([event.type for event in events], ["error"])
+        self.assertEqual(self.elsewhere.received, [])
+
+    def test_a_redirect_to_another_scheme_is_refused(self):
+        """``urllib`` follows a redirect to ``ftp:`` happily; the scheme check has to cover the
+        URL actually fetched, not only the one the user configured."""
+        gateway = _RedirectServer(routes={"/v1/models": "ftp://127.0.0.1:9/models"})
+        self.addCleanup(gateway.close)
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(self._provider(gateway.url).list_models())
+        self.assertIn("ftp", str(caught.exception))
+
+    def test_a_same_origin_redirect_is_still_followed_with_the_key(self):
+        """The cost of the rule has to stay on the case that matters: a gateway moving a path
+        within its own origin is ordinary, and refusing it would break working setups."""
+        server = _RedirectServer(routes={"/v1/models": "/v2/models"})
+        self.addCleanup(server.close)
+        self.assertEqual(asyncio.run(self._provider(server.url).list_models()), ["beyond-the-redirect"])
+        followed = [headers.get("Authorization") for path, headers in server.received
+                    if path == "/v2/models"]
+        self.assertEqual(followed, [f"Bearer {self.key}"])

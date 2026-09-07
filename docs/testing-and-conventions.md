@@ -18,8 +18,10 @@ in `picoagent/testing/fakes.py`.
 | `test_tools.py` | read/write/edit/bash, truncation, the per-file lock |
 | `test_skills_session_config.py` | SKILL.md parsing, session tree + compaction, config layering, command parsing |
 | `test_loop_and_plugins.py` | the loop end-to-end with a scripted model; plugin loading and trust |
-| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, and the `base_url` scheme check |
-| `test_config_refusals.py` | config files that will not parse, and `DEFAULTS` keys nothing reads |
+| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, and where a redirect may take a credentialed request |
+| `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
+| `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
+| `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
 | `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |

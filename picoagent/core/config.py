@@ -32,6 +32,8 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from .text import describe_exception
+
 log = logging.getLogger("picoagent.config")
 
 DEFAULTS: dict[str, Any] = {
@@ -373,11 +375,25 @@ class _ConfigFileError(Exception):
 def _read_toml(path: Path) -> dict:
     """Parse a TOML file, or return ``{}`` if it does not exist.
 
-    A file that exists and will not parse raises :class:`_ConfigFileError` naming the file and
-    the fault. Letting ``tomllib`` and ``OSError`` out instead put a stack trace through
-    ``tomllib._parser`` in front of somebody whose only mistake was an unclosed quote - or, for a
-    repository's config, whose only act was cloning it. A directory and an unreadable file land
-    here too: all three mean "this file is not usable", and only the wording differs.
+    A file that exists and cannot be turned into a dictionary raises :class:`_ConfigFileError`
+    naming the file and the fault. Letting the parser's own exception out instead put a stack
+    trace through ``tomllib._parser`` in front of somebody whose only mistake was an unclosed
+    quote - or, for a repository's config, whose only act was cloning it.
+
+    The catch is broad on purpose, with the two failures worth their own sentence named first.
+    Naming the rest was tried and was wrong twice over: ``tomllib.load`` decodes the bytes itself
+    (``s = b.decode()``), so a file that is not UTF-8 - which is what a Windows editor writes when
+    somebody re-saves this one - raises ``UnicodeDecodeError``, a ``ValueError`` that neither
+    named handler covers; and the parser is recursive descent, so ``v = [[[[...`` runs out of
+    stack and raises ``RecursionError`` before it runs out of input. Both escaped as tracebacks,
+    and both let a cloned repository deny the user their own tool, which is the one thing the
+    layering below exists to prevent. The file is content an attacker may choose, so the contract
+    that reading it never raises has to hold for every way a parser can fail, including the ones
+    a future ``tomllib`` invents. ``MemoryError`` is re-raised because it is not a fact about this
+    file: the interpreter is out of memory, and reporting that as a config-file fault would send
+    whoever reads it to edit a file that is fine. Catching ``RecursionError`` is safe here because
+    the stack has already unwound back to this frame by the time the handler runs, so the sentence
+    below is built with the whole stack available again.
     """
     if not path.exists():
         return {}
@@ -388,6 +404,10 @@ def _read_toml(path: Path) -> dict:
         raise _ConfigFileError(f"{path} is not valid TOML: {exc}") from None
     except OSError as exc:
         raise _ConfigFileError(f"{path} could not be read: {exc.strerror or exc}") from None
+    except MemoryError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - an attacker-controlled file may fail any way it likes
+        raise _ConfigFileError(f"{path} could not be read: {describe_exception(exc)}") from None
 
 
 def load_config(cwd: Path, overrides: dict | None = None) -> dict:

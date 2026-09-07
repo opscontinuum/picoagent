@@ -95,6 +95,45 @@ class RefusedProjectKeyTests(unittest.TestCase):
         self.assertEqual(rt.frontend.events, [])
 
 
+class UnreadableProjectConfigNoticeTests(unittest.TestCase):
+    """``config.py`` works out the sentence; it is only worth working out if it reaches somebody.
+
+    A repository's ``.picoagent/config.toml`` that will not parse is dropped rather than fatal, so
+    the session runs under the user's own settings and everything the file asked for silently does
+    not happen. The sentence explaining that was parked on the config for a ``--json`` consumer to
+    read as data and never handed to a frontend, so the person at the keyboard - the one who can
+    see the file and cannot find its settings in the session - was told nothing at all.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        (self.tmp / ".picoagent").mkdir(parents=True)
+        (self.tmp / ".picoagent" / "config.toml").write_bytes(b'\xff\xfemodel = "x"\n')
+
+    def _runtime(self, frontend):
+        return make_runtime(self.tmp, frontend=frontend)
+
+    def test_the_frontend_is_told_the_repository_config_was_ignored(self):
+        rt = self._runtime(CaptureFrontend())
+        run(cli.warn_about_unreadable_project_config(rt))
+        said = [payload["text"] for event, payload in rt.frontend.events if event == "notice"]
+        self.assertTrue(said, "the sentence never reached the frontend")
+        self.assertIn(str(self.tmp / ".picoagent" / "config.toml"), said[0])
+
+    def test_a_headless_prompt_run_prints_it_on_stderr(self):
+        rt = self._runtime(PrintFrontend(json_mode=False))
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            run(cli.warn_about_unreadable_project_config(rt))
+        self.assertIn(".picoagent", err.getvalue())
+        self.assertEqual(out.getvalue(), "", "stdout carries the answer and nothing else")
+
+    def test_a_repository_config_that_parses_is_not_announced(self):
+        (self.tmp / ".picoagent" / "config.toml").write_text("model = 'anything'\n")
+        rt = self._runtime(CaptureFrontend())
+        run(cli.warn_about_unreadable_project_config(rt))
+        self.assertEqual(rt.frontend.events, [])
+
 class HeadlessNoticeChannelTests(unittest.TestCase):
     """Which channel a `notice` takes in `-p`, given that one event name carries two things.
 

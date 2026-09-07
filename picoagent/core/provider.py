@@ -77,6 +77,12 @@ def _user_message(message: Message) -> dict:
 #: is in ``config.USER_ONLY``, so a cloned repository cannot set the URL - but an environment
 #: variable, a typo, and a plugin passing a value out of its own ``[plugins.<name>]`` table all
 #: arrive at the same argument, and none of them is checked anywhere else.
+#:
+#: This is a check on the *scheme* and deliberately not on the host. ``http://127.0.0.1:11434`` is
+#: Ollama, and a local model server is the case this client is most used for, so loopback,
+#: link-local and private addresses are all allowed on purpose: an SSRF filter here would refuse
+#: the headline configuration. What keeps a repository from choosing the host is
+#: ``config.USER_ONLY``, not this function. See docs/security/trust-boundaries.md.
 HTTP_SCHEMES = ("http", "https")
 
 
@@ -92,7 +98,74 @@ def check_base_url(url: str) -> str | None:
     if scheme in HTTP_SCHEMES:
         return None
     found = f"its scheme is '{scheme}'" if scheme else "it names no scheme"
-    return f"refusing to use {url} as a model endpoint: base_url must be http or https, {found}"
+    return (f"refusing to use {safe_for_display(url)} as a model endpoint: "
+            f"base_url must be http or https, {found}")
+
+
+class RedirectRefused(Exception):
+    """A redirect that would take a credentialed request off the origin the user configured."""
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """``(scheme, host, port)`` for ``url``, or ``None`` when it has no usable one.
+
+    Port is filled in from the scheme when the URL omits it, so ``https://h`` and ``https://h:443``
+    are the same origin and not two. A ``Location`` header is written by whoever is answering, so
+    a port that is not a number is a shape this has to have an answer for: ``None``, which the
+    caller reads as "not the same origin as anything".
+    """
+    parts = urllib.parse.urlsplit(url)
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    return scheme, (parts.hostname or "").lower(), port or {"http": 80, "https": 443}.get(scheme)
+
+
+class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only while it stays on the origin the request started from.
+
+    ``urllib`` re-sends every header that is not about the body to whatever ``Location`` names, so
+    a gateway answering ``/models`` with a 302 to another host was handed ``Authorization: Bearer
+    <key>`` - demonstrated against a second local server, which received the key in full.
+    ``requests`` and ``curl`` both strip the header on a cross-origin redirect. urllib does not,
+    and it will also follow a redirect to ``ftp:``, so the scheme check has to be applied to the
+    URL actually fetched rather than only to the one the user configured.
+
+    Origin is scheme, host and port, all three. Host alone would let a redirect downgrade an
+    ``https`` endpoint to ``http`` and put the key on the wire in clear; port alone would treat two
+    services on one machine as one. An ``http`` endpoint redirecting to ``https`` on the same host
+    is refused too, which is the one legitimate case this costs - the fix is to configure the
+    ``https`` URL, which is what anyone sending a key over the first URL should have done anyway.
+
+    Refused rather than followed with the header dropped, which is where this differs from
+    ``requests``. Dropping the credential is the whole answer for an ordinary API client, but the
+    body of a ``/chat/completions`` request is the user's conversation and its tool results, so a
+    stripped-header request still delivers to the new host the thing worth stealing. A redirect
+    that a model gateway cannot express within its own origin is not a request this client makes.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urllib.parse.urlsplit(newurl).scheme.lower()
+        if scheme not in HTTP_SCHEMES:
+            raise RedirectRefused(f"refusing to follow a redirect to {safe_for_display(newurl)}: "
+                                  f"a model endpoint must be http or https, its scheme is '{scheme}'")
+        origin, target = _origin(req.full_url), _origin(newurl)
+        if origin is None or target is None or origin != target:
+            raise RedirectRefused(
+                f"refusing to follow a redirect from {safe_for_display(req.full_url)} to "
+                f"{safe_for_display(newurl)}: the request body and the Authorization header on it "
+                "would go to a host you did not configure. Set base_url to the endpoint you mean")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+#: The opener every request in this module goes through, so the redirect rule cannot be bypassed by
+#: forgetting it at one call site. ``build_opener`` drops its own ``HTTPRedirectHandler`` in favour
+#: of the subclass above. Its other default handlers (``file:``, ``ftp:``, ``data:``) stay, and are
+#: unreachable: every URL this module fetches is scheme-checked, the configured one by
+#: :func:`check_base_url` and a redirect target by the handler.
+_OPENER = urllib.request.build_opener(_SameOriginRedirects)
 
 
 def parse_sse(response) -> Iterator[dict]:
@@ -200,7 +273,7 @@ class OpenAICompatProvider:
             headers["Authorization"] = f"Bearer {self._key}"
         request = urllib.request.Request(f"{self._base}/models", headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with _OPENER.open(request, timeout=30) as response:
                 payload = json.loads(response.read().decode(errors="replace"))
         except urllib.error.HTTPError as exc:
             raise RuntimeError(safe_for_display(
@@ -226,7 +299,7 @@ class OpenAICompatProvider:
         """Thread body: push each parsed chunk, an Exception on failure, then ``None`` as the sentinel."""
         put = lambda item: loop.call_soon_threadsafe(queue.put_nowait, item)  # noqa: E731
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            with _OPENER.open(request, timeout=600) as response:
                 for chunk in parse_sse(response):
                     put(chunk)
         except urllib.error.HTTPError as exc:

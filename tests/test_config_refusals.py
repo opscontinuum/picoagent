@@ -95,6 +95,33 @@ class BrokenProjectConfigTests(_ConfigDirs):
         self.assertEqual(cfg["model"], "user-model")
         self.assertIn(str(self.project_config), cfg[config.UNREADABLE_PROJECT_CONFIG_KEY])
 
+    def test_a_repository_config_that_is_not_utf8_does_not_end_the_session(self):
+        """``tomllib`` decodes the bytes itself, so a non-UTF-8 file fails before any parsing."""
+        self.project_config.write_bytes(b'\xff\xfemodel = "x"\n')
+        cfg = config.load_config(self.proj)
+        self.assertEqual(cfg["model"], "user-model")
+        self.assertIn(str(self.project_config), cfg[config.UNREADABLE_PROJECT_CONFIG_KEY])
+
+    def test_a_repository_config_saved_as_utf16_does_not_end_the_session(self):
+        """What a Windows editor writes when somebody re-saves the file. An accident, not an attack."""
+        self.project_config.write_bytes('model = "x"\n'.encode("utf-16"))
+        cfg = config.load_config(self.proj)
+        self.assertEqual(cfg["model"], "user-model")
+        self.assertIn(str(self.project_config), cfg[config.UNREADABLE_PROJECT_CONFIG_KEY])
+
+    def test_a_repository_config_of_nested_arrays_does_not_end_the_session(self):
+        """A recursive-descent parser runs out of stack before it runs out of input."""
+        self.project_config.write_text("v = " + "[" * 8000 + "]" * 8000)
+        cfg = config.load_config(self.proj)
+        self.assertEqual(cfg["model"], "user-model")
+        self.assertIn(str(self.project_config), cfg[config.UNREADABLE_PROJECT_CONFIG_KEY])
+
+    def test_a_repository_config_of_nested_inline_tables_does_not_end_the_session(self):
+        self.project_config.write_text("v = " + "{a = " * 2000 + "1" + "}" * 2000)
+        cfg = config.load_config(self.proj)
+        self.assertEqual(cfg["model"], "user-model")
+        self.assertIn(str(self.project_config), cfg[config.UNREADABLE_PROJECT_CONFIG_KEY])
+
     def test_a_repository_config_that_parses_is_untouched(self):
         """The refusal must not cost the working case - project config is the whole feature."""
         self.project_config.write_text('model = "proj-model"\n')
@@ -128,6 +155,18 @@ class BrokenUserConfigTests(_ConfigDirs):
         with self.assertRaises(SystemExit) as caught:
             config.load_config(self.proj)
         self.assertIn("fix it", str(caught.exception))
+
+    def test_a_user_config_that_is_not_utf8_stops_the_session_readably(self):
+        (self.home / "config.toml").write_bytes(b'\xff\xfemodel = "x"\n')
+        with self.assertRaises(SystemExit) as caught:
+            config.load_config(self.proj)
+        self.assertIn(str(self.home / "config.toml"), str(caught.exception))
+
+    def test_a_user_config_of_nested_arrays_stops_the_session_readably(self):
+        (self.home / "config.toml").write_text("v = " + "[" * 8000 + "]" * 8000)
+        with self.assertRaises(SystemExit) as caught:
+            config.load_config(self.proj)
+        self.assertIn(str(self.home / "config.toml"), str(caught.exception))
 
     def test_a_broken_endpoint_file_stops_the_session_too(self):
         """Endpoints hold one credential each and live in the user dir; same author, same rule."""

@@ -18,6 +18,33 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..core.text import describe_exception
+
+
+class ManifestError(Exception):
+    """A ``plugin.toml`` that cannot be turned into a :class:`Manifest`, worded for a person.
+
+    One type for every way the read can fail, because every caller is asking the same question -
+    *can I have this plugin's manifest?* - and none of them has a different answer for "the file
+    is not there" than for "the file is not UTF-8". Enumerating the exception types the read can
+    produce was the previous shape and it did not hold: ``plugin add`` and ``plugin trust`` caught
+    ``FileNotFoundError`` and ``KeyError``, and a manifest that was not UTF-8 raised
+    ``UnicodeDecodeError`` past both of them. A manifest arrives with a clone, so the list of ways
+    it can fail is chosen by whoever wrote it, and a caller cannot be asked to keep up with that.
+    """
+
+
+def _string_list(value: object) -> list[str]:
+    """The strings in ``value``, or an empty list if it is not a list of them.
+
+    Forgiving rather than refusing, because these fields are names of things to fetch or expose
+    and a value of the wrong shape names none of them: ``python_deps = 3`` asks for no package,
+    and a table in ``skills`` names no directory. Dropping is also the safe direction - what falls
+    out is something not installed, not something installed unasked. Refused instead, a stray
+    value in an optional list would cost the user the whole plugin.
+    """
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
 
 @dataclass
 class Manifest:
@@ -53,18 +80,54 @@ class Manifest:
 
     @staticmethod
     def load(root: Path) -> "Manifest":
-        """Parse ``<root>/plugin.toml``. Raises ``FileNotFoundError`` if it's missing."""
+        """Parse ``<root>/plugin.toml``, or raise :class:`ManifestError` saying why it could not.
+
+        Read as bytes and parsed rather than ``read_text()`` and parsed: the second decodes with
+        the platform's default encoding before ``tomllib`` sees anything, so a file that is not
+        UTF-8 - what a Windows editor writes when somebody re-saves this one, and what a
+        repository would commit on purpose - failed inside ``pathlib`` rather than inside the
+        parser, out of reach of anything watching for a parse error.
+
+        The catch is broad because the file is content: a repository's ``.picoagent/plugins``
+        chooses these bytes, so it also chooses which exception the parser raises. ``MemoryError``
+        is re-raised - the interpreter is out of memory, which is not a fact about this manifest.
+        """
         path = root / "plugin.toml"
         if not path.exists():
-            raise FileNotFoundError(f"{root} has no plugin.toml")
-        data = tomllib.loads(path.read_text())
+            raise ManifestError(f"{root} has no plugin.toml")
+        try:
+            with path.open("rb") as fh:
+                data = tomllib.load(fh)
+        except MemoryError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a file a clone brought may fail any way it likes
+            raise ManifestError(f"{path} could not be read: {describe_exception(exc)}") from None
+        return Manifest._from_data(path, data)
+
+    @staticmethod
+    def _from_data(path: Path, data: dict) -> "Manifest":
+        """Build a manifest from parsed TOML, refusing what the rest of the loader cannot use.
+
+        ``name`` and ``entry`` are the two the loader has no default for: the first is what an
+        approval is filed against and what every message about this plugin calls it, the second is
+        the module it imports. Missing or of the wrong type, they used to arrive as a ``KeyError``
+        two callers caught and a third did not, or as an ``int`` that reached a trust record and a
+        format string.
+        """
+        for key in ("name", "entry"):
+            if not isinstance(data.get(key), str) or not data[key].strip():
+                raise ManifestError(f"{path} has no usable '{key}': a plugin manifest needs "
+                                    "'name' and 'entry', both non-empty strings")
+        version, description = data.get("version", "0.0.0"), data.get("description", "")
         reason = data.get("required_reason")
-        return Manifest(name=data["name"], entry=data["entry"], version=data.get("version", "0.0.0"),
-                        description=data.get("description", ""), python_deps=data.get("python_deps", []),
-                        skills=data.get("skills", []), prompts=data.get("prompts", []),
-                        requires=data.get("requires", []),
+        return Manifest(name=data["name"], entry=data["entry"],
+                        version=version if isinstance(version, str) else "0.0.0",
+                        description=description if isinstance(description, str) else "",
+                        python_deps=_string_list(data.get("python_deps")),
+                        skills=_string_list(data.get("skills")), prompts=_string_list(data.get("prompts")),
+                        requires=_string_list(data.get("requires")),
                         # `is True` rather than a truth test: this field decides whether a session
                         # refuses to start, so `required = "no"` must not read as yes.
                         required=data.get("required") is True,
                         required_reason=reason if isinstance(reason, str) else "",
-                        root=root)
+                        root=path.parent)

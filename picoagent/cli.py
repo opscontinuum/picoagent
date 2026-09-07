@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import subprocess
@@ -21,15 +22,17 @@ import sys
 import time
 from pathlib import Path
 
-from .core.config import load_config
+from .core.config import UNREADABLE_PROJECT_CONFIG_KEY, load_config
 from .core.loop import AgentLoop, Runtime
 from .core.provider import OpenAICompatProvider
 from .core.session import Session
+from .core.text import describe_exception, safe_for_display
 from .core.tools import BUILTIN_TOOLS
 from .frontends.plain import PlainFrontend
 from .frontends.print import PrintFrontend
 from .plugins import loader
 from .plugins import upgrade as upgrade_mod
+from .plugins.manifest import ManifestError
 
 
 # ---------------------------------------------------------------------------- wiring
@@ -279,11 +282,32 @@ async def warn_about_ignored_project_keys(rt) -> None:
         "ignored_project_keys": list(ignored)})
 
 
+async def warn_about_unreadable_project_config(rt) -> None:
+    """Say so when this repository's config could not be read at all.
+
+    The neighbouring warning covers a repository that asked for something it may not have. This
+    one covers the case where nothing it asked for happened: the file did not parse, so it was
+    dropped whole and the session is running on the user's own settings. Silence there is worse
+    than for a refused key, because the file can be sitting open in the editor with settings in it
+    that the session has never seen.
+
+    ``load_config`` already logs the sentence, which puts it on stderr in a default run. That is
+    not the same as this: logging is off in a library embedder and below the level of a ``--json``
+    consumer that reads stdout, and both of them are running under settings the repository did not
+    choose. The sentence is stored rather than rebuilt, so the two channels cannot drift apart.
+    """
+    said = rt.cfg.get(UNREADABLE_PROJECT_CONFIG_KEY)
+    if not said:
+        return
+    await rt.frontend.emit("notice", {"text": said})
+
+
 # ---------------------------------------------------------------------------- commands
 
 async def run_agent(args: argparse.Namespace) -> int:
     rt = build_runtime_or_refuse(args)
     agent = AgentLoop(rt)
+    await warn_about_unreadable_project_config(rt)
     await warn_about_ignored_project_keys(rt)
     await announce_load_report(rt)
     await rt.events.emit("session_start", {"resume": bool(args.resume)}, rt)
@@ -379,10 +403,11 @@ def plugin_command(args: argparse.Namespace) -> int:
             return 1
         try:
             manifest = loader.Manifest.load(root)
-        except (FileNotFoundError, KeyError) as exc:
+        except ManifestError as exc:
             # A repository that isn't a plugin is a normal mistake, not a crash. Say which
-            # file is missing and where it was looked for.
-            print(f"{root} is not a plugin: {exc}")
+            # file could not be read and where it was looked for. One exception type, because
+            # the ways a fetched manifest fails are chosen by whoever wrote it.
+            print(f"{root} is not a plugin: {safe_for_display(str(exc))}")
             return 1
         print(f"fetched {manifest.name} {manifest.version} -> {root}\n")
         # Consent first, then pip. `python_deps` comes from a manifest nobody has read yet,
@@ -398,8 +423,8 @@ def plugin_command(args: argparse.Namespace) -> int:
     elif args.pcmd == "trust":
         try:
             manifest = loader.Manifest.load(Path(args.spec).expanduser().resolve())
-        except (FileNotFoundError, KeyError) as exc:
-            print(f"not a plugin directory: {exc}")
+        except ManifestError as exc:
+            print(f"not a plugin directory: {safe_for_display(str(exc))}")
             return 1
         return trust_command(manifest, trust, assume_yes=args.yes)
     elif args.pcmd == "untrust":
@@ -411,7 +436,19 @@ def plugin_command(args: argparse.Namespace) -> int:
         for directory in directories:
             for path in sorted(directory.iterdir()) if directory.is_dir() else []:
                 if (path / "plugin.toml").exists():
-                    manifest = loader.Manifest.load(path)
+                    try:
+                        manifest = loader.Manifest.load(path)
+                    except ManifestError as exc:
+                        # Listed rather than skipped, and skipped rather than fatal. The manifest
+                        # arrived with a clone, so one repository's unreadable file must not cost
+                        # the user the listing of every plugin they do have - which is how they
+                        # find the name to trust or untrust. Dropping it silently would be its own
+                        # answer to a different question: a directory absent from the listing
+                        # reads as a plugin that was never installed.
+                        listed_roots.add(loader.TrustStore.key(path))
+                        print(f"{path.name:20} {'-':8} {'UNREADABLE':10} {path}")
+                        print(f"{'':20} {safe_for_display(str(exc))}")
+                        continue
                     status = {"trusted": "trusted", "changed": "CHANGED", "new": "UNTRUSTED"}[trust.status(manifest)]
                     listed_roots.add(loader.TrustStore.key(path))
                     listed_names.add(manifest.name)
@@ -577,9 +614,42 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+class SafeLogFormatter(logging.Formatter):
+    """Renders a log line without letting the text inside it drive the terminal.
+
+    Everything else picoagent puts on screen goes through ``picoagent.core.text``; the log did
+    not, and it is the one channel where the dangerous half is not written by the call site.
+    ``log.exception`` renders the traceback itself, and a traceback's last line is the exception's
+    class name and ``str(exc)`` - both chosen by whoever raised, both reaching stderr verbatim
+    however carefully the caller wraps its own arguments. The three places that do this are the
+    three that catch plugin code so a failure does not end the session: a handler that raised, a
+    slash command that raised, a tool that raised. Sanitising it here rather than at those three
+    call sites is not tidiness - the traceback is built by the logging machinery, after the call
+    site is done, so there is nowhere else it can be reached.
+
+    A message that will not render is reported rather than allowed out, for the same reason
+    ``describe_exception`` does it: this formatter runs on the path that exists so a failure is
+    survivable, and an exception thrown while reporting one would undo that.
+    """
+
+    def formatException(self, ei) -> str:
+        return safe_for_display(super().formatException(ei))
+
+    def format(self, record: logging.LogRecord) -> str:
+        record = copy.copy(record)      # other handlers get the record as it was
+        try:
+            message = record.getMessage()
+        except Exception as exc:  # noqa: BLE001 - an argument's __str__ is the plugin's code too
+            message = f"<the log message could not be rendered: {describe_exception(exc)}>"
+        record.msg, record.args = safe_for_display(message), ()
+        return super().format(record)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(name)s: %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(SafeLogFormatter("%(name)s: %(message)s"))
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, handlers=[handler])
     if args.cmd == "plugin":
         sys.exit(plugin_command(args))
     if args.cmd == "upgrade":

@@ -70,6 +70,25 @@ repository's own `.picoagent/plugins/` rather than yours. When a repository trie
 a `notice` handed to the frontend, so it is on screen in the REPL and in a `-p` run, and a
 `--json` run carries the refused names as `ignored_project_keys` beside the sentence.
 
+A repository's config that cannot be read at all is announced the same way, and for a stronger
+reason: nothing it asked for happened, and the file can be open in the editor with settings in it
+the session has never seen. Reading one never raises, whatever the bytes are. Naming the failures
+one at a time was tried and lost twice - `tomllib` decodes the file itself, so a `.picoagent/config.toml`
+that is not UTF-8 (what a Windows editor writes when someone re-saves it, and what a repository
+would commit on purpose) raised `UnicodeDecodeError`, and the parser is recursive descent, so
+`v = [[[[...` raised `RecursionError` - and each escaped as a traceback that let a cloned
+repository deny the user their own tool. The catch is now broad, with `MemoryError` re-raised
+because that is a fact about the machine and not about the file. The asymmetry is unchanged: the
+repository's file is dropped with the sentence, the user's own file stops the session.
+
+The same door was open on `plugin.toml`, which is also a file a clone brings. Session startup was
+safe - the loader catches around every manifest read, so one broken manifest costs its own plugin
+and nothing else - but `picoagent plugin list` caught nothing and died on a manifest that was not
+UTF-8, and `plugin add` and `plugin trust` caught two exception types out of the several a hostile
+file can produce. `Manifest.load` now fails as one type, `ManifestError`, and the listing marks
+the unreadable directory `UNREADABLE` and carries on with the plugins around it: a repository must
+not be able to stop the user seeing, adding or trusting the ones they do have.
+
 ### `plugins.enabled` is concatenated, and a spec carries its layer
 
 The concatenation is deliberate: user list first, then the repository's, so a repository can
@@ -286,7 +305,24 @@ Dotted arrows are paths that were closed deliberately, each because it was reach
 | A tool reads the credentials file or `config.toml` | `tool_call` guard blocks any tool whose path argument names a protected file, by inode identity, and blocks recursive tools pointed at a containing directory |
 | `env` or `echo $VAR` in a shell command | The shell tool passes an allowlist of variables, not a denylist of secret-shaped names |
 | A gateway echoes the key back in a 401 body | Provider error text is scrubbed before it reaches the terminal or the `--json` stream |
+| A gateway answers the model request with a 302 to another host | The redirect is refused. `urllib` re-sends every header that is not about the body, so the key arrived at the second host in full - confirmed by execution against a local server. Same origin means the same scheme, host and port; a redirect that stays inside one is followed |
 | A key typed into a slash command | Slash commands short-circuit before `session.append_message`, so they are never recorded |
+
+### The endpoint check is on the scheme, and not on the host
+
+`provider.HTTP_SCHEMES` refuses a `base_url` that is not `http` or `https`, because `urlopen`
+resolves `file:`, `ftp:` and `data:` without complaint and a `file:///etc` endpoint turns the model
+client into a file reader. It does **not** refuse an address: loopback, link-local and private
+ranges all pass, so `http://127.0.0.1:11434` reaches a local Ollama and `http://10.0.0.5:8000`
+reaches a vLLM on the network. That is a decision rather than an omission. A local model server is
+the configuration this client is most used for, so an SSRF filter here would refuse the headline
+case in order to defend against a URL the user typed into their own config. What keeps a
+*repository* from choosing the host is `providers` being in `USER_ONLY`, above; a plugin handed a
+URL out of its own `[plugins.<name>]` table is answered by `PluginConfig`, not by this check.
+
+What is checked at every hop is the scheme and the origin of the URL actually fetched, which is why
+the redirect row in the table above exists: the configured URL being `https://gateway.example` says
+nothing about where a 302 from it leads.
 
 ## Confining file access
 
@@ -436,6 +472,56 @@ parses rather than a display. A consumer that echoes a field to its own terminal
 
 Alongside it, an exception whose `__str__` a plugin wrote is rendered through
 `describe_exception`, which strips the same sequences from both the message and the class name
-(`type()` accepts any string as a name) and bounds the result at 2000 characters. Logging is not
-covered: `log.exception` renders the traceback itself, so the fix there is a formatter installed
-where logging is configured, and it is not installed today.
+(`type()` accepts any string as a name) and bounds the result at 2000 characters. Reading that
+name is itself a call into the raiser's code, because a metaclass can make `__name__` a
+property, so the name and the message are each read inside their own guard, that guard catches
+`BaseException` (the raiser chooses what to raise, and a `KeyboardInterrupt` from a property is
+not the user asking to stop), and the two halves are joined with `"".join` rather than an
+f-string so no `__format__` a raiser wrote runs after the guards have closed. This matters
+because every caller of `describe_exception` is a catch whose job is that a failure does not end
+the session: `_invoke` for every tool call, `_run_command` for every slash command. An exception
+escaping the report is a session that dies with a traceback in `-p` and in the REPL alike.
+Logging is covered by a formatter rather than by those call sites: `log.exception` renders the
+traceback itself, and a traceback's last line is the class name and `str(exc)` whatever the caller
+does to its own arguments. `cli.SafeLogFormatter` runs the same strip over the rendered exception
+and over the message, and `main` installs it on the handler it configures, so the three places
+that log a plugin's exception on purpose - a failing event handler, a failing slash command, a
+failing tool - no longer put escape sequences on stderr.
+
+**No string a frontend writes can crash the write.** A `str` in Python is not always text. A
+lone surrogate is a `str` that no codec can encode, UTF-8 included, so writing it raises
+`UnicodeEncodeError`. Three ways one arrives, only the first of them hostile: a plugin
+constructs it; `json.loads` builds it from a `"\ud800"` in a remote MCP server's reply; or a path
+is decoded off the filesystem, because `os.fsdecode` maps every byte a directory name holds that
+UTF-8 cannot explain to exactly such a surrogate, so `str(Path("/tmp/plug\xffin"))` is one and a
+tool that lists a directory can put it in front of a person. It survives every layer above: `strip_terminal_controls`
+keeps everything above U+009F by design, and the report builders interpolate with `{exc}` rather
+than `{exc!r}`. The same crash arrives without an attacker on an ASCII-only console or a Windows
+code page, where most of Unicode is unencodable. `picoagent.core.text.safe_for_stream` closes it
+by round-tripping through the stream's *own* codec with `backslashreplace`, and it runs at the
+write rather than in the stripper: the stripper does not know which stream the text is bound
+for, and half of what a frontend writes - the model's deltas, a tool result's preview, a
+question's prompt - never passes through it. `repr` would have answered this and the
+terminal-control question together, at the price of quoting the string and escaping every
+newline in it, and the notice channel exists to deliver a multi-line command answer as lines.
+
+**A plugin can still write into the `-p` answer.** `PrintFrontend` writes `assistant_delta`
+straight to stdout unstripped, and any plugin may emit that event, so it can add text to the
+bytes a script captures and can leave ANSI in them. This is a documented limit rather than a
+hole to plug, for the same reason the model's own deltas are unstripped: an escape sequence can
+be split across two chunks, so a per-chunk filter is defeated by an attacker sending two emits,
+and a filter that only stops the careless is worse than a stated boundary because it invites
+reliance. A plugin is in-process code with the user's privileges - `sys.stdout.write` is open to
+it directly - so the load-time trust decision is the boundary here, as it is everywhere else in
+plugin land. The forgery that *is* blocked is the one a filter can actually block: a `source`
+key claiming a notice is a command's answer, where the claim is a field a program reads. What is
+not part of the limit is the crash: a delta no codec can encode used to end the session, and it
+goes through `safe_for_stream` like every other write.
+
+Two writes are still outside that guarantee, both in `cli.py`, both before a frontend exists:
+`_report_skipped` writes the loader's notice text to stderr, and `build_runtime_or_refuse`
+writes a plugin-load exception's message the same way. Neither is stripped and neither is
+encoding-guarded. The notice text interpolates the skipped plugin's directory, so the
+filesystem route above reaches it: a plugin directory whose name is not valid UTF-8 turns
+"plugin X was not loaded" into a traceback. It ends the process at startup rather than mid
+session, which is the mildest place for it, but it is the same defect.

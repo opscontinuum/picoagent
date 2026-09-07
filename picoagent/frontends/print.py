@@ -6,6 +6,22 @@
   programs can consume the full trace (tool calls, results, errors).
 
 Questions are answered with a safe default (``False``/``None``) because nobody is there.
+
+Every write goes out through :func:`~picoagent.core.text.safe_for_stream`, the JSON one
+included. ``json.dumps`` already escapes to ASCII, so there the guard is a no-op and the record
+is unchanged; it is there so that "each of these writes is encodable" is a property of the
+method rather than of an argument about one branch, and so a later ``ensure_ascii=False`` cannot
+quietly make a crash reachable again.
+
+A known limit, in the same shape as the model's own deltas: a plugin may emit ``assistant_delta``
+and reach the ``-p`` answer on stdout, unstripped. That is not the leak it looks like. A plugin
+is in-process code with the user's privileges - it can call ``sys.stdout.write`` itself, and a
+per-chunk stripper is defeated by splitting one escape sequence across two emits, which is what
+makes the model's deltas unstripped in the first place. The forgery that *is* worth blocking is
+the one a filter can actually block: a plugin claiming its notice is a command's answer, which
+``_attested`` below rewrites, because there the claim is a field a program reads rather than a
+byte a terminal obeys. Crashing the write is not part of the limit: an ``assistant_delta`` no
+codec can encode killed the session, and it goes through the guard like everything else.
 """
 from __future__ import annotations
 
@@ -15,7 +31,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from ..core.commands import COMMAND_SOURCE
-from ..core.text import strip_terminal_controls
+from ..core.text import safe_for_stream, strip_terminal_controls
 
 
 def _serialise(obj: Any):
@@ -51,10 +67,11 @@ class PrintFrontend:
             # the text as it was. Stripping here would edit a record instead of a display. A
             # consumer that echoes a field to its own terminal owns that step, the same way it
             # owns every other rendering decision `--json` hands it.
-            sys.stdout.write(json.dumps({"event": event, **payload}, default=_serialise) + "\n")
+            record = json.dumps({"event": event, **payload}, default=_serialise)
+            sys.stdout.write(safe_for_stream(record, sys.stdout) + "\n")
             sys.stdout.flush()
         elif event == "assistant_delta":
-            sys.stdout.write(payload["text"]); sys.stdout.flush()
+            sys.stdout.write(safe_for_stream(payload["text"], sys.stdout)); sys.stdout.flush()
         elif event == "assistant_end":
             sys.stdout.write("\n")
         elif event == "notice":
@@ -68,9 +85,11 @@ class PrintFrontend:
             # commentary, and _attested has already dropped a `source` that only claims to be
             # the dispatcher's, so the branch below reads a key core is the only writer of.
             stream = sys.stdout if payload.get("source") else sys.stderr
-            stream.write(strip_terminal_controls(payload["text"]) + "\n"); stream.flush()
+            stream.write(safe_for_stream(strip_terminal_controls(payload["text"]), stream) + "\n")
+            stream.flush()
         elif event == "error":
-            sys.stderr.write(strip_terminal_controls(payload["text"]) + "\n")
+            text = safe_for_stream(strip_terminal_controls(payload["text"]), sys.stderr)
+            sys.stderr.write(text + "\n")
 
     async def ask(self, kind: str, prompt: str, **kw: Any) -> Any:
         return False if kind == "confirm" else None
