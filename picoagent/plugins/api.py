@@ -25,8 +25,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..core.config import PluginConfig, plugin_config
+from ..core.events import warn_if_unpublished
 from ..core.loop import Runtime
 from ..core.skills import Skill
+from ..core.tools import kill_process_tree, own_process_group
+
+#: Seconds the child of a timed-out :meth:`PluginAPI.exec` gets to exit on its own before it is
+#: killed. Long enough for a command interrupted mid-write to undo what it started, short enough
+#: that the plugin waiting on the call still gets an answer this turn.
+CHILD_EXIT_GRACE: float = 5.0
+
+#: The exit code a timed-out :meth:`PluginAPI.exec` reports. 124 is what ``timeout(1)`` uses, so a
+#: plugin that passes the code on says the same thing as the shell the user would have typed.
+TIMED_OUT_EXIT_CODE: int = 124
 
 #: What a child process needs to *be a runnable program*, on either platform, and nothing that
 #: identifies you to a service. Each name earns its place by breaking something when absent:
@@ -109,7 +120,13 @@ class PluginAPI:
 
     # ------------------------------------------------------------------ events
     def on(self, event: str, handler: Callable) -> None:
-        """Subscribe to a lifecycle event. See ``docs/events-reference.md``."""
+        """Subscribe to a lifecycle event. See ``docs/events-reference.md``.
+
+        A name that is neither a core event nor namespaced ``<plugin>:<event>`` is warned about
+        and then subscribed anyway - see :func:`~picoagent.core.events.warn_if_unpublished` for
+        why it is a warning and not a refusal.
+        """
+        warn_if_unpublished(event, self.name)
         self.rt.events.on(event, handler, owner=self.name)
 
     async def emit(self, event: str, payload: dict) -> dict:
@@ -122,6 +139,13 @@ class PluginAPI:
         self.rt.tools.register(tool, owner=self.name)
 
     def unregister_tool(self, name: str) -> None:
+        """Take a tool out of the registry. Unknown name => nothing happens.
+
+        Stronger than :meth:`set_active_tools`, which only narrows what the *model* is offered:
+        a hidden tool is still registered, so another plugin reaches it through
+        ``rt.tools.get(name)`` and runs it. This one removes it for everybody, which is what a
+        plugin that must not merely shadow a tool - it must not leave it reachable - needs.
+        """
         self.rt.tools.unregister(name)
 
     def register_command(self, name: str, handler: Callable, description: str = "") -> None:
@@ -140,6 +164,20 @@ class PluginAPI:
         """Add or replace a named block of the system prompt. ``render`` runs every turn."""
         self.rt.prompt.set_section(section, render)
 
+    def remove_system_prompt_section(self, section: str) -> None:
+        """Take a named block out of the system prompt. Unknown name => nothing happens.
+
+        The other half of :meth:`register_system_prompt_section`, and here for the reason
+        :meth:`unregister_tool` is: a plugin that adds something needs a way to take it back,
+        and a surface that only registers makes a plugin reach past this object for the undo.
+
+        Not the same as rendering an empty string. ``build()`` skips an empty section, so the
+        prompt reads alike either way today, but a blanked section is still registered: it is
+        still called every turn, still there for a plugin walking the sections, and still the
+        entry another plugin's replacement would land on.
+        """
+        self.rt.prompt.remove_section(section)
+
     def register_skill(self, skill: Skill) -> None:
         self.rt.skills.add(skill)
 
@@ -150,6 +188,13 @@ class PluginAPI:
         self.rt.tools.set_active(names)
 
     def get_active_tools(self) -> list[str]:
+        """The names currently offered to the model; :meth:`all_tools` is everything registered.
+
+        The read half of :meth:`set_active_tools`, and worth using rather than assuming: the
+        setter replaces the whole list, so a plugin that only wants ``shell`` gone subtracts
+        from this rather than naming the tools it happens to know about, and another plugin's
+        narrowing survives.
+        """
         return [t.name for t in self.rt.tools.active()]
 
     def all_tools(self) -> list[str]:
@@ -206,12 +251,32 @@ class PluginAPI:
         put it in a tool result or a notice, both of which reach the model and the session log.
         A ``git status`` or a ``docker ps`` needs ``PATH`` and ``HOME`` and nothing else; a
         command that genuinely needs more is a command whose author can name what.
+
+        Running out of ``timeout`` is a result rather than an exception: the child's whole tree
+        is ended and reaped, and you get ``(124, "timed out after <n>s")``. Nothing of what it
+        printed survives - the read was cancelled with it - so there is nothing truthful to put
+        in place of that sentence.
         """
         proc = await asyncio.create_subprocess_exec(cmd, *args, cwd=self.rt.cwd,
                                                     env=minimal_env(env),
                                                     stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.STDOUT)
-        output, _ = await asyncio.wait_for(proc.communicate(), timeout)
+                                                    stderr=asyncio.subprocess.STDOUT,
+                                                    # its own group, so the cleanup below reaches
+                                                    # the children a `sh -c` child started too
+                                                    **own_process_group())
+        try:
+            output, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            # `wait_for` cancels the read and nothing else: without this the child runs on with
+            # nobody left to wait for it, which is an orphan the session cannot report or reap.
+            await kill_process_tree(proc, grace=CHILD_EXIT_GRACE)
+            return TIMED_OUT_EXIT_CODE, f"timed out after {timeout}s"
+        except asyncio.CancelledError:
+            # An aborted run leaves the same orphan, and the child is now in a group of its own,
+            # so the terminal's Ctrl-C no longer reaches it either. Clean up, then let the
+            # cancellation carry on being one.
+            await kill_process_tree(proc, grace=CHILD_EXIT_GRACE)
+            raise
         return proc.returncode or 0, output.decode(errors="replace")
 
     # ------------------------------------------------------------------ context

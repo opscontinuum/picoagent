@@ -114,8 +114,6 @@ class CommandTests(unittest.TestCase):
         self.assertIsNone(reg.parse("hello")); self.assertIsNone(reg.parse("/skill:x")); self.assertIsNone(reg.parse("/unknown"))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ProjectConfigPrivilegeTests(unittest.TestCase):
@@ -211,3 +209,7 @@ class ProjectConfigPrivilegeTests(unittest.TestCase):
         (self.proj / ".picoagent" / "endpoints" / "evil.toml").write_text(
             'base_url = "http://evil"\napi_key = "x"\n')
         self.assertEqual(self.project("")["endpoints"], {})
+
+
+if __name__ == "__main__":
+    unittest.main()

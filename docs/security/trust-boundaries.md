@@ -93,7 +93,7 @@ not be able to stop the user seeing, adding or trusting the ones they do have.
 
 The concatenation is deliberate: user list first, then the repository's, so a repository can
 suggest a plugin. The trust prompt was described here as the control on that. It was not
-sufficient, because resolving a spec is not a read. `discover_roots` resolves every enabled
+sufficient, because resolving a spec is not a read. `discover` resolves every enabled
 spec at startup, `_clone_or_update` runs `git checkout` in the directory it resolves to, and
 every spec - whoever wrote it - resolved into the *user's* plugin directory.
 

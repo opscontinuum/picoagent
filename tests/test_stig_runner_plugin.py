@@ -298,6 +298,15 @@ class EvidenceContainmentTests(StigBase):
                            max_hits=1)
         self.assertTrue(all(count <= 1 for count in capped.details["hits"]), capped.details)
 
+    def test_cut_evidence_carries_the_note_all_the_way_into_the_tool_result(self):
+        """The reviewer reads the tool result, not the ``ProbeResult``, so the note has to arrive."""
+        for number in range(6):
+            (self.repo / f"tls_{number}.py").write_text("verify=False\n", encoding="utf-8")
+        self.load()
+        result = self.tool("stig_evidence", vuln_num="APSC-DV-000160", repo=str(self.repo),
+                           max_hits=5)
+        self.assertIn("more than 5 hits", result.content)
+
     def test_unmapped_rule_says_so_and_is_not_an_error(self):
         self.load()
         result = self.tool("stig_evidence", vuln_num="APSC-DV-003236", repo=str(self.repo))
@@ -310,6 +319,128 @@ class EvidenceContainmentTests(StigBase):
         result = self.tool("stig_evidence", vuln_num="APSC-DV-003110", repo=str(self.repo))
         self.assertIn("evidence, not a determination", result.content)
         self.assertIn("serves:", result.content)
+
+
+class EvidenceCase(unittest.TestCase):
+    """A repository written to order, and the one-probe scans the two classes below run over it.
+
+    Small hand-built trees rather than ``build_repo``: these assert on exact hit counts at an
+    exact cap, so the fixture has to say how many matches there are on the line above.
+    """
+
+    def _repo(self, files: dict[str, str]) -> Path:
+        root = Path(tempfile.mkdtemp()) / "repo"
+        root.mkdir()
+        for relative, content in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8", newline="\n")
+        return root
+
+    @staticmethod
+    def _matching_lines(count: int) -> str:
+        return "".join(f"verify=False  # {number}\n" for number in range(count))
+
+    def _grep(self, files: dict[str, str], max_hits: int):
+        probe = evidence.Probe(kind="grep", globs=("*.py",), pattern="verify=False",
+                               serves="a test's probe")
+        return evidence.run_probes(self._repo(files), [probe], max_hits=max_hits).results[0]
+
+    def _exists(self, files: dict[str, str], max_hits: int):
+        probe = evidence.Probe(kind="exists", globs=("*.py",), serves="a test's probe")
+        return evidence.run_probes(self._repo(files), [probe], max_hits=max_hits).results[0]
+
+
+class EvidenceTruncationTests(EvidenceCase):
+    """Evidence that was cut must say so, and evidence that was not must not say so.
+
+    A reviewer signs a determination on the evidence in front of them, so a probe that found
+    more than it was allowed to keep owes them the sentence saying it. Both halves are the same
+    property and both are asserted below: at a cap of five, six matches are cut and five are
+    complete, and flagging the complete one would teach a reviewer to read past the note.
+    """
+
+    def test_a_grep_hit_thrown_away_at_the_cap_is_reported(self):
+        result = self._grep({"a.py": self._matching_lines(6)}, max_hits=5)
+        self.assertEqual(len(result.hits), 5)
+        self.assertTrue(result.truncated)
+
+    def test_a_grep_probe_filled_exactly_to_the_cap_is_complete_evidence(self):
+        result = self._grep({"a.py": self._matching_lines(5)}, max_hits=5)
+        self.assertEqual(len(result.hits), 5)
+        self.assertFalse(result.truncated)
+
+    def test_a_grep_probe_below_the_cap_is_not_truncated(self):
+        result = self._grep({"a.py": self._matching_lines(4)}, max_hits=5)
+        self.assertEqual(len(result.hits), 4)
+        self.assertFalse(result.truncated)
+
+    def test_a_hit_discarded_in_a_later_file_is_reported_too(self):
+        """The cap is reached inside ``a.py`` and the evidence that was cut is in ``b.py``.
+
+        A probe stops reading once it can keep nothing more, so the match that proves the
+        evidence was cut can be in a file the probe would otherwise never have opened.
+        """
+        result = self._grep({"a.py": self._matching_lines(3), "b.py": self._matching_lines(3)},
+                            max_hits=3)
+        self.assertEqual(len(result.hits), 3)
+        self.assertTrue(result.truncated)
+
+    def test_a_cap_of_zero_keeps_nothing_and_says_the_evidence_was_cut(self):
+        result = self._grep({"a.py": self._matching_lines(1)}, max_hits=0)
+        self.assertEqual(result.hits, [])
+        self.assertTrue(result.truncated)
+
+    def test_a_cap_of_zero_over_a_repository_with_no_matches_is_not_truncated(self):
+        """Nothing was discarded, so "no hits" is the complete answer and not a cut one."""
+        result = self._grep({"a.py": "nothing to find\n"}, max_hits=0)
+        self.assertEqual(result.hits, [])
+        self.assertFalse(result.truncated)
+
+    def test_an_exists_probe_reports_the_file_it_had_to_drop(self):
+        result = self._exists({f"f{number}.py": "" for number in range(6)}, max_hits=5)
+        self.assertEqual(len(result.hits), 5)
+        self.assertTrue(result.truncated)
+
+    def test_an_exists_probe_matching_exactly_the_cap_is_complete(self):
+        result = self._exists({f"f{number}.py": "" for number in range(5)}, max_hits=5)
+        self.assertEqual(len(result.hits), 5)
+        self.assertFalse(result.truncated)
+
+
+class EvidenceCounterTests(EvidenceCase):
+    """The closing note tells a reviewer how much of the tree the "no hits" answer covers.
+
+    So the counters in it have to survive the two things that make them drift: a probe that stops
+    early, and one file offered to more than one probe.
+    """
+
+    def test_files_the_walk_offered_are_counted_whether_or_not_a_probe_read_them(self):
+        """A probe that stops early must not shrink the corpus the scan reports.
+
+        Tying ``files_scanned`` to how many files a probe happened to open would make one
+        repository report a different size for every cap.
+        """
+        files = {f"f{number}.py": self._matching_lines(2) for number in range(4)}
+        probe = evidence.Probe(kind="grep", globs=("*.py",), pattern="verify=False",
+                               serves="a test's probe")
+        root = self._repo(files)
+        self.assertEqual(evidence.run_probes(root, [probe], max_hits=1).files_scanned, 4)
+        self.assertEqual(evidence.run_probes(root, [probe], max_hits=99).files_scanned, 4)
+
+    def test_a_binary_file_two_probes_both_want_is_skipped_once(self):
+        """One walk feeds every probe, so a ``package.json`` is offered to grep and to manifest.
+
+        Counting the skip once per offer produced "1 files scanned; 2 skipped (binary)", which
+        says more files were skipped than were there and leaves a reviewer nothing to act on.
+        """
+        root = self._repo({})
+        (root / "package.json").write_bytes(b"\x00binary")
+        probes = [evidence.Probe(kind="grep", globs=("*.json",), pattern="x", serves="a probe"),
+                  evidence.Probe(kind="manifest", serves="a probe")]
+        scan = evidence.run_probes(root, probes, max_hits=5)
+        self.assertEqual(scan.files_scanned, 1)
+        self.assertEqual(scan.skipped_binary, 1)
 
 
 class ProbeTableTests(unittest.TestCase):
@@ -509,6 +640,22 @@ class AssetTests(StigBase):
         self.assertEqual(result.details["asset"]["ROLE"], "None")      # untouched
         self.assertEqual(result.details["asset"]["TARGET_KEY"], "4093")
 
+    def test_a_field_that_was_written_counts_as_an_unsaved_edit(self):
+        checklist = ckl.load(self.ckl_path)
+        checklist.set_asset(host_name="APPSRV01")
+        self.assertEqual(checklist.unsaved_edits, 1)
+
+    def test_an_asset_call_that_wrote_nothing_leaves_the_count_alone(self):
+        """``None`` skips a field, so a call where every field is ``None`` changed the file not at all.
+
+        Counting it would send the assessor to ``stig_save`` to clear a state nothing caused, and
+        the session-end warning about unsaved determinations would be raised over an edit that
+        never happened.
+        """
+        checklist = ckl.load(self.ckl_path)
+        checklist.set_asset(host_name=None, host_ip=None)
+        self.assertEqual(checklist.unsaved_edits, 0)
+
 
 # --------------------------------------------------------------------------- wiring
 
@@ -584,8 +731,6 @@ class NoNetworkTests(unittest.TestCase):
             self.assertNotIn("subprocess.", source, f"{name} must not shell out")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 class ControlCharacterTests(unittest.TestCase):
     """Evidence is pasted from terminals, and terminals emit bytes XML cannot hold.
@@ -680,3 +825,7 @@ class ProjectConfigLayerTests(unittest.TestCase):
                             if event == "notice")
         self.assertIn("stig-runner: ignored interactive", notices)
         self.assertIn("read from your own config only", notices)
+
+
+if __name__ == "__main__":
+    unittest.main()

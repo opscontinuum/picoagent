@@ -479,8 +479,6 @@ class LoadReportTests(unittest.TestCase):
         self.assertEqual(report.skipped, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ResumePathTests(unittest.TestCase):
@@ -521,3 +519,7 @@ class ResumePathTests(unittest.TestCase):
     def test_default_and_last_still_work(self):
         self.assertTrue(self._open(None).path.suffix == ".jsonl")
         self.assertTrue(self._open("last").path.suffix == ".jsonl")
+
+
+if __name__ == "__main__":
+    unittest.main()

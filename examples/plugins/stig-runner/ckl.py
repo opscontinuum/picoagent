@@ -120,7 +120,7 @@ class Checklist:
     asset: dict[str, str]
     stig_info: dict[str, str]
     rules: list[Rule]
-    unsaved_edits: int = 0        #: determinations changed since load or last write
+    unsaved_edits: int = 0        #: determinations and ASSET fills since load or last write
 
     # ------------------------------------------------------------------ reading
 
@@ -184,6 +184,7 @@ class Checklist:
     def set_asset(self, **fields: str) -> dict[str, str]:
         """Fill ``<ASSET>`` children. Unknown names and ``TARGET_KEY`` raise; ``None`` skips."""
         asset = self.tree.getroot().find("ASSET")
+        written = 0
         for name, value in fields.items():
             tag = name.upper()
             if value is None:
@@ -194,7 +195,12 @@ class Checklist:
                 raise CklError(f"unknown ASSET field {tag}")
             _set_text(asset, tag, str(value))
             self.asset[tag] = str(value)
-        self.unsaved_edits += 1
+            written += 1
+        # One edit per call, and none when every value was None: that call left the tree exactly
+        # as it was, and counting it sends the assessor to stig_save to clear a state nothing
+        # caused - including the session-end warning, raised over an edit that never happened.
+        if written:
+            self.unsaved_edits += 1
         return dict(self.asset)
 
     # ------------------------------------------------------------------ writing

@@ -70,9 +70,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import __version__
 from ..core.loop import Runtime
 from .api import PluginAPI
-from .manifest import Manifest
+from .manifest import Manifest, unmet_requirements
 
 log = logging.getLogger("picoagent.plugins")
 # file:// counts: an air-gapped site may mirror plugins onto a shared mount rather than
@@ -913,6 +914,11 @@ def load_plugin(root: Path, rt: Runtime, trust: TrustStore, *, allow_untrusted: 
         log.warning("plugin '%s' is not trusted (new or changed). Run: picoagent plugin trust %s",
                     manifest.name, root)
         return None
+    for complaint in unmet_requirements(manifest, __version__):
+        # Said before the import, so the author hears it even if `register()` then falls over on
+        # the very thing the constraint was about. Said and then passed by: see
+        # `unmet_requirements` for why this field does not get to refuse a plugin.
+        log.warning("plugin '%s' %s; loading it anyway", manifest.name, complaint)
     api = PluginAPI(rt, manifest.name, manifest.root)
     if manifest.required:
         # Seeded, not checked separately: a manifest declaration and a runtime one are the same
@@ -969,11 +975,6 @@ def discover(cfg: dict, extra_paths: list[str]) -> list[Discovered]:
     for path in extra_paths:
         add(Path(path).expanduser().resolve(), CLI)
     return found
-
-
-def discover_roots(cfg: dict, extra_paths: list[str]) -> list[Path]:
-    """All plugin directories in load order (see module docstring)."""
-    return [entry.root for entry in discover(cfg, extra_paths)]
 
 
 @dataclass(frozen=True)

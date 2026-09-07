@@ -13,6 +13,7 @@ Tool-call arguments arrive in fragments and are reassembled per ``index``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import threading
@@ -147,17 +148,34 @@ class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        refusal = self._refusal(req, newurl)
+        if refusal is None:
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+        # `fp` is the live 302, and urllib reads and closes it only after this method *returns*.
+        # Refusing is the one path that never returns, so it is the one path that has to close it;
+        # otherwise the connection is left to the garbage collector and turns up later as
+        # `ResourceWarning: unclosed <socket.socket ...>` in whatever code was running by then.
+        with contextlib.suppress(Exception):
+            # Suppressed rather than reported: a socket that objects on the way down would raise
+            # in place of the refusal, and the caller would read a security answer as an I/O
+            # failure. Nothing this close can say changes what the request may not do.
+            fp.close()
+        raise RedirectRefused(refusal)
+
+    @staticmethod
+    def _refusal(req, newurl: str) -> str | None:
+        """Why this redirect must not be followed, or ``None`` when it may be."""
         scheme = urllib.parse.urlsplit(newurl).scheme.lower()
         if scheme not in HTTP_SCHEMES:
-            raise RedirectRefused(f"refusing to follow a redirect to {safe_for_display(newurl)}: "
-                                  f"a model endpoint must be http or https, its scheme is '{scheme}'")
+            return (f"refusing to follow a redirect to {safe_for_display(newurl)}: "
+                    f"a model endpoint must be http or https, its scheme is '{scheme}'")
         origin, target = _origin(req.full_url), _origin(newurl)
         if origin is None or target is None or origin != target:
-            raise RedirectRefused(
-                f"refusing to follow a redirect from {safe_for_display(req.full_url)} to "
-                f"{safe_for_display(newurl)}: the request body and the Authorization header on it "
-                "would go to a host you did not configure. Set base_url to the endpoint you mean")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+            return (f"refusing to follow a redirect from {safe_for_display(req.full_url)} to "
+                    f"{safe_for_display(newurl)}: the request body and the Authorization header "
+                    "on it would go to a host you did not configure. Set base_url to the "
+                    "endpoint you mean")
+        return None
 
 
 #: The opener every request in this module goes through, so the redirect rule cannot be bypassed by

@@ -22,6 +22,7 @@ in `picoagent/testing/fakes.py`.
 | `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
 | `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
 | `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
+| `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
 | `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |

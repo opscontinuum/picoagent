@@ -165,8 +165,6 @@ class TruncateAndRegistryTests(unittest.TestCase):
         self.assertEqual(len(reg.specs()), 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ConfinementTests(unittest.TestCase):
@@ -205,3 +203,7 @@ class ConfinementTests(unittest.TestCase):
                                     tool_ctx(self.tmp, confine_to_project=True)))
         self.assertTrue(r.is_error)
         self.assertEqual(self.outside.read_text(), "out\n", "the file must not have been written")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -23,6 +23,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from picoagent.core.provider import RedirectRefused, _SameOriginRedirects
 from picoagent.core.tools import truncate
 from picoagent.core.types import ToolResult
 
@@ -63,6 +64,21 @@ class ESClient:
             # spells out exactly which two checks are being given up.
             self._ctx.check_hostname = False
             self._ctx.verify_mode = ssl.CERT_NONE
+        # Every request goes through this opener, so the redirect rule cannot be lost by forgetting
+        # it at one call site. urllib re-sends the ``Authorization`` header to whatever a
+        # ``Location`` names, so a 302 - from a proxy in front of the cluster, or from anything that
+        # can answer for it - would deliver the API key or the Basic password, and the query in the
+        # body, to a host the user never configured. Core's ``_SameOriginRedirects`` refuses that
+        # redirect rather than following it without the header; a stripped-header request still
+        # arrives, and what the assessor is searching for is itself worth reading.
+        #
+        # Built here rather than reusing core's ``_OPENER`` because ``opener.open()`` takes no
+        # ``context=``: the TLS context above is this client's own, so the opener has to carry it.
+        # Importing a name core spells with a leading underscore is deliberate - a copied security
+        # control drifts silently, while a rename in core fails this plugin's import loudly, which
+        # is the failure a human notices. See the same note in the vertex-provider plugin.
+        self._opener = urllib.request.build_opener(_SameOriginRedirects,
+                                                   urllib.request.HTTPSHandler(context=self._ctx))
 
     def request(self, method: str, path: str, body: dict | None = None, raw: bool = False) -> Any:
         """``raw=True`` returns the decoded body unparsed - ``_nodes/hot_threads`` answers plain
@@ -71,11 +87,15 @@ class ESClient:
                                      data=json.dumps(body).encode() if body is not None else None,
                                      headers={"Content-Type": "application/json", **({"Authorization": self._auth} if self._auth else {})})
         try:
-            with urllib.request.urlopen(req, timeout=60, context=self._ctx) as resp:
+            with self._opener.open(req, timeout=60) as resp:
                 payload = resp.read()
                 return payload.decode(errors="replace") if raw else json.loads(payload or b"null")
         except urllib.error.HTTPError as exc:
             raise ESError(f"HTTP {exc.code} {method} {path}: {exc.read().decode(errors='replace')[:800]}") from exc
+        except RedirectRefused as exc:
+            # A refused redirect is an expected failure like any other: the tools turn ESError into
+            # a result, and anything else would raise out of a tool's ``run`` instead of reporting.
+            raise ESError(str(exc)) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise ESError(f"cannot reach {self.url}: {exc}") from exc
 

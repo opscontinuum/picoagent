@@ -1,7 +1,7 @@
 """Runs the full agent loop (prompt -> tool call -> tool exec -> second turn) against a fake server
 for each provider dialect. Standard library only:  python -m unittest discover -s tests -v"""
 from __future__ import annotations
-import asyncio, json, os, sys, tempfile, threading, unittest
+import asyncio, json, os, sys, tempfile, threading, unittest, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -11,7 +11,8 @@ from picoagent.core.config import load_config                       # noqa: E402
 from picoagent.core.loop import AgentLoop, Runtime                  # noqa: E402
 from picoagent.core.session import Session                          # noqa: E402
 from picoagent.core.tools import BUILTIN_TOOLS                      # noqa: E402
-from picoagent.core.provider import OpenAICompatProvider            # noqa: E402
+from picoagent.core.provider import (OpenAICompatProvider, RedirectRefused,  # noqa: E402
+                                     _SameOriginRedirects)
 from picoagent.plugins import loader                                # noqa: E402
 from picoagent import cli                                           # noqa: E402
 from picoagent.testing.fakes import FakeServer  # noqa: E402
@@ -254,8 +255,6 @@ class TemperatureTests(unittest.TestCase):
             self.assertNotIn("temperature", srv.requests[0]["body"]["generationConfig"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class BaseUrlSchemeTests(unittest.TestCase):
@@ -439,3 +438,52 @@ class RedirectTests(unittest.TestCase):
         followed = [headers.get("Authorization") for path, headers in server.received
                     if path == "/v2/models"]
         self.assertEqual(followed, [f"Bearer {self.key}"])
+
+
+class _OpenResponse:
+    """Stands in for the live 302 ``urllib`` hands to ``redirect_request``."""
+
+    def __init__(self, closing_raises: Exception | None = None):
+        self.closed, self._closing_raises = False, closing_raises
+
+    def close(self) -> None:
+        self.closed = True
+        if self._closing_raises is not None:
+            raise self._closing_raises
+
+
+class RefusedRedirectClosesTheResponse(unittest.TestCase):
+    """A refusal returns nothing to ``urllib``, and ``urllib`` reads and closes the 302 only on
+    the path that returns. So the response the refusal arrived on is the refuser's to close:
+    left to the collector it surfaces as ``ResourceWarning: unclosed <socket.socket ...>`` in
+    whatever unrelated test is running when the collection falls due.
+    """
+
+    def _refuse(self, response: _OpenResponse, newurl: str = "https://elsewhere.example/v1/models"):
+        request = urllib.request.Request("https://gateway.example/v1/models")
+        return _SameOriginRedirects().redirect_request(
+            request, response, 302, "Found", {}, newurl)
+
+    def test_the_response_a_refusal_arrived_on_is_closed(self):
+        response = _OpenResponse()
+        with self.assertRaises(RedirectRefused):
+            self._refuse(response)
+        self.assertTrue(response.closed)
+
+    def test_a_close_that_fails_does_not_speak_in_place_of_the_refusal(self):
+        """The refusal is the security answer; an I/O error from the socket on the way down
+        would replace it with something the caller reports as a transport failure instead."""
+        response = _OpenResponse(closing_raises=OSError("connection already reset"))
+        with self.assertRaises(RedirectRefused):
+            self._refuse(response)
+
+    def test_a_followable_redirect_leaves_the_response_open(self):
+        """``urllib`` reads and closes it itself once this returns, and hands it to an
+        ``HTTPError`` on the method check inside the base class - closing early breaks both."""
+        response = _OpenResponse()
+        self.assertIsNotNone(self._refuse(response, "https://gateway.example/v2/models"))
+        self.assertFalse(response.closed)
+
+
+if __name__ == "__main__":
+    unittest.main()

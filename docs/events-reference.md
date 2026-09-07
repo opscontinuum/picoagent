@@ -28,6 +28,12 @@ the payload for later handlers and for the core.
 Plugins can define their own events with `await api.emit("thing", {...})`; other plugins
 subscribe to `"<plugin-name>:thing"`.
 
+`api.on` warns on stderr when the name is neither one of the events above nor a namespaced
+`<plugin>:<event>` one, because a typo is the one plugin mistake with no other symptom: the
+plugin loads, the loader reports it running, and the handler is never called. It is a warning
+and not a refusal - the handler is still subscribed - since an event may come from a plugin
+that has not loaded yet, or from a newer picoagent than the one you are reading.
+
 ## Emitted to the frontend, not to the bus
 
 Some things happen outside a turn and go straight to the frontend. `api.on` does not reach

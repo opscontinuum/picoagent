@@ -392,8 +392,6 @@ class ServerlessTests(EsAdminBase):
         self.assertIn("daily-1", r.content)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AllocationExplainWordingTests(unittest.TestCase):
@@ -437,3 +435,7 @@ class AllocationExplainWordingTests(unittest.TestCase):
         if found:
             self.assertIn("inflight_requests", found)
             self.assertNotIn("in_flight_requests", found)
+
+
+if __name__ == "__main__":
+    unittest.main()

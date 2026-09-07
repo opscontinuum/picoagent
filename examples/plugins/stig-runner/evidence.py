@@ -126,6 +126,10 @@ class ScanResult:
     skipped_binary: int = 0
     skipped_outside: int = 0       #: symlinks resolving outside the root
     cap_reached: bool = False
+    #: Files already counted in ``skipped_binary``. One walk feeds every probe, so the same file
+    #: is offered to ``read_text`` once per probe kind that wants it, and counting each offer
+    #: reported more files skipped than the repository holds.
+    binary_seen: set[Path] = field(default_factory=set, repr=False)
 
 
 class ContainmentError(Exception):
@@ -201,7 +205,9 @@ def read_text(path: Path, scan: ScanResult) -> str | None:
         with path.open("rb") as handle:
             prefix = handle.read(BINARY_SNIFF_BYTES)
             if b"\x00" in prefix:
-                scan.skipped_binary += 1
+                if path not in scan.binary_seen:
+                    scan.binary_seen.add(path)
+                    scan.skipped_binary += 1
                 return None
             rest = handle.read()
     except OSError:
@@ -287,9 +293,13 @@ def _probe_grep(files: list[Path], relatives: dict[Path, str], results: list[Pro
     """Every grep probe against every line, reading each file at most once.
 
     All the probes are matched inside one pass over a file's lines rather than one pass each,
-    for the reason ``run_probes`` walks once: reading is what costs. A probe already at
-    ``max_hits`` is dropped from the pass, so a pattern that matches everything stops paying
-    for itself instead of scanning the rest of the tree to throw the matches away.
+    for the reason ``run_probes`` walks once: reading is what costs. A probe leaves the pass once
+    it is *known truncated*, not once it is full: the hit that overflows the cap is the only thing
+    that proves the evidence was cut, so a full probe has to stay in and be offered one. Dropping
+    it at full instead returned five hits and ``truncated = False`` for a rule with six, which
+    reads as complete evidence. Once truncated there is nothing further to learn, so a pattern
+    that matches everything still stops paying for itself rather than scanning the rest of the
+    tree to throw the matches away.
     """
     compiled = [(result, re.compile(result.probe.pattern,
                                     re.IGNORECASE if result.probe.ignore_case else 0))
@@ -300,7 +310,7 @@ def _probe_grep(files: list[Path], relatives: dict[Path, str], results: list[Pro
         relative = relatives[path]
         wanted = [(result, regex) for result, regex in compiled
                   if _matches_globs(relative, path.name, result.probe.globs)
-                  and not _is_full(result, max_hits)]
+                  and not result.truncated]
         if not wanted:
             continue
         content = read_text(path, scan)
@@ -308,17 +318,17 @@ def _probe_grep(files: list[Path], relatives: dict[Path, str], results: list[Pro
             continue
         for number, line in enumerate(content.splitlines(), 1):
             for result, regex in wanted:
-                if not _is_full(result, max_hits) and regex.search(line):
+                if not result.truncated and regex.search(line):
                     _record_hit(result, Hit(relative, number, excerpt(line)), max_hits)
 
 
-def _is_full(result: ProbeResult, max_hits: int) -> bool:
-    """Whether ``result`` has all the hits it is allowed to keep."""
-    return len(result.hits) >= max_hits
-
-
 def _record_hit(result: ProbeResult, hit: Hit, max_hits: int) -> None:
-    """Keep ``hit``, or mark the result truncated once ``max_hits`` of them are already kept."""
+    """Keep ``hit``, or - when ``max_hits`` are already kept - record that one was thrown away.
+
+    Truncation is set by the discarded hit and by nothing else, which is what separates evidence
+    that was cut from evidence that merely filled the cap exactly: five matches under a cap of
+    five are complete and are not flagged, a sixth is what makes the note true.
+    """
     if len(result.hits) >= max_hits:
         result.truncated = True
         return

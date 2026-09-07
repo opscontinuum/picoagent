@@ -16,7 +16,16 @@ entry = "my_plugin:register"          # module:function, relative to this direct
 description = "One line users see when installing"
 python_deps = []                       # pip-installed by `picoagent plugin add`
 skills = ["skills"]                    # optional: folders of SKILL.md to expose
+requires = ["picoagent>=0.1"]          # optional: the picoagent versions this plugin expects
 ```
+
+`requires` is checked at load time and answered with a warning, never a refusal. A constraint the
+running picoagent does not meet prints the plugin's name, what it asked for and what is actually
+running, and then the plugin loads anyway; so does an entry that cannot be read as a constraint on
+picoagent's version at all. The warning is for you, so that a plugin written against a newer
+picoagent says so instead of failing in the middle of `register()`. It is not a gate, because a
+version line is not worth a user losing a plugin over. A package your code imports is not this
+field: put it in `python_deps`.
 
 If your plugin is a security control rather than a convenience, add two more lines. See
 [If being skipped is not acceptable](#if-being-skipped-is-not-acceptable).
@@ -146,9 +155,25 @@ stop a tool call. Handlers may be sync or async. See [events-reference.md](event
 
 ```python
 api.register_tool(MyTool())                      # object with name/description/parameters/execute
+api.unregister_tool("shell")                     # remove one outright, not just hide it
 api.register_skill(skill)                        # or list folders in plugin.toml `skills`
 api.register_system_prompt_section("mine", lambda: "# House rules\n...")
+api.remove_system_prompt_section("mine")         # the other half; an unknown name does nothing
 ```
+
+Every registration has an undo on this object, and this is the one for prompt sections. Removing a
+name that was never registered is not an error, the same answer `unregister_tool` gives, so a
+plugin can undo its own work without first proving it did any. It is also not the same as
+re-registering the section with a render that returns `""`: the prompt reads alike either way,
+because `build()` skips an empty section, but a blanked section is still registered, still called
+every turn, and still the entry another plugin's section of that name would replace. Remove it when
+you mean it to be gone; blank it when you mean it to be empty this turn.
+
+`unregister_tool` and `set_active_tools` are not the same removal. `set_active_tools` narrows
+what the *model* is offered and is reversible with `None`; the tool is still registered, so
+another plugin can find it with `rt.tools.get(name)` and run it. `unregister_tool` takes it out
+of the process. Use the first for a plan or read-only mode, the second when the tool must not
+exist for anyone.
 
 **Add things the user can use**
 
@@ -171,7 +196,12 @@ api.register_provider(MyProvider())              # then --provider myprovider
 await api.set_model("gpt-4.1", provider="openai")
 api.set_thinking("high")
 api.set_active_tools(["read", "shell"])          # read-only mode; None restores all
+api.get_active_tools()                           # what is offered now; all_tools() is everything
 ```
+
+Read the active set before you narrow it. `api.set_active_tools(["read"])` replaces whatever
+another plugin set, so a plugin that only wants `shell` gone should subtract from what is there:
+`api.set_active_tools([t for t in api.get_active_tools() if t != "shell"])`.
 
 **Talk to the model or the user**
 
@@ -216,7 +246,15 @@ api.plugin_config()                              # [plugins.my-plugin] from conf
 ```python
 code, output = await api.exec("git", "status")
 code, output = await api.exec("gh", "pr", "list", env={"GH_TOKEN": token})   # named, not inherited
+code, output = await api.exec("make", "build", timeout=600)                  # default is 60s
 ```
+
+A command that runs past its `timeout` comes back as `(124, "timed out after 600s")` rather than
+raising, so the timeout is a result you can report like any other. The child gets a SIGTERM, then a
+SIGKILL if it is still there, and it is waited for either way, so nothing it left behind outlives
+the call. It runs in a process group of its own, which is what makes that reach the children a
+`api.exec("sh", "-c", ...)` started for itself. Nothing the command printed before the timeout
+survives - the read is cancelled with it - so there is no partial output to inspect.
 
 ## Spawning a process
 

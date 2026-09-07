@@ -345,8 +345,6 @@ class _DummyOpenAI:
         yield  # pragma: no cover - never reached, keeps this an async generator
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ArgumentNameCoverageTests(unittest.TestCase):
@@ -392,3 +390,7 @@ class ArgumentNameCoverageTests(unittest.TestCase):
         """Arguments are model output: ints, bools, dicts and None must not crash the guard."""
         self.assertIsNone(self.guard("t", {"n": 5, "ok": True, "d": {"a": 1}, "z": None,
                                            "items": [1, 2, None]}))
+
+
+if __name__ == "__main__":
+    unittest.main()

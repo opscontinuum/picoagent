@@ -8,17 +8,38 @@ Example::
     description = "Ask before destructive commands"
     python_deps = []                      # pip-installed on `picoagent plugin add`
     skills = ["skills"]                   # directories of SKILL.md to expose
-    requires = ["picoagent>=0.1"]         # informational for now
+    requires = ["picoagent>=0.1"]         # warned about when this picoagent does not meet it
     required = true                       # this session should not run without me
     required_reason = "the only check on destructive commands"
+
+``requires`` is read at load time by :func:`unmet_requirements` and answered with a warning
+naming the plugin, the constraint and the running version - never with a refusal. It was
+informational for a long time, which means eight shipped manifests wrote it against nothing
+that checked it, so the first reader of a field like that meets declarations nobody has tested.
+Warning tells the author what is wrong; refusing would invent a new way for a user to lose a
+plugin over a line they may not have written.
 """
 from __future__ import annotations
 
+import operator
+import re
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..core.text import describe_exception
+
+#: A ``requires`` entry: a name, and optionally a comparison against a numeric version. This is
+#: the grammar the shipped manifests write and the one the docs show, and no more of PEP 508 than
+#: that - a grammar nothing writes is a grammar nothing has ever checked.
+_REQUIREMENT = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)"
+                          r"(?:\s*(?P<op><=|>=|==|!=|<|>)\s*(?P<version>[0-9]+(?:\.[0-9]+)*))?$")
+
+_COMPARE: dict[str, Callable[[tuple[int, ...], tuple[int, ...]], bool]] = {
+    ">=": operator.ge, ">": operator.gt, "<=": operator.le,
+    "<": operator.lt, "==": operator.eq, "!=": operator.ne,
+}
 
 
 class ManifestError(Exception):
@@ -54,7 +75,8 @@ class Manifest:
     description: str = ""
     python_deps: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
-    prompts: list[str] = field(default_factory=list)
+    #: Version constraints on picoagent itself, read by :func:`unmet_requirements` and reported
+    #: as a warning at load time. Not a gate: see that function for why it cannot become one.
     requires: list[str] = field(default_factory=list)
     #: Declared here rather than only through ``api.declare_required`` because the loader has to
     #: know before it runs anything. A plugin the trust check refuses never reaches ``register()``,
@@ -124,10 +146,66 @@ class Manifest:
                         version=version if isinstance(version, str) else "0.0.0",
                         description=description if isinstance(description, str) else "",
                         python_deps=_string_list(data.get("python_deps")),
-                        skills=_string_list(data.get("skills")), prompts=_string_list(data.get("prompts")),
+                        skills=_string_list(data.get("skills")),
                         requires=_string_list(data.get("requires")),
                         # `is True` rather than a truth test: this field decides whether a session
                         # refuses to start, so `required = "no"` must not read as yes.
                         required=data.get("required") is True,
                         required_reason=reason if isinstance(reason, str) else "",
                         root=path.parent)
+
+
+def _release(version: str) -> tuple[int, ...] | None:
+    """``"0.1.0"`` -> ``(0, 1, 0)``; ``None`` for anything that is not plain dotted numbers."""
+    parts = version.split(".")
+    return tuple(int(part) for part in parts) if all(part.isdigit() for part in parts) else None
+
+
+def _padded(release: tuple[int, ...], width: int) -> tuple[int, ...]:
+    """Trailing zeros, so ``0.1`` and ``0.1.0`` compare as the same version rather than as
+    a shorter tuple that sorts below the longer one."""
+    return release + (0,) * (width - len(release))
+
+
+def _satisfies(running: str, op: str | None, wanted: str) -> bool:
+    """Whether ``running`` meets ``<op><wanted>``.
+
+    True whenever there is nothing to compare: a bare name asks for any version at all, and a
+    running version that is not plain numbers is picoagent's own doing - a plugin author is not
+    the person to tell about it.
+    """
+    if op is None:
+        return True
+    left = _release(running)
+    if left is None:
+        return True
+    right = _release(wanted) or ()
+    width = max(len(left), len(right))
+    return _COMPARE[op](_padded(left, width), _padded(right, width))
+
+
+def unmet_requirements(manifest: Manifest, running: str) -> list[str]:
+    """What is worth saying about ``manifest.requires``, as sentences about this plugin.
+
+    Two kinds of entry earn a line: one the running picoagent does not satisfy, and one that
+    cannot be read as a constraint on picoagent at all. The second is a value the author wrote
+    and nothing has ever answered, so it is reported rather than dropped - a constraint that is
+    silently ignored is indistinguishable from one that passed.
+
+    Neither is a refusal, and that is the decision rather than an omission. ``requires`` shipped
+    as informational; eight manifests wrote it against nothing, so the first check on it meets
+    declarations no one has tested. Refusing on that would invent a way for a user to lose a
+    plugin over a line they may not have written - possibly the plugin that carries the fix.
+    A warning names the mismatch to the person who can correct it, which is the whole of what
+    this field has standing to do.
+    """
+    complaints: list[str] = []
+    for entry in manifest.requires:
+        match = _REQUIREMENT.match(entry.strip())
+        if match is None or match["name"].lower() != "picoagent":
+            complaints.append(f"declares requires = {entry!r}, which is not a constraint on "
+                              "picoagent's own version (a package your code imports belongs in "
+                              "python_deps)")
+        elif not _satisfies(running, match["op"], match["version"]):
+            complaints.append(f"requires {entry!r} and this is picoagent {running}")
+    return complaints

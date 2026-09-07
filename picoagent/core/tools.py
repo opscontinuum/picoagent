@@ -219,6 +219,23 @@ def is_windows() -> bool:
     return platform.system() == "Windows"
 
 
+def own_process_group() -> dict[str, Any]:
+    """The spawn keyword that makes a child lead a process group of its own, per platform.
+
+    Every child :func:`kill_process_tree` may be asked to end must be spawned with this. The
+    kill signals the *group*, which is how it reaches the grandchildren a shell started; a
+    child left in picoagent's own group would make ``os.killpg`` signal picoagent instead,
+    and the terminal it was started from with it.
+    """
+    if is_windows():
+        import subprocess  # local: CREATE_NEW_PROCESS_GROUP only exists on the Windows build
+        # getattr, not a direct attribute access: the constant is only defined by the subprocess
+        # module when the *real* interpreter is Windows, independent of the is_windows() check
+        # above - this keeps the branch exercisable by mocking is_windows() in tests on any OS.
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
 async def spawn_shell(command: str, cwd: Path, env: dict) -> asyncio.subprocess.Process:
     """Start ``command`` in the platform's real shell: PowerShell on Windows, ``/bin/sh``
     elsewhere. ``cmd.exe`` (the default for ``create_subprocess_shell`` on Windows) doesn't
@@ -226,29 +243,67 @@ async def spawn_shell(command: str, cwd: Path, env: dict) -> asyncio.subprocess.
     explicit PowerShell invocation rather than the plain cross-platform shell call.
     """
     if is_windows():
-        import subprocess  # local: CREATE_NEW_PROCESS_GROUP only exists on the Windows build
-        # getattr, not a direct attribute access: the constant is only defined by the subprocess
-        # module when the *real* interpreter is Windows, independent of the is_windows() check
-        # above - this keeps the branch exercisable by mocking is_windows() in tests on any OS.
-        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return await asyncio.create_subprocess_exec(
             "powershell", "-NoProfile", "-NonInteractive", "-Command", command, cwd=cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
-            creationflags=creation_flags,  # lets kill_process_tree reach the whole tree
+            **own_process_group(),
         )
     return await asyncio.create_subprocess_shell(
         command, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        env=env, start_new_session=True,  # own process group so we can kill children on timeout
+        env=env, **own_process_group(),
     )
 
 
-async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
-    """Kill the whole process tree and reap it, so a timed-out command can't leak children.
+#: How long a killed tree gets to actually go, before it is left un-reaped and reported. Only a
+#: process the kernel cannot interrupt reaches this, and the caller still has to answer somebody.
+_REAP_TIMEOUT = 5.0
 
-    POSIX: SIGKILL the process group ``start_new_session`` made ``proc`` the leader of.
-    Windows: process groups work differently and there's no ``os.killpg`` at all, so this
+
+def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> bool:
+    """Send ``sig`` to the group ``proc`` leads; ``False`` if the group is already gone.
+
+    The answer is what tells an escalation apart from a pointless second signal: a tree that
+    has left needs no SIGKILL, and asking again would only race a reused pid.
+    """
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _exited(proc: asyncio.subprocess.Process, seconds: float) -> bool:
+    """Wait up to ``seconds`` for ``proc`` to exit *and be reaped*; ``False`` if it is still there."""
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 0.0) -> None:
+    """End the whole process tree and reap it, so a timed-out command can't leak children.
+
+    ``proc`` must have been spawned with :func:`own_process_group`, because the signals go to
+    the group: killing the direct child alone reparents its own children to init, where nothing
+    in this session can see or stop them.
+
+    POSIX: signal the process group ``start_new_session`` made ``proc`` the leader of - SIGKILL,
+    or SIGTERM first when ``grace`` asks for it. Windows: process groups work differently and there's no ``os.killpg`` at all, so this
     shells out to ``taskkill /T`` (kill the tree) instead - the standard way to do this from
     pure stdlib on Windows.
+
+    ``grace`` seconds, on POSIX, buys the tree a SIGTERM first, and SIGKILL follows only if it
+    is still there afterwards: a child holding a lock or half a written file gets its chance to
+    undo that, and a child that ignores SIGTERM still does not survive. Windows is offered no
+    such choice because it has none to make - ``TerminateProcess`` is what both ``terminate()``
+    and ``kill()`` call there, and ``taskkill`` without ``/F`` posts ``WM_CLOSE``, which a
+    console child has no message loop to receive.
+
+    The reap is bounded by :data:`_REAP_TIMEOUT` rather than awaited forever. A process wedged in
+    an uninterruptible kernel wait outlives SIGKILL itself, and the caller - a tool result, a
+    plugin's ``api.exec`` - has to answer somebody. One warned-about un-reaped child beats a
+    session that never returns.
     """
     if is_windows():
         killer = await asyncio.create_subprocess_exec(
@@ -256,14 +311,11 @@ async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await killer.wait()
     else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except asyncio.TimeoutError:
-        log.warning("timed-out command did not exit after being killed")
+        asked = grace > 0 and _signal_group(proc, signal.SIGTERM)
+        if not (asked and await _exited(proc, grace)):
+            _signal_group(proc, signal.SIGKILL)
+    if proc.returncode is None and not await _exited(proc, _REAP_TIMEOUT):
+        log.warning("process %s did not exit after being killed; leaving it un-reaped", proc.pid)
 
 
 class ShellTool:

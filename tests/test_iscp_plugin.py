@@ -619,8 +619,6 @@ class CommandTests(PluginBase):
             self.assertIn(f"{section:5}", summary)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ConfinementTests(unittest.TestCase):
@@ -722,3 +720,7 @@ class ProjectConfigLayerTests(unittest.TestCase):
         notices = "\n".join(payload["text"] for event, payload in rt.frontend.events if event == "notice")
         self.assertIn("iscp-author: ignored answers, output", notices)
         self.assertIn("read from your own config only", notices)
+
+
+if __name__ == "__main__":
+    unittest.main()

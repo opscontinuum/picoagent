@@ -19,7 +19,9 @@ Configuration (``[plugins.vertex-provider]`` **in your own config.toml**, or env
 Every one of these decides where an OAuth bearer token is sent, so all four are read from the
 user layer of the config only - ``api.plugin_config()`` does not carry a repository's values.
 A cloned repository setting ``base_url`` would receive a live Google access token, minted from
-your ``gcloud`` login, on the first turn. See ``docs/security/trust-boundaries.md``.
+your ``gcloud`` login, on the first turn. See ``docs/security/trust-boundaries.md``. A redirect
+cannot move the token either: the request goes through core's opener, which refuses a redirect
+that leaves the origin ``base_url`` names rather than following it to a host you did not choose.
 
 Run with:  picoagent --provider vertex -m gemini-2.5-pro
 """
@@ -34,6 +36,18 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+# Core's opener, rather than a plain ``urlopen`` or a copy of core's redirect handler. urllib
+# re-sends the ``Authorization`` header to whatever a ``Location`` names, so a 302 from a gateway
+# would hand a live Google OAuth token, and the conversation in the request body, to a host the
+# user never configured; the handler behind this opener refuses such a redirect instead of
+# following it with the header dropped, because the body is worth stealing on its own.
+#
+# The leading underscore says core promises nothing about the name, and this plugin takes that
+# trade knowingly: a copied security control goes stale silently, while a rename in core breaks
+# this import loudly at plugin load, where a human reads it. Core should export the opener (or a
+# builder for one) as public API and say in docs/plugin-authoring.md that a plugin sending a
+# credential over HTTP is expected to use it; until it does, this is the honest import.
+from picoagent.core.provider import _OPENER as SAME_ORIGIN_OPENER
 from picoagent.core.types import Message, StreamEvent, ToolCall, new_id
 
 # Gemini's function-declaration schema is an OpenAPI subset; anything else is rejected with 400.
@@ -163,9 +177,20 @@ class VertexProvider:
     @staticmethod
     def _read_sse(request, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
         """Thread body: push each ``data:`` JSON object, an Exception on failure, then ``None``."""
-        put = lambda item: loop.call_soon_threadsafe(queue.put_nowait, item)  # noqa: E731
+        def put(item) -> None:
+            """Hand ``item`` to the consumer, or drop it once there is no consumer left.
+
+            ``stream`` returns on the first error event - a refused redirect, an HTTP failure -
+            and its loop is closed while this thread is still finishing. ``call_soon_threadsafe``
+            raises on a closed loop, and this thread has nowhere to report that, so it would die
+            printing a traceback about an outcome the session already handled.
+            """
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+            except RuntimeError:
+                pass
         try:
-            with urllib.request.urlopen(request, timeout=600) as response:
+            with SAME_ORIGIN_OPENER.open(request, timeout=600) as response:
                 for raw in response:
                     line = raw.decode("utf-8", errors="replace").strip()
                     if line.startswith("data:"):

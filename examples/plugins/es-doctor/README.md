@@ -76,6 +76,15 @@ remain `es_request` plus `allow_destructive`, and the skills say so at every bra
 Kibana, Fleet or Watcher APIs, no cross-cluster search or CCR, no security diagnostics, and
 no "auto-fix" mode: the tools gather evidence and the user decides.
 
+### Where the credential goes
+
+To the `url` you configured, and nowhere else. A redirect that leaves that origin - a different
+host, port or scheme - is refused rather than followed, because urllib re-sends the
+`Authorization` header to whatever the `Location` names, and dropping the header would still
+deliver the query in the body. If your cluster sits behind something that answers `http://` with
+a redirect to `https://`, configure the `https://` URL: that is the address the key should have
+been sent to in the first place.
+
 ### Versions
 
 Targets Elasticsearch 7.10+ and 8.x. `_index_template`, `_component_template` and
