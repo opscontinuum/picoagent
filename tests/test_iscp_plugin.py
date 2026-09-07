@@ -511,6 +511,45 @@ class RunbookTests(unittest.TestCase):
         self.assertIn("TODO(iscp_import_cis)", document)
 
 
+class CiInventorySiteTests(unittest.TestCase):
+    """The Site column of CI-inventory.md, which a person signs.
+
+    Table 2.5 records a site by Designation, Site Name, Site Type and Address. It has no region
+    column, so a Configuration Item joins to it by site name: its own ``site`` where the estate
+    records one, and its ``region`` only when the user accepted the region prefill, which writes
+    each distinct region into a Site Name cell. Every case here uses a site name a user typed,
+    which is exactly what the prefill never produces.
+    """
+
+    ASHBURN = [{"Designation": "Primary Site", "Site Name": "Ashburn DC", "Site Type": "Hot Sites",
+                "Address": "44 Example Way, Ashburn VA"}]
+
+    def ci(self, **overrides) -> iac_inventory.CI:
+        fields = {"ci_id": "CI-001", "name": "orders", "address": "aws_db_instance.orders",
+                  "resource_type": "aws_db_instance", "category": "database", "cloud": "aws",
+                  "region": "us-east-1", "source": "main.tf"}
+        return iac_inventory.CI(**{**fields, **overrides})
+
+    def row_for(self, ci: iac_inventory.CI, answers: dict) -> str:
+        document = iscp_render.render_ci_inventory([ci], answers)
+        return next(line for line in document.splitlines() if line.startswith("| CI-001 "))
+
+    def test_a_site_name_the_user_typed_resolves_to_its_designation(self):
+        row = self.row_for(self.ci(site="Ashburn DC"), {"sites": self.ASHBURN})
+        self.assertIn("Primary Site", row,
+                      f"Table 2.5 designates Ashburn DC the primary site: {row!r}")
+
+    def test_a_site_absent_from_table_2_5_is_visible_rather_than_blank(self):
+        row = self.row_for(self.ci(), {"sites": self.ASHBURN})
+        self.assertIn("TODO(sites)", row,
+                      f"us-east-1 is in no Table 2.5 row, and the reader has to see that: {row!r}")
+
+    def test_an_accepted_region_prefill_still_resolves(self):
+        prefilled = [{"Designation": "Alternate Site", "Site Name": "us-east-1",
+                      "Site Type": "Warm Sites", "Address": ""}]
+        self.assertIn("Alternate Site", self.row_for(self.ci(), {"sites": prefilled}))
+
+
 class RenderToolTests(PluginBase):
     def test_render_writes_the_whole_set_and_reports_what_is_open(self):
         self.seed(SAMPLE_ANSWERS)

@@ -676,6 +676,19 @@ def _interval_seconds(text: str) -> int:
     return int(text[:-1]) * units[text[-1]]
 
 
+def _nearest_rank(values: list, percent: float):
+    """The value at ``percent`` by nearest rank, or ``None`` when there is nothing to rank.
+
+    ``values`` must already be sorted. Nearest rank rather than interpolation because a fixture
+    that invents a number between two observations makes a test pass on arithmetic the real
+    cluster never performed.
+    """
+    if not values:
+        return None
+    index = max(0, min(len(values) - 1, round(percent / 100 * len(values) + 0.5) - 1))
+    return values[index]
+
+
 def _run_aggs(docs: list[dict], aggs: dict) -> dict:
     """Compute the supported aggregation subset."""
     out: dict = {}
@@ -705,6 +718,14 @@ def _run_aggs(docs: list[dict], aggs: dict) -> dict:
             kind = "avg" if "avg" in spec else "max"
             values = [v for v in (_get(d, spec[kind]["field"]) for d in docs) if isinstance(v, (int, float))]
             out[name] = {"value": (sum(values) / len(values) if kind == "avg" else max(values)) if values else None}
+        elif "percentiles" in spec:
+            # Answered so the offline correlate demo still prints latency. A real cluster
+            # interpolates between neighbouring values; nearest-rank is close enough for a
+            # fixture and never invents a number that is not in the data.
+            values = sorted(v for v in (_get(d, spec["percentiles"]["field"]) for d in docs)
+                            if isinstance(v, (int, float)))
+            out[name] = {"values": {f"{percent:.1f}": _nearest_rank(values, percent)
+                                    for percent in spec["percentiles"].get("percents", [50])}}
         elif "filter" in spec:
             kept = [d for d in docs if _matches(d, spec["filter"])]
             out[name] = {"doc_count": len(kept), **_run_aggs(kept, sub)}

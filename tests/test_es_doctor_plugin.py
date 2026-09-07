@@ -1,6 +1,6 @@
 """es-doctor plugin: log digging, metric queries, and log<->metric<->APM correlation
 against the fake Elasticsearch incident (errors + CPU + latency spike at 10:15-10:20)."""
-import tempfile, unittest
+import statistics, tempfile, unittest
 from pathlib import Path
 from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT
 from picoagent.core.loop import AgentLoop
@@ -128,6 +128,66 @@ class GuardTests(EsDoctorBase):
     def test_raw_search_passthrough_works(self):
         r = self.tool("es_search", index="traces-apm*", body={"size": 1, "query": {"term": {"event.outcome": "failure"}}})
         self.assertIn("POST /checkout", r.content)
+
+
+class ApmLatencyTests(EsDoctorBase):
+    """The apm_p50_ms column has to be the median it is named after.
+
+    A mean over transaction durations is the one statistic that cannot be read as latency: a
+    single 10-second transaction drags it past every request an incident responder is asking
+    about. The durations below are skewed so the two figures cannot be mistaken for each
+    other, mean 1090 ms against median 100 ms.
+    """
+
+    def correlate_over(self, durations_us):
+        self.rt.tools.get("es_correlate").es = SkewedLatencyES(durations_us)
+        return self.tool("es_correlate", **WINDOW, interval="10m")
+
+    def test_apm_column_reports_the_median_not_the_mean(self):
+        r = self.correlate_over([100_000] * 9 + [10_000_000])
+        self.assertIn("apm_p50_ms", r.content)
+        row = next(line for line in r.content.splitlines() if line.startswith("2026-09-02 10:10"))
+        self.assertEqual(row.split()[-2], "100",
+                         f"apm_p50_ms must be the median (100 ms), not the mean (1090 ms): {row!r}")
+
+    def test_the_query_asks_elasticsearch_for_a_percentile(self):
+        es = SkewedLatencyES([100_000])
+        self.rt.tools.get("es_correlate").es = es
+        self.tool("es_correlate", **WINDOW, interval="10m")
+        latency = es.searches[-1]["aggs"]["t"]["aggs"]["p50"]
+        self.assertIn("percentiles", latency, f"p50 is computed by the server, not renamed: {latency}")
+        self.assertEqual(latency["percentiles"]["percents"], [50])
+
+
+class SkewedLatencyES:
+    """A stand-in Elasticsearch that answers whichever latency statistic it is asked for.
+
+    ``picoagent/testing/fake_es.py`` computes ``avg`` and ``max`` but not ``percentiles``, and
+    it is shared with the other suites and the offline demo, so the one query whose statistic
+    is under test is answered here instead. Every aggregation is computed from the sample it
+    was handed, so a tool asking for a mean gets a real mean and the test can tell which one
+    reached the column.
+    """
+
+    BUCKETS = ("2026-09-02T10:00:00.000Z", "2026-09-02T10:10:00.000Z", "2026-09-02T10:20:00.000Z")
+
+    def __init__(self, durations_us):
+        self.durations_us, self.searches = durations_us, []
+
+    def search(self, index, body):
+        self.searches.append(body)
+        sub = body["aggs"]["t"]["aggs"]
+        buckets = [{"key_as_string": key, "doc_count": len(self.durations_us),
+                    **{name: self.agg(spec) for name, spec in sub.items()}} for key in self.BUCKETS]
+        return {"hits": {"hits": [], "total": {"value": 0}}, "aggregations": {"t": {"buckets": buckets}}}
+
+    def agg(self, spec):
+        if "percentiles" in spec:
+            return {"values": {"50.0": float(statistics.median(self.durations_us))}}
+        if "avg" in spec:
+            values = self.durations_us if "duration" in spec["avg"]["field"] else [0.5]
+            return {"value": float(statistics.fmean(values))}
+        return {"doc_count": 2}
 
 
 if __name__ == "__main__":

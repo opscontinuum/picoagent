@@ -258,7 +258,7 @@ def render_ci_inventory(cis: list[CI], answers: dict) -> str:
              "artefact: ISCP Appendix H points at the Integrated Inventory Workbook, and this list "
              "is what you fill that workbook from. It also supplies the drafts offered for BIA "
              "sections 3.2 and 3.3.", ""]
-    site_of = _sites_by_region(answers)
+    designation_of = _designations_by_site_name(answers)
     lines.append(f"{len(cis)} configuration items.")
     lines.append("")
     replicated = [ci for ci in cis if ci.replication]
@@ -274,20 +274,41 @@ def render_ci_inventory(cis: list[CI], answers: dict) -> str:
                   "| CI | Name | Type | Region | Site | Source |",
                   "| --- | --- | --- | --- | --- | --- |"]
         for ci in sorted(members, key=lambda c: c.ci_id):
-            site = ci.site or site_of.get(ci.region or "", "")
             lines.append(f"| {ci.ci_id} | {ci.name} | {ci.resource_type} | {ci.region or ''} | "
-                         f"{site} | {ci.source} |")
+                         f"{_site_cell(ci, designation_of)} | {ci.source} |")
         lines.append("")
     return "\n".join(lines) + "\n"
 
 
-def _sites_by_region(answers: dict) -> dict[str, str]:
-    """Region -> Primary/Alternate, taken only from the user's Table 2.5 answer."""
+def _designations_by_site_name(answers: dict) -> dict[str, str]:
+    """Site Name -> Primary/Alternate, taken only from the user's Table 2.5 answer.
+
+    Site name is the only key there is: Table 2.5's columns are Designation, Site Name, Site
+    Type and Address, with no region among them. A CI reaches that key through its own
+    ``site``; its ``region`` matches only when the user accepted the region prefill, which
+    writes each distinct region into a Site Name cell. The old name promised a region key while
+    the build used the site name, so the caller's region lookup resolved in that prefilled case
+    alone and missed every site a user had named themselves.
+    """
     rows = answers.get("sites")
     if not isinstance(rows, list):
         return {}
     return {str(row.get("Site Name", "")): str(row.get("Designation", ""))
-            for row in rows if row.get("Site Name")}
+            for row in rows if isinstance(row, dict) and row.get("Site Name")}
+
+
+def _site_cell(ci: CI, designation_of: dict[str, str]) -> str:
+    """The Site column for one CI: its site name and what Table 2.5 designates that site.
+
+    A person signs this document, so an unresolved site says so in the cell. The blank this
+    used to render was indistinguishable from a site the reader had already accounted for,
+    which is the failure mode a compliance artefact can least afford.
+    """
+    name = ci.site or ci.region or ""
+    if not name:
+        return "TODO(sites): this CI records no site or region"
+    designation = designation_of.get(name, "")
+    return f"{name} ({designation})" if designation else f"TODO(sites): {name} is not in Table 2.5"
 
 
 # --------------------------------------------------------------------------- runbooks

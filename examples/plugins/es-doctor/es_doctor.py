@@ -182,6 +182,25 @@ def fmt(value: float | None, digits: int = 3) -> str:
     return "-" if value is None else (f"{value:.{digits}f}" if isinstance(value, float) else str(value))
 
 
+def percentile_value(agg: dict | None) -> float | None:
+    """The one figure out of a ``percentiles`` aggregation, or ``None`` for an empty bucket.
+
+    Elasticsearch nests percentile results under ``values``, keyed by the percent as a string
+    ("50.0"). That is a different shape from ``avg``'s flat ``value``: reading it as an avg
+    raises, and falling back to an avg is how a mean ends up printed under a p50 heading.
+    ``keyed: false`` turns the map into ``{"key", "value"}`` pairs, so accept both shapes. A
+    bucket matching no documents answers ``null``, and older versions answer ``NaN``.
+    """
+    values = (agg or {}).get("values")
+    if isinstance(values, dict):
+        candidates = list(values.values())
+    elif isinstance(values, list):
+        candidates = [entry.get("value") for entry in values if isinstance(entry, dict)]
+    else:
+        return None
+    return next((v for v in candidates if isinstance(v, (int, float)) and math.isfinite(v)), None)
+
+
 # ------------------------------------------------------------------ tools
 
 class ClusterHealthTool(_ESTool):
@@ -304,7 +323,8 @@ class MetricsTool(_ESTool):
 class CorrelateTool(_ESTool):
     name = "es_correlate"
     description = ("Correlate log errors with metrics and APM over a time window: one row per bucket with error count, "
-                   "total logs, each metric's avg, APM p50 latency and failure count; Pearson r of errors vs each series; "
+                   "total logs, each metric's avg, APM median (p50) latency and failure count; Pearson r of "
+                   "errors vs each series; "
                    "spike buckets; top error messages inside the spike. metrics: aliases or ECS fields (default cpu, memory).")
     parameters = {"type": "object", "properties": {
         "since": {"type": "string"}, "until": {"type": "string"}, "interval": {"type": "string", "description": "default 1m"},
@@ -375,15 +395,27 @@ class CorrelateTool(_ESTool):
         return {b["key_as_string"]: b["v"]["value"] for b in buckets if b["v"]["value"] is not None}
 
     def _apm_series(self, args, window, who, interval) -> dict[str, dict]:
+        """Median transaction duration and failure count per bucket.
+
+        The median is asked of Elasticsearch (``percentiles``), never approximated by a mean
+        here. Latency is the series where the two answer different questions: one 30-second
+        transaction drags a mean past every request the responder is reasoning about, so a mean
+        under a p50 heading reports that typical requests got slow when nothing typical moved.
+        A cluster that cannot answer the aggregation leaves the column empty rather than
+        substituting a mean, because during an incident a wrong latency figure costs more than
+        a missing one.
+        """
         body = {"size": 0, "query": {"bool": {"filter": window + who + [{"exists": {"field": "transaction.duration.us"}}]}},
                 "aggs": {"t": {"date_histogram": {"field": "@timestamp", "fixed_interval": interval},
-                               "aggs": {"p50": {"avg": {"field": "transaction.duration.us"}},
+                               "aggs": {"p50": {"percentiles": {"field": "transaction.duration.us",
+                                                                "percents": [50]}},
                                         "fail": {"filter": {"term": {"event.outcome": "failure"}}}}}}}
         try:
             buckets = self.es.search(args.get("traces_index") or self.settings.traces_index, body).get("aggregations", {}).get("t", {}).get("buckets", [])
         except ESError:
             return {"p50": {}, "fail": {}}
-        return {"p50": {b["key_as_string"]: b["p50"]["value"] for b in buckets if b["p50"]["value"]},
+        medians = {b["key_as_string"]: percentile_value(b.get("p50")) for b in buckets}
+        return {"p50": {bucket: value for bucket, value in medians.items() if value},
                 "fail": {b["key_as_string"]: b["fail"]["doc_count"] for b in buckets}}
 
     def _top_errors(self, args, since, until, who) -> list[tuple[str, int]]:
