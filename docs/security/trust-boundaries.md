@@ -302,9 +302,11 @@ rather than allowed:
   the setting and nothing is dispatched, but it is not what makes the gate hold.
 * `ESClient.request_after_confirmation` is the only bypass, and it exists for the two writes a
   person is shown in full and agrees to before they happen: `es_slowlog enable|disable` (three
-  named threshold keys) and `es_snapshots verify` (a test blob per node). Both skip the write
-  outright when there is no interactive session to ask. Grep for the name to see every call that
-  takes it.
+  named threshold keys) and `es_snapshots verify` (a test blob per node). Grep for the name to
+  see every call that takes it, and what you get is only the confirmed writes: with no
+  interactive session `es_snapshots verify` is skipped outright, and `es_slowlog` is too unless
+  `allow_destructive` is set, in which case it writes through the ordinary gated `request` -
+  authorised by the setting rather than confirmed by a person, which is what happened.
 
 What this does not cover: a call that is genuinely a read but is not on the list is refused too,
 so a person who needs one either uses `es_search` or sets `allow_destructive` - a false refusal

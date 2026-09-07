@@ -95,12 +95,16 @@ def _stand_in_results(assistant: Message, later: list[Message]) -> list[dict]:
 
     Answered ids are collected from every later message, not just the ``role: tool`` one that
     should immediately follow, because emitting a second entry for an id that is answered further
-    down would trade this 400 for a duplicate-id one.
+    down would trade this 400 for a duplicate-id one. One entry per *distinct* unanswered id, for
+    the same reason: an assistant message repeating an id is already malformed - a model that
+    reused one, or a plugin that rewrote the batch - and two stand-ins for it would be the
+    duplicate-id 400 as well, produced by the code that exists to avoid it.
     """
     if not assistant.tool_calls:
         return []
     answered = {result.tool_call_id for message in later for result in message.tool_results}
-    missing = [call for call in assistant.tool_calls if call.id not in answered]
+    missing = list({call.id: call for call in assistant.tool_calls
+                    if call.id not in answered}.values())
     if missing:
         # Not a warning: this renders the same history on every turn for the rest of the session,
         # so a warning would repeat until the user stopped reading it. `-v` shows it once per turn

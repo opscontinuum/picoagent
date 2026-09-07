@@ -16,9 +16,11 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
-from helpers import run, temp_dir
+from helpers import ScriptedProvider, make_runtime, run, temp_dir, text
 from picoagent import cli
 from picoagent.core.config import load_config
+from picoagent.core.loop import AgentLoop
+from picoagent.core.types import StreamEvent
 from picoagent.testing.fakes import FakeServer
 
 ANSWERED = {"text": "all done", "tool_calls": []}
@@ -91,6 +93,59 @@ class HeadlessExitCodeTests(unittest.TestCase):
         plugin or a bad ``-r`` path."""
         codes = {cli.EXIT_REQUIRED_PLUGIN, cli.EXIT_PLUGIN_PROVENANCE, cli.EXIT_MODEL_ERROR, 0, 1, 2}
         self.assertEqual(len(codes), 6)
+
+
+class VerdictAcrossAFollowUpTests(unittest.TestCase):
+    """A plugin's follow-up must not turn a prompt that never reached the model into a success.
+
+    ``rt.provider_error`` is the whole of what ``run_agent`` reads for :data:`cli.EXIT_MODEL_ERROR`,
+    and ``AgentLoop.run`` clears it at the top of every run. A queued ``follow_up`` re-enters
+    ``run``, so the follow-up's clean start erased the failure of the prompt that produced it and
+    the one-shot exited 0. Any auto-continue or compaction plugin plus one transient error on the
+    first turn reaches that, which is the exact case the exit code was added for.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+
+    def _runtime(self, turns):
+        return make_runtime(self.tmp, provider=ScriptedProvider(turns))
+
+    def test_a_follow_up_that_answered_does_not_speak_for_the_prompt_that_failed(self):
+        rt = self._runtime([[StreamEvent("error", error="502 from the gateway")], [text("done")]])
+        queued = []
+
+        async def queue_one_follow_up(event, runtime):
+            if not queued:
+                queued.append(True)
+                runtime.queue.append(("follow_up", "carry on"))
+
+        rt.events.on("agent_end", queue_one_follow_up)
+        run(AgentLoop(rt).run("do the thing"))
+        self.assertEqual(len(rt.providers.get("scripted").calls), 2, "the follow-up did run")
+        self.assertIsNotNone(rt.provider_error, "the user's prompt got no answer; the run failed")
+
+    def test_a_retry_that_answered_is_still_a_successful_run(self):
+        """What the compaction plugin does: it fixes the request and asks for the same turn again.
+        Nothing was lost, so the run is not a failure and must not become one here."""
+        rt = self._runtime([[StreamEvent("error", error="context length exceeded")], [text("done")]])
+
+        async def retry_once(event, runtime):
+            return {"retry": True}
+
+        rt.events.on("provider_error", retry_once)
+        run(AgentLoop(rt).run("do the thing"))
+        self.assertIsNone(rt.provider_error, "every turn ultimately answered")
+
+    def test_the_next_prompt_starts_with_a_clean_verdict(self):
+        """The field is per invocation, not per session: a REPL user who watched an error scroll
+        past and then had a prompt answered has not had a failed run."""
+        rt = self._runtime([[StreamEvent("error", error="502 from the gateway")], [text("done")]])
+        agent = AgentLoop(rt)
+        run(agent.run("first"))
+        self.assertIsNotNone(rt.provider_error)
+        run(agent.run("second"))
+        self.assertIsNone(rt.provider_error)
 
 
 class SessionDirectoryTests(unittest.TestCase):

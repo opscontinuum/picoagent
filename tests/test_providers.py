@@ -529,6 +529,15 @@ class InterruptedToolBatchTests(unittest.TestCase):
         self.assertEqual(sorted(e["tool_call_id"] for e in answered), ["c1", "c2"])
         self.assertEqual([e["content"] for e in answered if e["tool_call_id"] == "c1"], ["first"])
 
+    def test_one_id_is_answered_once_however_often_the_model_repeated_it(self):
+        """Two calls sharing an id is already a malformed assistant message, from a model or from
+        a plugin that rewrote the batch. Answering each of them separately turns that into the
+        duplicate-``tool_call_id`` 400 - the same class of refusal this repair exists to avoid."""
+        calls = [ToolCall("dup", "read", {}), ToolCall("dup", "read", {})]
+        answered = [e for e in self._mapped([Message(role="assistant", tool_calls=calls)])
+                    if e["role"] == "tool"]
+        self.assertEqual([e["tool_call_id"] for e in answered], ["dup"])
+
     def test_the_answer_sits_between_the_call_and_whatever_the_user_typed_next(self):
         """On ``-r`` the next entry is the new prompt, and a tool message after it is the same 400."""
         messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})]),

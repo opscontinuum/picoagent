@@ -142,6 +142,50 @@ class PermissionGateSpellingTests(unittest.TestCase):
         self.assertFalse((self.tmp / ".git/hooks/pre-commit").exists())
 
 
+class RefusalMessageTests(unittest.TestCase):
+    """A refusal has to name the file it refused and the pattern that refused it.
+
+    Resolving the path before matching closed the respelling bypass above, and it widened the
+    patterns at the same time: one with a slash in it now matches under *any* directory the agent
+    can reach, so ``config/database.yml`` is protected in a sibling checkout as much as in this
+    one. That is the right reading of "do not touch this kind of file" - the failure direction is
+    a refusal the user can see and change rather than a silent write - but only if they can see
+    it. ``config/database.yml is protected`` names neither the file that was actually refused
+    (they were editing another repository) nor which of their patterns did it, so the only way
+    left to find out is to read the plugin.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.project = self.tmp / "project"
+        self.project.mkdir()
+        self.sibling = self.tmp / "othertool"
+        (self.sibling / "config").mkdir(parents=True)
+
+    def reason(self, raw: str, patterns=None) -> str:
+        gate = pg.PermissionGate(FakeApi(patterns))
+        verdict = run(gate.on_tool_call({"name": "write", "args": {"path": raw}},
+                                        FakeRuntime(self.project)))
+        self.assertTrue(verdict and verdict.get("block"), f"{raw} was not refused at all")
+        return verdict["reason"]
+
+    def test_the_refusal_names_the_file_it_actually_refused(self):
+        raw = "../othertool/config/database.yml"
+        reason = self.reason(raw, ["config/database.yml"])
+        self.assertIn(str(self.sibling / "config/database.yml"), reason,
+                      "the path the model wrote is relative to somewhere; the refused file is not")
+
+    def test_the_refusal_names_the_pattern_that_refused_it(self):
+        """A pattern the path does not spell out, so only the message can say which one matched."""
+        reason = self.reason("../othertool/config/database.yml", ["**/*.yml"])
+        self.assertIn("**/*.yml", reason)
+
+    def test_it_says_where_to_change_that_pattern(self):
+        reason = self.reason(".git/config")
+        self.assertIn(".git/**", reason, "the default pattern that did it")
+        self.assertIn("permission-gate", reason)
+
+
 class ConfinedSymlinkTests(unittest.TestCase):
     """Symptom C: confinement checked a textual path for a file that did not exist yet."""
 
@@ -201,8 +245,11 @@ class FakeApi:
     """The two calls ``PermissionGate.__init__`` makes, without a runtime behind them."""
     ui = None
 
+    def __init__(self, protected: list[str] | None = None):
+        self.config = FakeConfig({"protected": protected} if protected else {})
+
     def plugin_config(self):
-        return FakeConfig()
+        return self.config
 
     def warn_about_project_config(self, *accepted):
         pass

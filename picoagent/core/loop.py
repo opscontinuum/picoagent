@@ -67,8 +67,11 @@ class Runtime:
         # or "next_turn" (carried in ahead of the next user prompt). Every kind has a
         # draining site in AgentLoop; a kind without one accumulates here unseen forever.
         self.queue: list[tuple[str, str]] = []
-        # The provider error the current run ended on, or None. Cleared at the top of every run
-        # and set only when nothing retried, so it answers "did this run reach the model at all?"
+        # A provider error from this invocation that nothing retried, or None. A turn a plugin
+        # retried successfully records nothing, so a compaction round trip is not a failure. It
+        # is cleared once per invocation rather than once per run: a plugin's follow_up re-enters
+        # AgentLoop.run, and clearing there let a follow-up that answered speak for the user's
+        # prompt, which had not. So it answers "did anything in this invocation go unanswered?"
         # for a caller with no frontend to read - see cli.run_agent's exit code.
         self.provider_error: str | None = None
         self._busy = False
@@ -173,9 +176,14 @@ class AgentLoop:
         user-role messages ahead of the prompt, so the prompt the user typed stays theirs.
         """
         rt = self.rt
+        # Only the outermost run clears the failure verdict. The follow-up drain below re-enters
+        # this method, and a nested clear made "did the model answer the user's prompt?" mean
+        # "did it answer the last thing a plugin queued?" - so a -p whose own prompt errored
+        # exited 0 whenever an auto-continue plugin queued something that then succeeded.
+        if rt.is_idle():
+            rt.provider_error = None
         rt._busy = True
         rt.abort.clear()
-        rt.provider_error = None
         try:
             system = await self._prepare(prompt, images or [], carried or [])
             await self._turns(system)

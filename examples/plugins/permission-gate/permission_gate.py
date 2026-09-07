@@ -5,7 +5,11 @@ What it does
 * Asks the user before running shell commands that match a "dangerous" pattern.
 * Refuses to read or write protected paths (secrets, keys, ``.git`` internals). The path is
   resolved through ``picoagent.core.tools.resolve_tool_path`` first, so the gate decides about
-  the file the tool will open rather than about the way the model spelled it.
+  the file the tool will open rather than about the way the model spelled it. A pattern therefore
+  protects that structure wherever the agent can reach it, not only under this project: with
+  ``.git/**`` in the list a sibling checkout's ``.git`` is refused too, and editing sibling
+  repositories is a normal thing to do here. The block names the file and the pattern that
+  refused it, so a refusal you disagree with tells you which line to edit.
 * Adds ``/yolo [ask|yolo|readonly]`` to switch modes mid-session.
 * Tells the model (via a system-prompt section) that some actions may be blocked.
 
@@ -46,9 +50,15 @@ def _spellings(path: Path) -> list[str]:
     matches the third, ``.env`` and ``*.pem`` match the last - the basename check this
     replaces - and the absolute spelling the gate used to miss matches the first.
 
-    It also means ``.git/**`` now covers a ``.git`` directory anywhere the agent can reach,
-    not only the one directly under the project. That is the direction to be wrong in: this
-    list only ever refuses, and a repository may add to it but never shorten it.
+    It also means a pattern with a slash in it covers that structure anywhere the agent can
+    reach, not only under the project: ``.git/**`` protects a sibling checkout's ``.git``, and a
+    user's ``config/database.yml`` protects that file in every repository they open. Editing a
+    sibling repository is a normal thing to do with this tool, so this is a real widening and it
+    is deliberate - a protected pattern is the user saying "do not touch this kind of file", and
+    the kind does not stop at the project boundary. The direction is right too: this list only
+    ever refuses, a repository may add to it but never shorten it, and a refusal is something the
+    user sees and can change, which a silent write is not. Seeing it is the condition, so the
+    block names the file that was refused and the pattern that refused it.
     """
     parts = path.parts
     return [path.as_posix()] + ["/".join(parts[i:]) for i in range(1, len(parts))]
@@ -86,17 +96,23 @@ class PermissionGate:
                                      + cfg.from_project("protected", []))
 
     # ------------------------------------------------------------------ policy
-    def is_protected(self, path: Path) -> bool:
-        """True if the file at ``path`` matches a protected pattern.
+    def protecting_pattern(self, path: Path) -> str | None:
+        """The first protected pattern that matches the file at ``path``, or ``None``.
 
         ``path`` is resolved - what :func:`resolve_tool_path` says the tool will open - and not
         the string the model wrote. Matching the string was a bypass by respelling:
         ``.git/hooks/pre-commit`` was refused while ``<project>/.git/hooks/pre-commit``,
         ``./.git/config`` and ``@.git/config`` all named the same files and were allowed, so a
         commit hook could be planted through the gate that exists to stop exactly that.
+
+        The pattern rather than a boolean, because it is half of what the refusal has to say.
+        Resolving first widened every slash-bearing pattern to any directory the agent can reach
+        (see :func:`_spellings`), so the file a user has to think about after a block is often
+        one in another checkout, and which of their patterns caught it is not guessable from the
+        argument they can see.
         """
-        return any(fnmatch.fnmatch(spelling, pattern)
-                   for spelling in _spellings(path) for pattern in self.protected)
+        return next((pattern for spelling in _spellings(path) for pattern in self.protected
+                     if fnmatch.fnmatch(spelling, pattern)), None)
 
     def is_dangerous(self, command: str) -> bool:
         return any(pattern.search(command) for pattern in self.dangerous)
@@ -114,8 +130,10 @@ class PermissionGate:
             # non-string path is left alone: it resolves to the project directory, which every
             # directory pattern would then match, and the tool answers a missing argument
             # itself with a message the model can act on.
-            if self.is_protected(resolve_tool_path(raw, rt.cfg).path):
-                return self._block(f"{raw} is protected")
+            resolved = resolve_tool_path(raw, rt.cfg).path
+            pattern = self.protecting_pattern(resolved)
+            if pattern:
+                return self._block(self._protected_reason(raw, resolved, pattern))
         if name == "shell" and self.mode == "ask" and self.is_dangerous(args.get("command", "")):
             ui = self.api.ui
             allowed = await ui.ask("confirm", f"Run dangerous command?\n  {args['command']}") if ui else False
@@ -128,6 +146,21 @@ class PermissionGate:
         requested = argstr.strip()
         self.mode = requested or ("yolo" if self.mode == "ask" else "ask")
         return f"permission mode: {self.mode}"
+
+    @staticmethod
+    def _protected_reason(raw: str, resolved: Path, pattern: str) -> str:
+        """Why this file was refused, in the two facts the user needs to act on it.
+
+        The refusal is read by the model, which repeats it, and by the person watching. Neither
+        can do anything with "it is protected": a pattern matches the *resolved* path, so the
+        file is often not the one the argument appears to name - a relative path from a sibling
+        repository, or a pattern of the user's own catching a file they did not have in mind. So
+        the sentence names the file that was refused, the pattern that refused it, and where that
+        pattern is configured, which is everything needed to decide it was right or to change it.
+        """
+        named = raw if str(resolved) == raw else f"{raw} ({resolved})"
+        return (f"{named} is protected: it matches '{pattern}' in permission-gate's protected "
+                "list ([plugins.permission-gate] in config.toml)")
 
     @staticmethod
     def _block(reason: str) -> dict:

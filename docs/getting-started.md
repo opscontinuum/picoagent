@@ -133,7 +133,7 @@ The exit code says how the run went, so a script does not have to read the outpu
 | 2 | the command line was wrong (argparse) |
 | 3 | a plugin you approved is not running, and the session did not start |
 | 4 | a config file could not be read, so no plugin decision was made at all |
-| 5 | the session started but the model was never reached - a key, a URL or the network |
+| 5 | the session started, but a turn got no answer and nothing retried it - a key, a URL or the network. A retry that then answered is not this; a follow-up answering after the prompt failed does not undo it |
 
 ## Adding behaviour
 

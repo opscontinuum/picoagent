@@ -405,9 +405,14 @@ def _spellings(path):
 `.git/hooks/pre-commit`, `hooks/pre-commit` and `pre-commit`. `.git/**` matches the third,
 `.env` and `**/*.pem` match the last, and the absolute spelling that used to slip past matches
 the first. Patterns people already wrote keep working, and each of them now covers every way of
-naming the same file. It also widens `.git/**` to any `.git` the agent can reach rather than
-only the project's - the direction a protected list should be wrong in, since it refuses more
-and never less.
+naming the same file. It also widens every slash-bearing pattern to the same structure anywhere
+the agent can reach rather than only the project's: `.git/**` covers a sibling checkout's `.git`,
+and a user's `config/database.yml` covers that file in whichever repository they open next.
+Deliberate - a protected pattern is the user saying "do not touch this kind of file", and the
+kind does not stop at the project boundary - and the direction a protected list should be wrong
+in, since it refuses more and never less. What it costs is that the refused file is often not the
+one the tool argument appears to name, so say both in the block: the file that was refused and
+the pattern that refused it. A refusal nobody can act on gets worked around.
 
 A plugin that reads paths without gating them - `rules`, which uses tool arguments to work out
 which file the agent is on - has the same drift with a smaller cost: a rule that quietly does

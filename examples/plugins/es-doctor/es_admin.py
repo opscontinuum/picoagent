@@ -34,11 +34,14 @@ exercise real field names:
 
 Deliberately absent: anything that changes the cluster. Reroute, ILM retry/move, restore,
 index deletion and every other write still go through ``es_request`` and its
-``allow_destructive`` gate. Two calls here are exceptions, and both are shown to the user in
-full and skipped when there is nobody to ask: ``es_slowlog enable|disable`` writes three named
-keys and nothing else, and ``es_snapshots verify=true`` has every node write a test blob to the
-repository. They reach the cluster through ``ESClient.request_after_confirmation``, which is
-the gate's only bypass.
+``allow_destructive`` gate. Two calls here are exceptions and are shown to the user in full
+before they run: ``es_slowlog enable|disable`` writes three named keys and nothing else, and
+``es_snapshots verify=true`` has every node write a test blob to the repository. A shown-and-
+agreed write reaches the cluster through ``ESClient.request_after_confirmation``, the gate's
+only bypass, so that method's call sites are exactly the writes a person approved. With nobody
+to ask, ``es_snapshots verify`` is skipped outright and ``es_slowlog`` is too unless
+``allow_destructive`` is set - and where it is, the write is an authorised one rather than a
+confirmed one, so it goes through the ordinary gated ``request``.
 
 Two deviations from the 1.0 plan, both forced by the API:
 
@@ -967,14 +970,24 @@ class SlowlogTool(_AdminTool):
                 return result(ctx, "enable needs at least one of query_warn, fetch_warn or index_warn "
                                    "(for example query_warn='2s')", is_error=True)
         summary = ", ".join(f"{key}={value}" for key, value in body.items())
+        path = f"/{_quote(index)}/_settings"
+        # Three cases, and which door the write goes through is the whole point of splitting them.
+        # ``request_after_confirmation`` bypasses the destructive gate on the strength of one
+        # claim - that this exact change was shown to a person who said yes - so only the branch
+        # where that happened may take it. Headless with ``allow_destructive`` is a real
+        # authorisation and not a confirmation: nobody was shown anything, so it goes through
+        # ``request`` like every other write the setting permits, and grepping for the bypass
+        # still lists only writes a person actually approved.
         if ctx.ui is not None:
             if not await ctx.ui.ask("confirm", f"Change slow-log settings on {index}? {summary}"):
                 return result(ctx, f"Slow-log settings on {index} left unchanged at the user's request.")
-        elif not self.settings.allow_destructive:
+            self.es.request_after_confirmation("PUT", path, body)
+        elif self.settings.allow_destructive:
+            self.es.request("PUT", path, body)
+        else:
             return result(ctx, f"es_slowlog {action} changes cluster settings on {index} and there is no "
                                "interactive session to confirm it. Run without -p, or set "
                                "allow_destructive = true in [plugins.es-doctor].", is_error=True)
-        self.es.request_after_confirmation("PUT", f"/{_quote(index)}/_settings", body)
         return result(ctx, f"Slow-log settings on {index} updated: {summary}\n"
                            "The slow log is written to files on each node "
                            "(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to "

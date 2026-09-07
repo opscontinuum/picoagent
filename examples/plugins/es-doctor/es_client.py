@@ -153,13 +153,16 @@ class ESClient:
         """The gate's one bypass: a write the user was shown in full and agreed to.
 
         Two tools ask before they write - ``es_slowlog`` for three named threshold keys, and
-        ``es_snapshots`` for the test blob repository verification puts on every node - and both
-        skip the write outright when there is nobody to ask. A person who has just read the exact
-        change and said yes is a stronger authority than a config key, so refusing them because
-        ``allow_destructive`` is unset would refuse the write they just approved.
+        ``es_snapshots`` for the test blob repository verification puts on every node. A person
+        who has just read the exact change and said yes is a stronger authority than a config
+        key, so refusing them because ``allow_destructive`` is unset would refuse the write they
+        just approved.
 
         A separate method rather than a flag on :meth:`request`: this is the whole bypass, and
-        grepping for its name lists every call that is allowed to take it.
+        grepping for its name lists every call that is allowed to take it. Which is only true
+        while every caller meets the contract, so a write nobody was shown does not come here
+        even when something else authorises it - ``es_slowlog`` running headless under
+        ``allow_destructive`` calls :meth:`request`, because that is what happened.
         """
         return self._send(method, path, body)
 

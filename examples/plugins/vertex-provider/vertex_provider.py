@@ -88,9 +88,10 @@ def to_gemini_contents(messages: list[Message], call_names: dict[str, str]) -> l
     The response turn is built from the *calls*, pulling each result forward to sit beside the
     call it answers, rather than emitted where the ``role: tool`` message happens to fall. Gemini
     checks a count, not a set of ids - see :func:`_response_turn` - and a count only comes out
-    even if both halves are assembled in one place. A result nothing called (a plugin rewriting
-    history can leave one) still gets its own turn below, because dropping it would lose what a
-    tool reported.
+    even if both halves are assembled in one place.
+
+    A result whose call is nowhere in the history is the one thing that cannot be paired at all,
+    so it does not go out as a ``functionResponse``: see :func:`_orphan_part`.
     """
     contents: list[dict] = []
     paired: set[str] = set()
@@ -112,7 +113,7 @@ def to_gemini_contents(messages: list[Message], call_names: dict[str, str]) -> l
             orphans = [result for result in message.tool_results if result.tool_call_id not in paired]
             if orphans:
                 contents.append({"role": "user", "parts": [
-                    _response_part(call_names.get(result.tool_call_id, "tool"), result)
+                    _orphan_part(call_names.get(result.tool_call_id, "tool"), result)
                     for result in orphans]})
     return contents
 
@@ -169,6 +170,27 @@ def _response_part(name: str, result: ToolResult) -> dict:
     """What a tool actually reported, as the part Gemini pairs with a ``functionCall``."""
     return {"functionResponse": {"name": name,
                                  "response": {"output": result.content, "error": result.is_error}}}
+
+
+def _orphan_part(name: str, result: ToolResult) -> dict:
+    """A tool result whose call is not in this history, as text rather than as a response part.
+
+    Gemini pairs responses with the call turn immediately before them and refuses the request
+    when the counts differ, so a ``functionResponse`` with no ``functionCall`` ahead of it is the
+    same 400 as an unanswered call, arriving from the other end. The loop never writes that
+    shape - it appends the calls and the results together - but a plugin rewriting history through
+    the ``context`` event can (compaction keeping a recent tool result while dropping the
+    assistant message that asked for it), and so can a log that lost an entry.
+
+    Dropping it is the other option and it is worse: the plugin kept that result on purpose, and
+    what a tool reported is often the only record of what the session already did. Text is the
+    one part shape Gemini takes anywhere, so the content survives; what is lost is the pairing,
+    which cannot survive, because there is no call left to pair it with. It arrives inside a
+    ``user`` turn, where the model would otherwise read it as something the person typed, so the
+    text says whose words these are and that picoagent, not the user, put them there.
+    """
+    return {"text": f"[picoagent: the tool '{name}' reported this, but the call that asked for it "
+                    f"is no longer in this conversation.]\n{result.content}"}
 
 
 def _stand_in_part(call: ToolCall) -> dict:

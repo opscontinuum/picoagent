@@ -11,6 +11,7 @@ from picoagent.testing.fake_es import FakeES
 PLUGIN = ROOT / "examples/plugins/es-doctor"
 if str(PLUGIN) not in sys.path:
     sys.path.insert(0, str(PLUGIN))
+import es_admin                                        # noqa: E402 - needs the path above
 import es_client                                       # noqa: E402 - needs the path above
 WINDOW = {"since": "2026-09-02T10:00:00Z", "until": "2026-09-02T10:30:00Z"}
 
@@ -195,6 +196,75 @@ class WriteGateTests(EsDoctorBase):
     def test_the_tool_description_does_not_promise_more_than_the_gate_does(self):
         described = self.rt.tools.get("es_request").description.lower()
         self.assertIn("read-only", described)
+
+
+class ConfirmedWriteTests(EsDoctorBase):
+    """``request_after_confirmation`` is the gate's one bypass, and its contract is narrow: a
+    write the user was shown in full and agreed to.
+
+    That contract is what makes grepping for the method's name a way to enumerate the writes a
+    person actually approved. ``es_slowlog`` asked when there was a ``ctx.ui`` and refused when
+    there was neither a ``ctx.ui`` nor ``allow_destructive`` - and then took the bypass in the
+    third case as well, where nobody was shown anything. Not an escalation: ``allow_destructive``
+    already authorises destructive ``request()`` calls, so the cluster ends up in the same state
+    either way. It is the audit that breaks - the list stops meaning what it says.
+    """
+
+    def _slowlog(self, allow_destructive):
+        es = es_client.ESClient(url=self.es.url, allow_destructive=allow_destructive)
+        return es_admin.SlowlogTool(es, es_client.Settings(allow_destructive=allow_destructive))
+
+    def _record_route(self, tool):
+        """Which of the client's two doors a write went through, in call order."""
+        taken, plain, bypass = [], tool.es.request, tool.es.request_after_confirmation
+
+        def through(name, method):
+            def call(*args, **kwargs):
+                taken.append(name)
+                return method(*args, **kwargs)
+            return call
+
+        tool.es.request = through("request", plain)
+        tool.es.request_after_confirmation = through("confirmed", bypass)
+        return taken
+
+    def _enable(self, tool, ui=None):
+        ctx = tool_ctx(self.tmp)
+        ctx.ui = ui
+        return run(tool.execute({"index": "logs-app", "action": "enable", "query_warn": "2s"}, ctx))
+
+    def test_a_write_nobody_was_shown_does_not_claim_to_have_been_confirmed(self):
+        tool = self._slowlog(allow_destructive=True)
+        taken = self._record_route(tool)
+        outcome = self._enable(tool)
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertEqual(taken, ["request"], "no ctx.ui means nobody saw this change")
+
+    def test_the_write_still_happens_because_allow_destructive_authorised_it(self):
+        self.es.requests.clear()
+        self._enable(self._slowlog(allow_destructive=True))
+        self.assertIn(("PUT", "/logs-app/_settings"),
+                      [(r["method"], r["path"]) for r in self.es.requests])
+
+    def test_a_write_the_user_agreed_to_does_take_the_bypass(self):
+        tool = self._slowlog(allow_destructive=False)
+        taken = self._record_route(tool)
+        outcome = self._enable(tool, ui=CaptureFrontend(answer=True))
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertEqual(taken, ["confirmed"])
+
+    def test_with_nobody_to_ask_and_nothing_authorising_it_the_write_is_refused(self):
+        self.es.requests.clear()
+        tool = self._slowlog(allow_destructive=False)
+        outcome = self._enable(tool)
+        self.assertTrue(outcome.is_error)
+        self.assertEqual([r for r in self.es.requests if r["method"] == "PUT"], [])
+
+    def test_a_user_who_said_no_is_not_overridden_by_the_setting(self):
+        self.es.requests.clear()
+        outcome = self._enable(self._slowlog(allow_destructive=True), ui=CaptureFrontend(answer=False))
+        self.assertIn("unchanged", outcome.content)
+        self.assertEqual([r for r in self.es.requests if r["method"] == "PUT"], [])
 
 
 class ApmLatencyTests(EsDoctorBase):
