@@ -3,8 +3,10 @@ import asyncio, unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from helpers import run, tool_ctx, temp_dir
+import signal
 from picoagent.core.tools import (ShellTool, EditTool, ReadTool, ToolRegistry, WriteTool, truncate,
-                                  spawn_shell, kill_process_tree, tool_result)
+                                  spawn_shell, kill_process_tree, tool_result, is_windows,
+                                  own_process_group, _signal_group)
 
 
 class ReadToolTests(unittest.TestCase):
@@ -64,6 +66,13 @@ class WriteEditTests(unittest.TestCase):
         (self.tmp / "f.py").write_text("a\n")
         r = run(EditTool().execute({"path": "f.py", "old_text": "zzz", "new_text": "b"}, tool_ctx(self.tmp)))
         self.assertTrue(r.is_error)
+
+    def test_edit_of_a_missing_file_is_an_error(self):
+        """Flipping this result's ``is_error`` survived a mutation run: nothing pinned that an
+        edit of a file that is not there *fails*, and a model reading success retries nothing."""
+        r = run(EditTool().execute({"path": "nope.py", "old_text": "a", "new_text": "b"}, tool_ctx(self.tmp)))
+        self.assertTrue(r.is_error)
+        self.assertIn("not found", r.content)
 
     def test_parallel_edits_to_same_file_serialize(self):
         """Two concurrent edits must both land (no lost update)."""
@@ -153,6 +162,29 @@ class ShellDispatchTests(unittest.TestCase):
     @staticmethod
     def tmp_path() -> Path:
         return temp_dir()
+
+
+class SignalGroupContractTests(unittest.TestCase):
+    """``_signal_group``'s answer is what separates escalation from a pointless second signal.
+
+    ``kill_process_tree`` only waits out the SIGTERM grace when the send reported a live group;
+    a mutation making it report ``False`` for a live group survived the suite, and under it
+    every graceful kill went straight to SIGKILL - the grace contract, silently gone. The
+    timing of the grace window itself is not asserted (that test would be a race); the return
+    value that gates it is deterministic and is what this pins.
+    """
+
+    @unittest.skipIf(is_windows(), "process groups and killpg are POSIX")
+    def test_a_live_group_reports_true_and_a_finished_one_false(self):
+        async def probe():
+            proc = await asyncio.create_subprocess_exec(
+                "sleep", "30", stdout=asyncio.subprocess.DEVNULL, **own_process_group())
+            alive = _signal_group(proc, signal.SIGKILL)
+            await proc.wait()
+            return alive, _signal_group(proc, signal.SIGKILL)
+        alive, gone = run(probe())
+        self.assertTrue(alive, "a signal delivered to a live group must report it was")
+        self.assertFalse(gone, "a group that is gone must not read as one worth escalating on")
 
 
 class TruncateAndRegistryTests(unittest.TestCase):

@@ -21,8 +21,28 @@ import unittest
 from pathlib import Path
 
 from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
+from picoagent.core.config import has_shape
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
+
+
+class ShapeOfANumber(unittest.TestCase):
+    """``has_shape`` is what stands between a repository's value and a plugin's default.
+
+    The numeric arm reads ``isinstance(value, (int, float)) and not isinstance(value, bool)``,
+    and a mutation dropping the ``not`` survived the whole suite: under it a repository's
+    ``timeout = 30`` is refused as the wrong shape while ``timeout = true`` sails through -
+    both directions wrong, at the exact seam T4 exists for. Pinned here in both directions.
+    """
+
+    def test_a_number_is_shaped_like_a_numeric_default(self):
+        self.assertTrue(has_shape(30, 60))
+        self.assertTrue(has_shape(0.5, 60.0))
+        self.assertTrue(has_shape(30, 60.0))
+
+    def test_a_bool_is_not_a_number_whatever_python_thinks(self):
+        self.assertFalse(has_shape(True, 60))
+        self.assertFalse(has_shape(False, 60.0))
 from picoagent.plugins.api import PluginAPI
 from picoagent.plugins.manifest import Manifest
 
