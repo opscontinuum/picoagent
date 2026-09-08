@@ -1,5 +1,0 @@
-name = "complete"
-version = "0.1.0"
-entry = "complete:register"
-description = "Tab completion in the REPL for slash commands, skills, file paths and cached model ids"
-requires = ["picoagent>=0.1"]

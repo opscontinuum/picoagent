@@ -1,5 +1,0 @@
-name = "rules"
-version = "0.1.0"
-entry = "rules:register"
-description = "Instruction files that switch on when the files they describe come into play"
-requires = ["picoagent>=0.1"]
