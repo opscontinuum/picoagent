@@ -52,7 +52,8 @@ from typing import Any
 
 from es_client import (DEFAULT_LOGS_INDEX, DEFAULT_METRICS_INDEX, DEFAULT_TRACES_INDEX,
                        ESClient, ESError, Settings, _ESTool, destructive_refusal, is_destructive,
-                       result, text_table)
+                       text_table)
+from picoagent.core.tools import tool_result
 
 # ------------------------------------------------------------------ Elastic knowledge
 # Beats and Elastic Agent write ECS documents into these data streams; the default patterns
@@ -238,7 +239,7 @@ class ClusterHealthTool(_ESTool):
                         lines.append(f"  {node.get('node_name')}: [{decider.get('decider')}] {decider.get('decision')} - {decider.get('explanation')}")
             except ESError as exc:
                 lines.append(f"(allocation explain unavailable: {exc})")
-        return result(ctx, "\n".join(lines), health=health)
+        return tool_result(ctx, "\n".join(lines), health=health)
 
 
 class IndicesTool(_ESTool):
@@ -261,7 +262,7 @@ class IndicesTool(_ESTool):
                 signal = "traces"
             groups[signal or "other"].append(f"  {row.get('health', '?'):7} {name:45} docs={row.get('docs.count', '?'):>8} size={row.get('store.size', '?')}")
         text = "\n".join(f"{signal} ({len(rows)}):\n" + "\n".join(rows) for signal, rows in groups.items() if rows)
-        return result(ctx, text or "(no indices)")
+        return tool_result(ctx, text or "(no indices)")
 
 
 def _logs_body(args: dict) -> dict[str, Any]:
@@ -320,7 +321,7 @@ class LogsTool(_ESTool):
             lines.append("\nTimeline:")
             lines += [f"  {bucket_label(b)}  {b['doc_count']:>6}  {'#' * min(60, b['doc_count'])}"
                       for b in aggs["timeline"]["buckets"] if b["doc_count"]]
-        return result(ctx, "\n".join(lines), total=total)
+        return tool_result(ctx, "\n".join(lines), total=total)
 
 
 class MetricsTool(_ESTool):
@@ -345,7 +346,7 @@ class MetricsTool(_ESTool):
         lines += [f"{bucket_label(b)}  avg={fmt(b['value']['value'])}  max={fmt(b['peak']['value'])}" for b in buckets]
         if not buckets:
             lines.append("no data - check the field name (try es_search with size=1 on the metrics index) or the time window")
-        return result(ctx, "\n".join(lines), field=field)
+        return tool_result(ctx, "\n".join(lines), field=field)
 
 
 class CorrelateTool(_ESTool):
@@ -385,7 +386,7 @@ class CorrelateTool(_ESTool):
                          | {bucket for series in metric_series.values() for bucket in series}
                          | set(apm["p50"] if apm else []))
         if not buckets:
-            return result(ctx, "no data in window; widen since/until or drop host/service filters", is_error=True)
+            return tool_result(ctx, "no data in window; widen since/until or drop host/service filters", is_error=True)
 
         errors = [errors_by_bucket.get(bucket, 0) for bucket in buckets]
         header = ["bucket", "errors", "logs"] + [metric_label(field) for field in fields]
@@ -404,7 +405,7 @@ class CorrelateTool(_ESTool):
                  "Correlation of error count with:",
                  *_correlation_lines(errors, buckets, fields, metric_series, apm),
                  *self._spike_lines(args, buckets, spikes, who)]
-        return result(ctx, "\n".join(lines), buckets=len(buckets), spike_buckets=len(spikes))
+        return tool_result(ctx, "\n".join(lines), buckets=len(buckets), spike_buckets=len(spikes))
 
     def _spike_lines(self, args, buckets, spikes, who) -> list[str]:
         """The spike section: when the errors jumped, and the messages inside the jump."""
@@ -495,7 +496,7 @@ class SearchTool(_ESTool):
 
     def run(self, args, ctx):
         data = self.es.search(args["index"], args["body"])
-        return result(ctx, json.dumps(data, indent=1))
+        return tool_result(ctx, json.dumps(data, indent=1))
 
 
 class RequestTool(_ESTool):
@@ -511,7 +512,7 @@ class RequestTool(_ESTool):
         # Always JSON: the client answers a text body with an ESError naming the endpoints that
         # do that and what to call instead, so there is no string case to render here.
         data = self.es.request(args["method"].upper(), args["path"], args.get("body"))
-        return result(ctx, json.dumps(data, indent=1))
+        return tool_result(ctx, json.dumps(data, indent=1))
 
 
 # ------------------------------------------------------------------ registration

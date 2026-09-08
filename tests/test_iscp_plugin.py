@@ -626,6 +626,10 @@ class ConfinementTests(unittest.TestCase):
     It previously returned absolute paths unchecked, so a deployment that switched confinement
     on still had this plugin reading and writing outside the project while read/write/edit
     refused - the one behaviour such a deployment cannot tolerate.
+
+    The rule itself now lives in ``picoagent.core.tools`` and is shared with stig-runner, so
+    these assert that this plugin resolves through it - the plugin's own copy is what drifted
+    from stig-runner's over the ``@`` prefix and over symlinks.
     """
 
     def setUp(self):
@@ -633,44 +637,54 @@ class ConfinementTests(unittest.TestCase):
         self.outside = temp_dir()
         (self.outside / "main.tf").write_text('resource "aws_instance" "x" {}\n')
 
+    def resolve(self, raw, **cfg):
+        return iscp_author.resolve_path_inside_project(tool_ctx(self.proj, **cfg), raw)
+
     def test_absolute_outside_path_is_allowed_when_confinement_is_off(self):
         """The default must not change: a Terraform repo often sits beside the docs repo."""
-        ctx = tool_ctx(self.proj, confine_to_project=False)
-        self.assertEqual(iscp_author._resolve_inside(ctx, str(self.outside / "main.tf")),
+        self.assertEqual(self.resolve(str(self.outside / "main.tf"), confine_to_project=False),
                          self.outside / "main.tf")
 
     def test_absolute_outside_path_is_refused_when_confinement_is_on(self):
-        ctx = tool_ctx(self.proj, confine_to_project=True)
         with self.assertRaises(PathRefused):
-            iscp_author._resolve_inside(ctx, str(self.outside / "main.tf"))
+            self.resolve(str(self.outside / "main.tf"), confine_to_project=True)
 
     def test_relative_escape_is_refused_whether_or_not_confinement_is_on(self):
         """A usability guard, not a security one - an injection can write an absolute path."""
         for confine in (False, True):
             with self.subTest(confine=confine):
-                with self.assertRaises(ValueError):
-                    iscp_author._resolve_inside(tool_ctx(self.proj, confine_to_project=confine),
-                                                "../escape")
+                with self.assertRaises(PathRefused):
+                    self.resolve("../escape", confine_to_project=confine)
+
+    def test_an_at_prefixed_relative_escape_is_refused_too(self):
+        """``@../escape`` is ``../escape``. Models copy the ``@`` out of an ``@file`` mention and
+        the resolution strips it, so an escape check that reads the unstripped string is checking
+        a path nothing will open - and passes the one that will."""
+        with self.assertRaises(PathRefused):
+            self.resolve("@../escape")
+
+    def test_a_relative_path_leaving_through_a_symlink_is_refused(self):
+        """The escape has to be judged on the resolved path. A link inside the project is a
+        child of it textually and points wherever it points."""
+        (self.proj / "link").symlink_to(self.outside)
+        with self.assertRaises(PathRefused):
+            self.resolve("link/main.tf")
 
     def test_a_path_inside_the_project_still_resolves_under_confinement(self):
-        ctx = tool_ctx(self.proj, confine_to_project=True)
-        self.assertEqual(iscp_author._resolve_inside(ctx, "docs/out"), self.proj / "docs/out")
+        self.assertEqual(self.resolve("docs/out", confine_to_project=True), self.proj / "docs/out")
 
-    def test_a_nul_byte_is_rejected_as_a_value_error_the_tools_catch(self):
-        """A NUL used to escape the tool as an unhandled ValueError from path.exists().
-
-        It is raised here rather than returned because both call sites catch ValueError and
-        PathRefused and turn them into error results - asserted by the next test.
-        """
-        with self.assertRaises(ValueError):
-            iscp_author._resolve_inside(tool_ctx(self.proj), "out\x00")
+    def test_a_nul_byte_is_refused_rather_than_escaping_as_a_value_error(self):
+        """A NUL used to escape the tool as an unhandled ValueError from path.exists(). It is a
+        path the OS cannot resolve, which the seam already answers with a refusal."""
+        with self.assertRaises(PathRefused):
+            self.resolve("out\x00")
 
     def test_both_call_sites_convert_a_refusal_into_an_error_result(self):
         """The convention is: expected failures return an error result, bugs raise."""
         import inspect
         source = inspect.getsource(iscp_author)
-        self.assertEqual(source.count("except (ValueError, PathRefused) as exc:"), 2,
-                         "every _resolve_inside call site must catch both refusal types")
+        self.assertEqual(source.count("except PathRefused as exc:"), 2,
+                         "every resolve_path_inside_project call site must catch the refusal")
 
 
 class ProjectConfigLayerTests(unittest.TestCase):

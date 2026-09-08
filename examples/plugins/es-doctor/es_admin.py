@@ -62,7 +62,8 @@ import urllib.parse
 from collections import Counter
 from typing import Any
 
-from es_client import ESError, _ESTool, result, text_table
+from es_client import ESError, _ESTool, text_table
+from picoagent.core.tools import tool_result
 
 ES_ADMIN_PROMPT_NOTE = """
 ## Cluster administration
@@ -224,7 +225,7 @@ class ShardsTool(_ESTool):
 
         if args.get("explain"):
             lines += ["", *self._explain(args, rows, index)]
-        return result(ctx, "\n".join(lines), shards=len(rows), unassigned=by_state.get("UNASSIGNED", 0))
+        return tool_result(ctx, "\n".join(lines), shards=len(rows), unassigned=by_state.get("UNASSIGNED", 0))
 
     @staticmethod
     def _tally(rows: list[dict]) -> tuple[Counter, Counter, Counter]:
@@ -318,7 +319,8 @@ class RecoveryTool(_ESTool):
         path = f"/_cat/recovery/{_quote(index)}" if index else "/_cat/recovery"
         rows = self.es.request("GET", f"{path}?format=json&bytes=b&active_only={active}&h={self.COLUMNS}")
         if not rows:
-            return result(ctx, f"no {'active ' if active == 'true' else ''}recoveries for {index or '*'}")
+            return tool_result(
+                ctx, f"no {'active ' if active == 'true' else ''}recoveries for {index or '*'}")
 
         groups: dict[str, list[dict]] = {}
         for row in rows:
@@ -331,7 +333,7 @@ class RecoveryTool(_ESTool):
                              f"time={row.get('time')}  {row.get('source_node')} -> {row.get('target_node')}  "
                              f"files {row.get('files_percent')}  bytes {row.get('bytes_percent')}  "
                              f"translog {row.get('translog_ops_percent')}")
-        return result(ctx, "\n".join(lines), recoveries=len(rows))
+        return tool_result(ctx, "\n".join(lines), recoveries=len(rows))
 
 
 # ------------------------------------------------------------------ nodes
@@ -386,7 +388,7 @@ class NodesTool(_ESTool):
         lines = [f"{len(rows)} nodes", text_table(header, table) if table else "(no nodes match)",
                  "", "Warnings:"]
         lines += warnings or ["  none - heap, disk and circuit breakers are all within thresholds"]
-        return result(ctx, "\n".join(lines), nodes=len(rows), warnings=len(warnings))
+        return tool_result(ctx, "\n".join(lines), nodes=len(rows), warnings=len(warnings))
 
     def _warnings(self, name: str, row: dict, stats: dict) -> list[str]:
         found = []
@@ -427,7 +429,7 @@ class NodesTool(_ESTool):
             lines += ["", "Rejections mean work was dropped, not delayed - the client saw an error:"]
             lines += [f"  {r.get('node_name')} {r.get('name')}: rejected={r.get('rejected')} "
                       f"queue={r.get('queue')}" for r in busy]
-        return result(ctx, "\n".join(lines), pools=len(rows), busy=len(busy))
+        return tool_result(ctx, "\n".join(lines), pools=len(rows), busy=len(busy))
 
     def _breakers(self, node: str, ctx):
         lines = []
@@ -437,7 +439,7 @@ class NodesTool(_ESTool):
                 lines.append(f"  {breaker:20} estimated={stats.get('estimated_size')} "
                              f"limit={stats.get('limit_size')} overhead={stats.get('overhead')} "
                              f"tripped={stats.get('tripped')}")
-        return result(ctx, "\n".join(lines) or "(no nodes match)")
+        return tool_result(ctx, "\n".join(lines) or "(no nodes match)")
 
     def _tasks(self, ctx):
         tasks = self.es.request("GET", "/_tasks?detailed=true&group_by=parents").get("tasks", {})
@@ -458,7 +460,7 @@ class NodesTool(_ESTool):
                      if _num(task.get("time_in_queue_millis")) > PENDING_TASK_WARN_SECONDS * 1000 else "")
             lines.append(f"  {task.get('time_in_queue')}  [{task.get('priority')}] "
                          f"{task.get('source')}{stale}")
-        return result(ctx, "\n".join(lines), tasks=len(tasks), pending=len(pending))
+        return tool_result(ctx, "\n".join(lines), tasks=len(tasks), pending=len(pending))
 
 
 class HotThreadsTool(_ESTool):
@@ -479,7 +481,7 @@ class HotThreadsTool(_ESTool):
                                         "type": (args.get("type") or "cpu").lower()})
         path = f"/_nodes/{_quote(node)}/hot_threads" if node else "/_nodes/hot_threads"
         text = self.es.request("GET", f"{path}?{query}", raw=True)
-        return result(ctx, text or "(no hot threads reported)")
+        return tool_result(ctx, text or "(no hot threads reported)")
 
 
 # ------------------------------------------------------------------ lifecycle and snapshots
@@ -522,7 +524,7 @@ class IlmTool(_ESTool):
         if args.get("policy"):
             lines += ["", *self._policy(args["policy"])]
         errors = sum(1 for body in managed if body.get("step") == "ERROR")
-        return result(ctx, "\n".join(lines), managed=len(managed), errors=errors)
+        return tool_result(ctx, "\n".join(lines), managed=len(managed), errors=errors)
 
     def _policy(self, name: str) -> list[str]:
         policies = self.es.request("GET", f"/_ilm/policy/{_quote(name)}")
@@ -564,7 +566,7 @@ class SnapshotsTool(_ESTool):
             lines += await self._repository_detail(repository, args, ctx)
         if args.get("slm", True):
             lines += ["", *self._slm()]
-        return result(ctx, "\n".join(lines))
+        return tool_result(ctx, "\n".join(lines))
 
     def _repositories(self) -> list[str]:
         repos = self.es.request("GET", "/_snapshot")
@@ -708,7 +710,7 @@ class IndexInspectTool(_ESTool):
             lines += ["", *self._mappings(index, settings)]
         if view in ("all", "stats"):
             lines += ["", *self._stats(index)]
-        return result(ctx, "\n".join(lines))
+        return tool_result(ctx, "\n".join(lines))
 
     def _settings(self, settings: dict) -> list[str]:
         effective = _effective_settings(settings)
@@ -804,7 +806,7 @@ class TemplatesTool(_ESTool):
         if args.get("simulate_index"):
             lines += ["", *self._simulate(args["simulate_index"], templates or self._index_templates(""))]
         lines += ["", *self._data_streams()]
-        return result(ctx, "\n".join(lines))
+        return tool_result(ctx, "\n".join(lines))
 
     def _index_templates(self, name: str) -> list[dict]:
         path = f"/_index_template/{_quote(name)}" if name else "/_index_template"
@@ -916,7 +918,7 @@ class SlowlogTool(_ESTool):
         if action == "show":
             return self._show(args, ctx)
         if action not in ("enable", "disable"):
-            return result(ctx, f"unknown action {action!r}; use show, enable or disable", is_error=True)
+            return tool_result(ctx, f"unknown action {action!r}; use show, enable or disable", is_error=True)
         return await self._write(args, ctx, action)
 
     def _thresholds(self, index: str) -> dict[str, str]:
@@ -934,7 +936,7 @@ class SlowlogTool(_ESTool):
             lines.append("  None are set, so this index logs nothing slow. "
                          "es_slowlog action=enable sets them.")
         lines += ["", *self._shipped(args)]
-        return result(ctx, "\n".join(lines), thresholds=thresholds)
+        return tool_result(ctx, "\n".join(lines), thresholds=thresholds)
 
     def _shipped(self, args: dict) -> list[str]:
         """Slow logs are node files; the only way an API can show them is if something shipped them."""
@@ -969,8 +971,8 @@ class SlowlogTool(_ESTool):
                      SLOWLOG_KEYS[2]: args.get("index_warn")}
             body = {key: value for key, value in given.items() if value}
             if not body:
-                return result(ctx, "enable needs at least one of query_warn, fetch_warn or index_warn "
-                                   "(for example query_warn='2s')", is_error=True)
+                return tool_result(ctx, "enable needs at least one of query_warn, fetch_warn or index_warn "
+                                        "(for example query_warn='2s')", is_error=True)
         summary = ", ".join(f"{key}={value}" for key, value in body.items())
         path = f"/{_quote(index)}/_settings"
         # Three cases, and which door the write goes through is the whole point of splitting them.
@@ -982,18 +984,19 @@ class SlowlogTool(_ESTool):
         # still lists only writes a person actually approved.
         if ctx.ui is not None:
             if not await ctx.ui.ask("confirm", f"Change slow-log settings on {index}? {summary}"):
-                return result(ctx, f"Slow-log settings on {index} left unchanged at the user's request.")
+                return tool_result(ctx, f"Slow-log settings on {index} left unchanged at the user's request.")
             self.es.request_after_confirmation("PUT", path, body)
         elif self.settings.allow_destructive:
             self.es.request("PUT", path, body)
         else:
-            return result(ctx, f"es_slowlog {action} changes cluster settings on {index} and there is no "
-                               "interactive session to confirm it. Run without -p, or set "
-                               "allow_destructive = true in [plugins.es-doctor].", is_error=True)
-        return result(ctx, f"Slow-log settings on {index} updated: {summary}\n"
-                           "The slow log is written to files on each node "
-                           "(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to "
-                           "search them here.", changed=list(body))
+            return tool_result(
+                ctx, f"es_slowlog {action} changes cluster settings on {index} and there is no "
+                                    "interactive session to confirm it. Run without -p, or set "
+                                    "allow_destructive = true in [plugins.es-doctor].", is_error=True)
+        return tool_result(ctx, f"Slow-log settings on {index} updated: {summary}\n"
+                                "The slow log is written to files on each node "
+                                "(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to "
+                                "search them here.", changed=list(body))
 
 
 TOOL_CLASSES = (ShardsTool, RecoveryTool, NodesTool, HotThreadsTool, IlmTool,

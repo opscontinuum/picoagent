@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from picoagent.core.provider import RedirectRefused, _SameOriginRedirects
-from picoagent.core.tools import truncate
 from picoagent.core.types import ToolResult
 
 log = logging.getLogger("es_doctor")
@@ -234,12 +233,6 @@ class _ESTool:
 
     def run(self, args: dict, ctx) -> ToolResult:  # pragma: no cover - overridden
         raise NotImplementedError
-
-
-def result(ctx, text: str, is_error: bool = False, **details) -> ToolResult:
-    """Every tool's last line: truncate to the session's limits, say so when it cut."""
-    body, cut = truncate(text, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
-    return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=is_error, details=details)
 
 
 def text_table(header: list[str], rows: list[list]) -> str:

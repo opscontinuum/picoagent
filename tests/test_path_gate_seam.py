@@ -10,7 +10,8 @@ import unittest
 from pathlib import Path
 
 from helpers import run, tool_ctx, temp_dir
-from picoagent.core.tools import PathRefused, ReadTool, resolve_path, resolve_tool_path
+from picoagent.core.tools import (PathRefused, ReadTool, resolve_path, resolve_path_inside_project,
+                                  resolve_tool_path, resolve_tool_path_inside_project)
 
 
 class SeamTests(unittest.TestCase):
@@ -99,6 +100,94 @@ class SeamTests(unittest.TestCase):
         with self.assertRaises(PathRefused):
             resolve_path(ctx, str(outside))
         self.assertIsNotNone(resolve_tool_path(str(outside), ctx.config, ctx.cwd).refusal)
+
+
+class InsideProjectTests(unittest.TestCase):
+    """The stricter rule on top of the seam: a *relative* path must land in the project.
+
+    Two shipped plugins each wrote this for themselves and the two copies disagreed, which is
+    how the gate/tool drift bug in this repository started. These pin the shared answer,
+    including the two things one of the copies got wrong.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.project = self.tmp / "project"
+        self.project.mkdir()
+        self.cfg = {"_cwd": str(self.project)}
+
+    def refusal(self, raw, **cfg):
+        return resolve_tool_path_inside_project(raw, {**self.cfg, **cfg}).refusal
+
+    def test_a_relative_path_inside_the_project_is_allowed(self):
+        answer = resolve_tool_path_inside_project("docs/out", self.cfg)
+        self.assertIsNone(answer.refusal)
+        self.assertEqual(answer.path, self.project / "docs" / "out")
+
+    def test_the_project_directory_itself_is_inside_it(self):
+        self.assertIsNone(self.refusal("."))
+
+    def test_a_relative_escape_is_refused(self):
+        self.assertIn("outside the project directory", self.refusal("../escape") or "")
+
+    def test_an_at_prefixed_relative_escape_is_refused_the_same_way(self):
+        """``Path("@../..").is_absolute()`` is False and so is ``Path("../..")``'s - but the
+        first also looks like a plain name to anything reading the string before the ``@`` is
+        stripped, which is how one plugin let it through."""
+        self.assertIn("outside the project directory", self.refusal("@../escape") or "")
+
+    def test_a_relative_path_leaving_through_a_symlink_is_refused(self):
+        """Judged on the resolved path, not on the text: a link inside the project is textually
+        a child of it and points wherever it points."""
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        os.symlink(outside, self.project / "link")
+        self.assertIn("outside the project directory", self.refusal("link/main.tf") or "")
+
+    def test_an_absolute_path_outside_the_project_is_the_users_own_choice(self):
+        """The rule is about the model's constructions. An absolute path is somebody naming a
+        place on purpose - the sibling repository - and refusing it makes the tool useless."""
+        self.assertIsNone(self.refusal(str(self.tmp / "sibling" / "main.tf")))
+
+    def test_a_tilde_path_counts_as_absolute(self):
+        self.assertIsNone(self.refusal("~/notes.md"))
+
+    def test_confinement_still_refuses_that_absolute_path_when_it_is_on(self):
+        """The security boundary underneath is unchanged; this rule only adds to it."""
+        self.assertIn("outside the project",
+                      self.refusal(str(self.tmp / "sibling"), confine_to_project=True) or "")
+
+    def test_a_path_the_os_cannot_resolve_is_a_refusal_and_not_a_raise(self):
+        """A NUL byte reached ``path.exists()`` as an unhandled ValueError once. It is a path
+        nothing can open, which is what a refusal says."""
+        answer = resolve_tool_path_inside_project("out\x00", self.cfg)
+        self.assertIsNotNone(answer.refusal)
+        self.assertTrue(answer.path.is_absolute())
+
+    def test_the_raising_twin_raises_exactly_where_the_value_form_refuses(self):
+        ctx = tool_ctx(self.project)
+        for raw in ("../escape", "@../escape", "out\x00"):
+            with self.subTest(raw=raw):
+                self.assertIsNotNone(resolve_tool_path_inside_project(raw, ctx.config, ctx.cwd).refusal)
+                with self.assertRaises(PathRefused):
+                    resolve_path_inside_project(ctx, raw)
+
+    def test_the_raising_twin_returns_the_same_path_where_it_does_not(self):
+        ctx = tool_ctx(self.project)
+        for raw in ("docs/out", "@notes.md", "~/x.txt", str(self.tmp / "sibling")):
+            with self.subTest(raw=raw):
+                self.assertEqual(resolve_path_inside_project(ctx, raw),
+                                 resolve_tool_path_inside_project(raw, ctx.config, ctx.cwd).path)
+
+    def test_an_allowed_path_is_the_one_the_plain_seam_names(self):
+        """This adds a refusal and never a different file. A guard resolving the argument with
+        ``resolve_tool_path`` and a tool taking the stricter rule must still agree on which
+        file is in question, or the drift is back."""
+        ctx = tool_ctx(self.project)
+        for raw in ("docs/out", "@notes.md", "sub/../notes.md", "~/x.txt", str(self.tmp / "sibling")):
+            with self.subTest(raw=raw):
+                self.assertEqual(resolve_tool_path_inside_project(raw, ctx.config, ctx.cwd).path,
+                                 resolve_tool_path(raw, ctx.config, ctx.cwd).path)
 
 
 if __name__ == "__main__":

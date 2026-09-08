@@ -81,6 +81,29 @@ def truncate(text: str, max_bytes: int, max_lines: int, keep: str = "head") -> t
     return out, True
 
 
+def tool_result(ctx: ToolContext, text: str, is_error: bool = False, **details: Any) -> ToolResult:
+    """A tool's last line: cut ``text`` to the session's limits, say when it cut, and wrap it.
+
+    Reach for this at the end of every ``execute`` that returns text whose length something
+    other than the tool decides - a cluster's answer, a document, a search result. Unbounded
+    output is the fastest way to break a session, and the limits live in the config so a
+    deployment sets them once for every tool rather than each tool inventing a cap.
+
+    It takes ``ctx`` rather than the two limits because the result also carries
+    ``ctx.tool_call_id``: the id and the limits are the whole of what this needs, and they
+    arrive together. Keyword arguments become ``ToolResult.details``, which UIs and plugins
+    read and the model never sees, so structured facts about the call go there (``path=``,
+    ``exit_code=``) and ``text`` stays what the model is meant to read.
+
+    It keeps the *head*, which is right for a document or a listing. A tool whose output
+    matters at the end - a command's - calls :func:`truncate` with ``keep="tail"`` itself, the
+    way :class:`ShellTool` does, because it has a footer to add after the cut.
+    """
+    body, cut = truncate(text, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
+    return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=is_error,
+                      details=details)
+
+
 def spill_to_tempfile(text: str) -> str:
     """Write ``text`` to a temp file and return its path (so the model can grep the full output)."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="picoagent-", delete=False) as fh:
@@ -104,6 +127,26 @@ class ResolvedPath:
     """
     path: Path
     refusal: str | None = None
+
+
+def _project_root(config: dict, cwd: Path | None) -> Path:
+    """The directory a relative path is resolved against: the session's, not the process's.
+
+    They differ under ``-C``, and every path decision has to be taken against the same one, so
+    the fallback for a config nobody built with ``load_config`` is written once here.
+    """
+    return Path(cwd) if cwd is not None else Path(config.get("_cwd") or Path.cwd())
+
+
+def _model_path(raw: str) -> Path:
+    """What a model-supplied string names before it is joined to anything.
+
+    A leading ``@`` is stripped (models copy it from ``@file`` mentions) and ``~`` expanded.
+    Anything deciding *about* such a string - is it absolute? - has to ask here rather than of
+    the raw text, or it decides about a path nothing will open: ``@../..`` is not relative to
+    the tool that opens it, whatever ``Path("@../..").is_absolute()`` says.
+    """
+    return Path(os.path.expanduser(raw.lstrip("@")))
 
 
 def resolve_tool_path(raw: str, config: dict, cwd: Path | None = None) -> ResolvedPath:
@@ -130,8 +173,8 @@ def resolve_tool_path(raw: str, config: dict, cwd: Path | None = None) -> Resolv
     Refused, for this function, means *the tool will not open this*: outside the project while
     ``confine_to_project`` is on, or a path the OS cannot resolve at all (a symlink loop).
     """
-    root = Path(cwd) if cwd is not None else Path(config.get("_cwd") or Path.cwd())
-    path = Path(os.path.expanduser(raw.lstrip("@")))
+    root = _project_root(config, cwd)
+    path = _model_path(raw)
     absolute = path if path.is_absolute() else root / path
     try:
         # Non-strict resolve() follows every symlink component that exists and appends the rest,
@@ -171,6 +214,54 @@ def resolve_path(ctx: ToolContext, raw: str) -> Path:
     guard that forgets to check would silently allow. Same decision, taken in one place.
     """
     resolved = resolve_tool_path(raw, ctx.config, ctx.cwd)
+    if resolved.refusal:
+        raise PathRefused(resolved.refusal)
+    return resolved.path
+
+
+def resolve_tool_path_inside_project(raw: str, config: dict, cwd: Path | None = None) -> ResolvedPath:
+    """:func:`resolve_tool_path`, with one more rule: a *relative* path must land in the project.
+
+    Two different rules, easily read as one:
+
+    * ``confine_to_project`` is the security boundary. It is off by default, it applies to every
+      spelling of a path, and :func:`resolve_tool_path` enforces it.
+    * This adds a **usability** rule on top, for a tool whose path argument is normally the
+      model's own construction: a relative path that climbs out of the project (``../..``, or a
+      symlink that leads there) is refused, while an absolute one is allowed. An absolute path
+      is a place someone named on purpose - the sibling repository, the terraform tree next
+      door - and a tool that refused it would be unusable for the work it exists for.
+
+    It is not a security boundary and must not be sold as one: anything that can write ``../..``
+    can write ``/etc``, so this stops a mistake, not an attacker. What stops an attacker is
+    ``confine_to_project``, and that is still the rule underneath.
+
+    The escape is judged on the *resolved* path, after ``@`` stripping, ``~`` expansion and
+    symlink following, because those are what decide which file gets opened. One of the two
+    plugin copies this replaces judged it on the text instead, and was wrong twice for it:
+    ``@../..`` passed where ``../..`` did not, and a symlink inside the project pointing out of
+    it passed as a child of it.
+    """
+    resolved = resolve_tool_path(raw, config, cwd)
+    if resolved.refusal or _model_path(raw).is_absolute():
+        return resolved
+    root = _project_root(config, cwd).resolve()
+    if resolved.path == root or root in resolved.path.parents:
+        return resolved
+    return ResolvedPath(resolved.path,
+                        f"{raw!r} resolves to {resolved.path}, which is outside the project "
+                        f"directory ({root}); pass an absolute path if you meant to go there")
+
+
+def resolve_path_inside_project(ctx: ToolContext, raw: str) -> Path:
+    """:func:`resolve_tool_path_inside_project` with the refusal raised instead of returned.
+
+    The same split as :func:`resolve_path` and for the same reason: a tool that forgets to check
+    gets an exception the loop turns into an error result, while a guard that forgets to check
+    would silently allow. Catch :class:`PathRefused` at the call site and return it as an error
+    result - a refused path is an expected failure, not a bug.
+    """
+    resolved = resolve_tool_path_inside_project(raw, ctx.config, ctx.cwd)
     if resolved.refusal:
         raise PathRefused(resolved.refusal)
     return resolved.path

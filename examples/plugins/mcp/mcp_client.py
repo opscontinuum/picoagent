@@ -49,7 +49,7 @@ from typing import Any
 
 from mcp_stdio import PROTOCOL_VERSION, McpError, ServerSpec, StdioServer
 
-from picoagent.core.tools import truncate
+from picoagent.core.tools import tool_result
 from picoagent.core.types import ToolResult
 
 log = logging.getLogger("mcp")
@@ -221,9 +221,8 @@ class McpTool:
         except McpError as exc:
             return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
         text, is_error = render_result(payload)
-        body, cut = truncate(text, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
-        return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=is_error,
-                          details={"server": self.server.name, "tool": self.remote_name})
+        return tool_result(ctx, text, is_error=is_error, server=self.server.name,
+                           tool=self.remote_name)
 
 
 # ------------------------------------------------------------------ registration

@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from helpers import run, tool_ctx, temp_dir
 from picoagent.core.tools import (ShellTool, EditTool, ReadTool, ToolRegistry, WriteTool, truncate,
-                                  spawn_shell, kill_process_tree)
+                                  spawn_shell, kill_process_tree, tool_result)
 
 
 class ReadToolTests(unittest.TestCase):
@@ -165,6 +165,48 @@ class TruncateAndRegistryTests(unittest.TestCase):
         self.assertEqual(len(reg.specs()), 2)
 
 
+
+
+class ToolResultTests(unittest.TestCase):
+    """``tool_result``: the last line of a tool that returns text somebody else sized.
+
+    Four shipped plugins each had this function; the boundary is what a copy gets wrong, so it
+    is pinned here - at the limit is not truncated, one line or one byte past it is.
+    """
+
+    def setUp(self):
+        self.ctx = tool_ctx(temp_dir(), tool_output_max_bytes=100, tool_output_max_lines=3)
+
+    def test_short_text_passes_through_with_the_call_id(self):
+        answer = tool_result(self.ctx, "all good")
+        self.assertEqual(answer.content, "all good")
+        self.assertEqual(answer.tool_call_id, "t1")
+        self.assertFalse(answer.is_error)
+        self.assertEqual(answer.details, {})
+
+    def test_text_exactly_at_the_line_limit_is_not_marked_truncated(self):
+        self.assertNotIn("[truncated]", tool_result(self.ctx, "a\nb\nc").content)
+
+    def test_one_line_past_the_limit_is_cut_and_says_so(self):
+        answer = tool_result(self.ctx, "a\nb\nc\nd")
+        self.assertEqual(answer.content, "a\nb\nc\n\n[truncated]")
+
+    def test_text_exactly_at_the_byte_limit_is_not_marked_truncated(self):
+        self.assertNotIn("[truncated]", tool_result(self.ctx, "x" * 100).content)
+
+    def test_one_byte_past_the_limit_is_cut_and_says_so(self):
+        self.assertIn("[truncated]", tool_result(self.ctx, "x" * 101).content)
+
+    def test_it_keeps_the_head_which_is_what_a_document_needs(self):
+        self.assertTrue(tool_result(self.ctx, "first\nsecond\nthird\nfourth").content.startswith("first"))
+
+    def test_keyword_arguments_become_details_the_model_never_sees(self):
+        answer = tool_result(self.ctx, "wrote it", path="/tmp/x", lines=3)
+        self.assertEqual(answer.details, {"path": "/tmp/x", "lines": 3})
+        self.assertNotIn("/tmp/x", answer.content)
+
+    def test_an_expected_failure_is_a_flagged_result_not_a_raise(self):
+        self.assertTrue(tool_result(self.ctx, "no such index", is_error=True).is_error)
 
 
 class ConfinementTests(unittest.TestCase):

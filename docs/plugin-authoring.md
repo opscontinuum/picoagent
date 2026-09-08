@@ -27,6 +27,35 @@ picoagent says so instead of failing in the middle of `register()`. It is not a 
 version line is not worth a user losing a plugin over. A package your code imports is not this
 field: put it in `python_deps`.
 
+## Publishing a plugin somebody can verify
+
+A `python_deps` entry is an ordinary pip requirement line, so it may carry a version and hashes:
+
+```toml
+python_deps = [
+  "requests==2.31.0 --hash=sha256:58cd2187c01e70e6e26505bca751777aa9f2ee0b7f4300988b709f44e013003f",
+]
+```
+
+Sites that have written a `~/.picoagent/plugin-pins.toml` **require** that shape by default:
+every entry pinned with `==` and carrying at least one `--hash`, whereupon pip is invoked with
+`--require-hashes`, which also means you must list the whole transitive set rather than only the
+package you import. Sites without that file take bare names as they always have. Writing the
+hashed form costs you nothing on those machines and is the difference between installable and
+refused on the others, so write it. `pip freeze` and `pip hash` produce the values.
+
+Publish the plugin's digest alongside each release, too. It is the value an administrator pins
+against, and they cannot check what you have not published:
+
+```sh
+python3 -m picoagent.plugins.loader ./my-plugin
+```
+
+Every file in the directory is covered, so a release note's digest and the directory a user
+clones have to match exactly - a stray editor backup file changes it. See
+[docs/security/trust-boundaries.md](security/trust-boundaries.md#requiring-a-hash-or-a-signature-before-a-plugin-may-be-installed)
+for what a site does with it, and for the `signed_by` alternative if you sign your tags.
+
 If your plugin is a security control rather than a convenience, add two more lines. See
 [If being skipped is not acceptable](#if-being-skipped-is-not-acceptable).
 
@@ -312,8 +341,7 @@ command nor name the variables it receives.
 ## Writing a tool
 
 ```python
-from picoagent.core.types import ToolResult
-from picoagent.core.tools import truncate, resolve_path, file_lock
+from picoagent.core.tools import tool_result, resolve_path, file_lock
 
 class GrepTool:
     name = "grep"
@@ -324,19 +352,34 @@ class GrepTool:
 
     async def execute(self, args, ctx):
         code, out = await run_ripgrep(args, ctx.cwd)          # your implementation
-        body, cut = truncate(out, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
-        return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=code > 1)
+        return tool_result(ctx, out, is_error=code > 1, pattern=args["pattern"])
 ```
+
+`tool_result(ctx, text, is_error=False, **details)` is the last line of most tools: it cuts
+`text` to the session's limits, appends `[truncated]` when it cut, and wraps the rest with
+`ctx.tool_call_id`. Keyword arguments become `ToolResult.details`, which UIs and plugins read
+and the model never sees, so structured facts about the call go there and `text` stays what the
+model is meant to read. It takes `ctx` rather than the two limits because the result carries the
+call id as well, and both arrive in that one object.
+
+It keeps the *head* of the output, which is what a document or a listing needs. A tool whose
+output matters at the end - a command's - calls `truncate(out, max_bytes, max_lines,
+keep="tail")` itself and assembles the `ToolResult`, the way the built-in `shell` does, because
+it has a footer to add after the cut.
 
 Rules of thumb:
 
 * Return `ToolResult(..., is_error=True)` for expected failures; don't raise.
-* Always truncate output. Unbounded output is the fastest way to break a session.
+* Always truncate output. Unbounded output is the fastest way to break a session. `tool_result`
+  is that, done; four shipped plugins wrote their own copy of it before it moved into core.
 * If you write files, wrap the read-modify-write in `async with file_lock(path):` so you
   cooperate with the built-in `edit`/`write` when tool calls run in parallel.
 * Registering a tool named `read`, `write`, `edit` or `shell` replaces the built-in.
 * Take the path from `resolve_path(ctx, args["path"])`, never from `args["path"]` directly.
   It is the same resolution the built-ins use, and it is what a gate is inspecting.
+* If your tool's path argument is normally the model's own construction rather than something
+  the user typed, take it from `resolve_path_inside_project(ctx, args["path"])` instead. Same
+  resolution, one more rule - see below.
 
 ## Gating a path argument
 
@@ -390,6 +433,37 @@ ResolvedPath(path=PosixPath("/home/u/proj/.git/config"), refusal=None)
   "there is no file" is the mistake.
 * Nothing raises. An expected failure is a value here, following the same rule tools follow, so
   a guard never needs a `try` around the question.
+
+**A relative path that leaves the project.** `confine_to_project` is off by default, because a
+coding agent legitimately edits the sibling repository and `~/.config`. That is right for a
+`path` the user typed and wrong for one the model built for itself: `repo="../.."` is a mistake
+nobody asked for, and a tool that quietly scans the parent of the work tree is worse than one
+that says no. The pair for that is one rule further on:
+
+```python
+from picoagent.core.tools import PathRefused, resolve_path_inside_project, resolve_tool_path_inside_project
+
+# in a tool: the refusal is an exception the call site turns into an error result
+try:
+    root = resolve_path_inside_project(ctx, args["repo"])
+except PathRefused as exc:
+    return tool_result(ctx, str(exc), is_error=True)
+
+# in a guard: the refusal is a value, as always
+answer = resolve_tool_path_inside_project(raw, rt.cfg)
+```
+
+A *relative* path must land inside the project; an absolute one is allowed, because it is
+somebody naming a place on purpose. It is a **usability** rule, not a security boundary, and
+must not be sold as one: whatever can write `../..` can write `/etc`. `confine_to_project` is
+the boundary, it is enforced underneath this, and it is unchanged by it.
+
+The escape is judged on the *resolved* path - after the `@` is stripped, `~` expanded and
+symlinks followed - for the same reason everything else here is. Two shipped plugins wrote this
+rule for themselves and the copies disagreed: one read the unstripped string, so `@../..` passed
+where `../..` did not, and compared text rather than the resolved path, so a link inside the
+project pointing out of it passed as a child of it. That is the drift this whole section is
+about, arriving one level up.
 
 **Matching patterns against a resolved path.** A resolved path is absolute, so a relative
 pattern like `.git/**` or `.env` will not `fnmatch` it. Match against every trailing run of the
