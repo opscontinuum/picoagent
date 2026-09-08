@@ -324,8 +324,8 @@ def refuse_unverified(root: Path, policy: "pins.Policy | None", *, spec: str = "
     refusal = policy.refusal(identities, root, pin_digest(root)) or _dependency_refusal(root, policy)
     if refusal is None:
         return
-    # Logged as well as raised: `plugin trust` has no catch for this, so the sentence would
-    # otherwise reach the user only as the last line of a traceback.
+    # Logged as well as raised: the callers that answer this with a sentence do so on stdout,
+    # and a session refusing a spec at startup has only the log to say why.
     log.error("%s", refusal)
     raise PluginVerificationError(refusal)
 

@@ -323,6 +323,22 @@ class TrustingADirectoryIsGatedToo(PinFixture):
             store.trust(loader.Manifest.load(checkout))
         self.assertEqual(loader.TrustStore(self.home).data, {}, "an approval was written anyway")
 
+    def test_the_cli_answers_that_refusal_with_a_sentence_and_not_a_traceback(self):
+        """``picoagent plugin trust <dir>`` used to let the raise escape ``plugin_command``,
+        so the user's fail-closed refusal arrived as a crash. Same policy as above, driven the
+        way a person reaches it."""
+        checkout = loader.plugins_dir(self.cfg()) / "origin"
+        checkout.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", self.spec, str(checkout)], check=True)
+        self.write_pins("")
+        buffer = io.StringIO()
+        args = argparse.Namespace(pcmd="trust", spec=str(checkout), yes=True)
+        with redirect_stdout(buffer):
+            code = cli.plugin_command(args)      # a raise here is the defect this test pins
+        self.assertEqual(code, 1, buffer.getvalue())
+        self.assertIn("not trusted", buffer.getvalue())
+        self.assertEqual(loader.TrustStore(self.home).data, {})
+
 
 class DependenciesAreHashPinnedWhenTheSiteSaysSo(PinFixture):
     """The second half of the finding: ``python_deps`` reach pip with whatever version it

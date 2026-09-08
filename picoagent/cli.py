@@ -829,7 +829,14 @@ def trust_command(manifest, trust: loader.TrustStore, assume_yes: bool = False) 
     if not assume_yes and not input(f"\n{question}").lower().startswith("y"):
         print("not trusted - the plugin will not load")
         return 1
-    trust.trust(manifest)
+    try:
+        trust.trust(manifest)
+    except loader.PluginVerificationError as exc:
+        # The site's pin policy refusing is the store doing its job; a traceback here read as
+        # the tool crashing rather than the plugin failing verification, on both `plugin add`
+        # and `plugin trust`. The refusal already names the pin and the mismatch.
+        print(f"not trusted: {safe_for_display(str(exc))}")
+        return 1
     print(f"trusted {manifest.name}")
     return 0
 
