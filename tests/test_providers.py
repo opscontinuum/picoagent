@@ -57,6 +57,42 @@ def make_runtime(tmp: Path) -> Runtime:
     return rt
 
 
+class NoKeyMeansNoAuthorizationHeader(unittest.TestCase):
+    """With no key configured, the request carries no ``Authorization`` header at all.
+
+    The alternative - ``Authorization: Bearer `` with nothing after it - is not a harmless
+    spelling of "no key": a gateway that validates the header rejects the empty credential, so
+    the local-server configuration this client is most used for (Ollama needs no key) would
+    break against any proxy in front of it. Both request builders guard on ``self._key``; a
+    mutation forcing either guard survived the suite, which is how this test earned its place.
+    """
+
+    def setUp(self):
+        for name in ("PICOAGENT_API_KEY", "OPENAI_API_KEY"):
+            value = os.environ.pop(name, None)
+            if value is not None:
+                self.addCleanup(os.environ.__setitem__, name, value)
+
+    def test_list_models_without_a_key_sends_no_authorization_header(self):
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1")
+            asyncio.run(provider.list_models())
+        self.assertNotIn("Authorization", srv.requests[0]["headers"])
+
+    def test_chat_without_a_key_sends_no_authorization_header(self):
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1")
+
+            async def collect():
+                return [event async for event in provider.stream(
+                    system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+
+            asyncio.run(collect())
+        chat = [r for r in srv.requests if r["path"].endswith("/chat/completions")]
+        self.assertTrue(chat, "the fake server never saw the chat request")
+        self.assertNotIn("Authorization", chat[0]["headers"])
+
+
 class ListModelsTests(unittest.TestCase):
     """`GET /models` on the provider, and the `/model` command built on it."""
 
