@@ -180,11 +180,23 @@ class GuardedShellToolTests(unittest.TestCase):
         self.assertTrue(result.is_error)
         self.assertIn("timed out", result.content)
 
+    def test_truncation_honours_the_sessions_limits_and_keeps_the_tail(self):
+        """The tool carried its own hardcoded 50_000-byte cap with no line cap, so a deployment
+        that tuned tool_output_max_bytes/lines got core's limits from the built-in shell and
+        this plugin's private ones the moment they installed the guard."""
+        result = run(cg.GuardedShellTool().execute(
+            {"command": "seq 1 100"}, _ctx(temp_dir(), tool_output_max_lines=5)))
+        self.assertIn("100", result.content)
+        self.assertNotIn("\n50\n", result.content)
+        self.assertIn("[output truncated; full output:", result.content)
+        self.assertIn("[exit code 0]", result.content)
+
 
 def _ctx(tmp: Path, **config):
     from picoagent.core.tools import ToolContext
-    return ToolContext(cwd=tmp, config={"shell_timeout": 10, **config}, tool_call_id="t1",
-                       abort=asyncio.Event())
+    return ToolContext(cwd=tmp, config={"shell_timeout": 10, "tool_output_max_bytes": 50_000,
+                                        "tool_output_max_lines": 2000, **config},
+                       tool_call_id="t1", abort=asyncio.Event())
 
 
 class ToolCallGuardTests(unittest.TestCase):

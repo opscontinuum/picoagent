@@ -59,6 +59,16 @@ class AgentToolTests(unittest.TestCase):
         self.assertFalse(result.is_error)
         self.assertEqual(result.content, "CHILD ANSWER")
 
+    def test_a_long_child_answer_is_cut_to_the_sessions_limits(self):
+        """The answer used to come back whole, whatever its size - the one tool in the tree
+        that returned unbounded text. max_tokens bounds a child on an ordinary day; the
+        session's own limits are what the parent's context is entitled to."""
+        rt = self._rt([[text("A" * 200)]])
+        rt.cfg["tool_output_max_bytes"] = 64
+        result = self._execute(rt, {"prompt": "say a lot"})
+        self.assertIn("[truncated]", result.content)
+        self.assertLess(len(result.content), 200)
+
     def test_parent_session_is_not_extended_by_the_child(self):
         rt = self._rt([[text("CHILD ANSWER")]])
         before = len(rt.session.entries)

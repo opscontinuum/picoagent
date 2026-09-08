@@ -130,7 +130,7 @@ from typing import Any
 
 from picoagent.core.loop import AgentLoop, Runtime
 from picoagent.core.session import Session
-from picoagent.core.tools import ToolContext
+from picoagent.core.tools import ToolContext, truncate
 from picoagent.core.types import ToolResult
 
 #: Child events replayed on the parent's bus. One entry, because ``tool_call`` is the only event
@@ -234,6 +234,14 @@ class AgentTool:
                               f"The child agent produced no text in {progress['turns']} turn(s). "
                               "It may have spent them all on tool calls; try a smaller task or a "
                               "higher max_turns.", is_error=True, details=details)
+        # The session's limits apply here as everywhere: a child is bounded by max_tokens on an
+        # ordinary day, but max_tokens is the user's setting, and the parent's context is what an
+        # oversized answer breaks. Cut first and append the footers after, so the sentence that
+        # says the answer is incomplete cannot itself be what the cut removed.
+        answer, was_truncated = truncate(answer, ctx.config["tool_output_max_bytes"],
+                                         ctx.config["tool_output_max_lines"])
+        if was_truncated:
+            answer += "\n[truncated]"
         if progress["stopped"]:
             # Say the answer was cut short. A truncated answer read as a complete one is the way
             # this tool would mislead the parent.

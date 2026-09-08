@@ -47,7 +47,7 @@ import sys
 import threading
 from pathlib import Path
 
-from picoagent.core.tools import SHELL_ENV_ALLOWLIST, resolve_tool_path
+from picoagent.core.tools import SHELL_ENV_ALLOWLIST, resolve_tool_path, spill_to_tempfile, truncate
 
 log = logging.getLogger("credential_guard")
 
@@ -243,7 +243,14 @@ class GuardedShellTool:
             return ToolResult(ctx.tool_call_id, f"Command timed out after {timeout}s", is_error=True)
 
         output = stdout.decode(errors="replace")
-        body = output if len(output) < 50_000 else output[-50_000:] + "\n[output truncated]"
+        # The session's limits, not a private cap: this tool replaces the built-in shell, and a
+        # replacement that ignores tool_output_max_bytes/lines un-tunes whatever the deployment
+        # set them to. Same cut and same spill as core's ShellTool, so installing the guard
+        # changes what a command may see, never how much of its output survives.
+        body, was_truncated = truncate(output, ctx.config["tool_output_max_bytes"],
+                                       ctx.config["tool_output_max_lines"], keep="tail")
+        if was_truncated:
+            body += f"\n[output truncated; full output: {spill_to_tempfile(output)}]"
         body += f"\n[exit code {proc.returncode}]"
         return ToolResult(ctx.tool_call_id, body, is_error=proc.returncode != 0,
                           details={"exit_code": proc.returncode})
