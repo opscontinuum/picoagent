@@ -60,8 +60,23 @@ class TheAllowlist(unittest.TestCase):
 
     def test_the_variables_a_toolchain_needs_survive(self):
         base = {"PATH": "/usr/bin", "HOME": "/home/u", "LANG": "C.UTF-8", "VIRTUAL_ENV": "/venv",
-                "CARGO_HOME": "/c", "TMPDIR": "/tmp"}
+                "PYTHONPATH": "/src", "TMPDIR": "/tmp"}
         self.assertEqual(shell_env(base, {}), base | {"PICOAGENT": "1"})
+
+    def test_a_toolchain_variable_earns_its_place_by_need_and_not_by_looking_harmless(self):
+        """The list held GOPATH, CARGO_HOME, JAVA_HOME, NVM_DIR and five more, on the argument
+        that a path is not a credential. That argument admits every harmless-looking name anyone
+        ever proposes, which is per-name secret-classification - the denylist failure - arriving
+        through the other door. Each of these runs from a default install with PATH and HOME
+        alone; a relocated toolchain's owner names the variable in ``shell_env_allow``. Re-adding
+        one here means arguing *need*, not harmlessness."""
+        toolchain = ["CONDA_PREFIX", "JAVA_HOME", "GOPATH", "GOROOT", "CARGO_HOME",
+                     "RUSTUP_HOME", "NODE_PATH", "NVM_DIR", "DOTNET_ROOT"]
+        for name in toolchain:
+            with self.subTest(name=name):
+                self.assertNotIn(name, SHELL_ENV_ALLOWLIST)
+        env = shell_env({name: "/opt/x" for name in toolchain} | {"PATH": "/usr/bin"}, {})
+        self.assertEqual(env, {"PATH": "/usr/bin", "PICOAGENT": "1"})
 
     def test_a_config_that_never_heard_of_the_setting_still_strips(self):
         """Every embedder that builds a config dict by hand gets the safe default."""

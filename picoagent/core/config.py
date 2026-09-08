@@ -50,7 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "tool_output_max_lines": 2000,
     "shell_timeout": 120,            # seconds, unless the model passes its own timeout
     # What the shell tool lets a model-composed command see of your environment. "allowlist"
-    # (paths, locale, toolchain locations - see tools.SHELL_ENV_ALLOWLIST) keeps exported API
+    # (paths, locale, the Python toolchain - see tools.SHELL_ENV_ALLOWLIST) keeps exported API
     # keys out of a tool result, and out of the session log that result is written to.
     # "inherit" is the old behaviour, for whoever wants it, by name.
     "shell_env": "allowlist",        # allowlist | inherit

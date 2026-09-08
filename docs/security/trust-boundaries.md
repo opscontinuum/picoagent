@@ -508,12 +508,21 @@ absent for everyone who has not opted in, which was the shipped default.
 
 An allowlist and not a denylist of secret-shaped names, because the site that invented the
 variable name is the site whose key leaks: `OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY`,
-`AWS_ACCESS_KEY_ID` and `DATABASE_URL` all sail past one. What is on it is what an ordinary
-build needs - `PATH`, `HOME`, `USER`, `SHELL`, `PWD`, `TMPDIR`, `DISPLAY`, the locale and
-timezone variables, the Windows equivalents, and the toolchain locations (`VIRTUAL_ENV`,
-`PYTHONPATH`, `CARGO_HOME`, `JAVA_HOME`, `GOPATH`, `NVM_DIR` and the rest). Every one of those
-is a path, a locale, a terminal setting or an identity the command could ask the operating
-system for anyway. That is the property to preserve when adding to it.
+`AWS_ACCESS_KEY_ID` and `DATABASE_URL` all sail past one. What is on it is what is *needed* -
+`PATH`, `HOME`, `USER`, `SHELL`, `PWD`, `TMPDIR`, `DISPLAY`, the locale and timezone variables,
+the Windows names a child cannot start or resolve a command without, and the Python
+interpreter's own `VIRTUAL_ENV`, `PYTHONPATH` and `PYTHONHOME`, because the interpreter this
+tool's commands run constantly is the one place where a stripped variable silently changes
+*which* program runs rather than failing a build out loud.
+
+Need is the bar for adding to it, not harmlessness. The list once carried `GOPATH`, `GOROOT`,
+`CARGO_HOME`, `RUSTUP_HOME`, `JAVA_HOME`, `NODE_PATH`, `NVM_DIR`, `DOTNET_ROOT` and
+`CONDA_PREFIX` on the argument that a path is not a credential - true of each, and still the
+wrong test, because it admits every harmless-looking name anyone ever proposes and turns the
+list's maintenance back into per-name secret-classification, which is the denylist failure
+arriving through the other door. A default install of every one of those toolchains runs from
+`PATH` and `HOME` alone; only a relocated one needs its variable, and its owner names it in
+`shell_env_allow` and gets exactly what they asked for.
 
 Deliberately absent, each because the value is a credential or carries one: `PICOAGENT_API_KEY`
 and `OPENAI_API_KEY` (the documented way to supply the model key), `SSH_AUTH_SOCK` (a live

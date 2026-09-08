@@ -539,8 +539,9 @@ during the STIG assessment: a planted key was echoed by `echo $VAR` through the 
 came back in a tool result, which is persisted and replayed to the model next turn.
 *Countermeasures taken:* the environment allowlist is the built-in shell's default. The list the
 `credential-guard` plugin invented is now `tools.SHELL_ENV_ALLOWLIST` and `tools.shell_env`
-applies it with no plugin loaded and nothing configured - paths, locale, identity and toolchain
-locations, and nothing that carries a credential. An allowlist rather than a denylist of
+applies it with no plugin loaded and nothing configured - paths, locale, identity and the
+Python interpreter's own variables, and nothing that carries a credential. An entry is on it
+because something needs it, not because it looks harmless. An allowlist rather than a denylist of
 secret-shaped names, because the site that invented the variable name is the site whose key
 leaks: `OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY`, `AWS_ACCESS_KEY_ID` and `DATABASE_URL` all
 sail past a denylist. `shell_env_allow` names a variable a build needs, and `shell_env =

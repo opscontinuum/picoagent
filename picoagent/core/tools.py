@@ -439,10 +439,17 @@ SHELL_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA",
     "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "SYSTEMDRIVE",
     "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE", "USERNAME", "COMPUTERNAME",
-    # toolchain locations: paths to an installed toolchain, never credentials
-    "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "JAVA_HOME", "GOPATH", "GOROOT",
-    "CARGO_HOME", "RUSTUP_HOME", "NODE_PATH", "NVM_DIR", "DOTNET_ROOT",
+    # The interpreter's own variables: these decide which Python runs and what it imports, and
+    # picoagent is a Python harness whose commands run `python` and `pip` constantly. Stripping
+    # them makes the tool's interpreter quietly disagree with the user's terminal.
+    "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
 })
+# An entry earns its place by being *needed* - by this interpreter, or for a default install of
+# a toolchain to run at all - not by being harmless. "It is only a path" is a denylist judgment
+# in allowlist clothing: it re-opens per-name secret-or-not classification, which is the failure
+# an allowlist exists to end. GOPATH, CARGO_HOME, JAVA_HOME, NVM_DIR and the rest were here once
+# on that argument; every one is only load-bearing for a relocated toolchain, whose owner names
+# it in `shell_env_allow` (USER_ONLY) and gets exactly what they asked for.
 
 #: The one value of ``shell_env`` that passes the whole environment through. Only this exact
 #: string opens the door, so a typo, a value of the wrong type, and a value that arrived from
@@ -580,7 +587,7 @@ class ShellTool:
                    "Returns stdout+stderr and exit code. Use timeout (seconds) for long commands. "
                    "Output is truncated at 50KB / 2000 lines (the full output is saved to a temp "
                    "file whose path is reported). The environment is an allowlist - PATH, HOME, "
-                   "locale and toolchain paths - so API keys, tokens and other credentials the "
+                   "locale and the Python toolchain paths - so API keys, tokens and other credentials the "
                    "user exported are not visible to the command, by design. If one is genuinely "
                    "needed, say which variable it is instead of trying to read it.")
     parameters = {"type": "object", "properties": {"command": {"type": "string"},

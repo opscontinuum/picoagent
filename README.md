@@ -110,9 +110,11 @@ Both are read-only conventions — nothing else in picoagent changes either way.
 
 The `shell` tool runs commands as you, but it does **not** hand them your whole environment. It
 passes an allowlist — `PATH`, `HOME`, `USER`, `SHELL`, `PWD`, `TMPDIR`, the locale and timezone
-variables, the Windows equivalents, and toolchain locations like `VIRTUAL_ENV`, `PYTHONPATH`,
-`CARGO_HOME` and `JAVA_HOME` — and drops everything else. So `npm test` and `cargo build` work,
-and `env` does not return your API keys.
+variables, the Windows equivalents, and the Python interpreter's own `VIRTUAL_ENV`, `PYTHONPATH`
+and `PYTHONHOME` — and drops everything else. `npm test` and `cargo build` still work, because a
+default toolchain install needs only `PATH` and `HOME`; what `env` does not return is your API
+keys. A relocated toolchain (a custom `GOPATH`, a `CARGO_HOME` moved off its default) is the
+case for `shell_env_allow` below.
 
 It matters because tool output is not ephemeral: every result is written to the session log and
 sent back to the model as context on the next turn. A key that reaches a command reaches both.

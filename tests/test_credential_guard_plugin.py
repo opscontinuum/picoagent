@@ -107,7 +107,7 @@ class SanitizedEnvTests(unittest.TestCase):
         self.assertEqual(out, {"PATH": "/usr/bin"})
 
     def test_toolchain_paths_still_get_through(self):
-        env = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv", "JAVA_HOME": "/jdk", "PYTHONPATH": "/src"}
+        env = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv", "PYTHONHOME": "/py", "PYTHONPATH": "/src"}
         self.assertEqual(cg.sanitized_env(env), env)
 
     def test_extra_allow_lets_a_project_opt_a_name_back_in(self):
