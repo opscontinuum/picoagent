@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
+from picoagent.core.types import StreamEvent, ToolCall, ToolResult
 from picoagent.frontends.plain import PlainFrontend
 from picoagent.plugins import loader
 from picoagent.plugins.api import PluginAPI
@@ -519,6 +520,52 @@ class ResumePathTests(unittest.TestCase):
     def test_default_and_last_still_work(self):
         self.assertTrue(self._open(None).path.suffix == ".jsonl")
         self.assertTrue(self._open("last").path.suffix == ".jsonl")
+
+
+class _ConcurrencyProbe:
+    """A tool that records the most copies of itself that were ever running at once."""
+    name = "probe"
+    description = "records how many calls overlapped"
+    parameters = {"type": "object", "properties": {}}
+
+    def __init__(self):
+        self.running = 0
+        self.peak = 0
+
+    async def execute(self, args, ctx):
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        # The yield point. Without one nothing can overlap however it was dispatched, so a
+        # probe with no await would report 1 under both settings and pin neither of them.
+        await asyncio.sleep(0.05)
+        self.running -= 1
+        return ToolResult(ctx.tool_call_id, "ok")
+
+
+class ParallelToolTests(unittest.TestCase):
+    """``parallel_tools``: sibling calls in one batch run together, and the default is that they do.
+
+    Every other loop test here issues one call at a time, so both settings produce the same
+    transcript and neither was under test. What the default buys is the whole reason a model is
+    allowed to ask for a batch: three reads take as long as the slowest rather than the sum.
+    """
+
+    def _peak_overlap(self, **config) -> int:
+        probe = _ConcurrencyProbe()
+        batch = [StreamEvent("tool_call", tool_call=ToolCall(f"c{n}", "probe", {})) for n in (1, 2)]
+        rt = make_runtime(temp_dir(), provider=ScriptedProvider([batch, [text("done")]]))
+        rt.tools.register(probe)
+        rt.cfg.update(config)
+        run(AgentLoop(rt).run("go"))
+        self.assertEqual(len(rt.frontend.tool_results()), 2, "both calls must have run")
+        return probe.peak
+
+    def test_two_calls_in_one_batch_overlap_by_default(self):
+        self.assertEqual(self._peak_overlap(), 2)
+
+    def test_turning_the_setting_off_runs_them_one_after_another(self):
+        """The other half, so the test above is about the default rather than about `gather`."""
+        self.assertEqual(self._peak_overlap(parallel_tools=False), 1)
 
 
 if __name__ == "__main__":

@@ -113,6 +113,19 @@ base_url = "http://localhost:11434/v1"
 api_key = ""
 ```
 
+That file can hold a key, so picoagent makes it readable only by your account the first time it
+reads it, and prints a line on stderr saying so. Same for `~/.picoagent/endpoints/*.toml`. It
+only ever removes access, never grants it, and it does not touch a project's own
+`.picoagent/config.toml`. On Windows this does nothing — mode bits are not access control there;
+restrict `%USERPROFILE%\.picoagent` with `icacls` instead.
+
+Note that the key in `PICOAGENT_API_KEY`, or in this file, is **not** visible to commands the
+model runs. The `shell` tool passes an allowlist of environment variables — `PATH`, `HOME`, the
+locale, toolchain paths — so builds and tests work while `env` returns nothing worth stealing.
+Every tool result is written to the session log and replayed to the model, so a key that reached
+a command would be in both. If one of your commands needs a specific variable, add
+`shell_env_allow = ["THE_NAME"]`; `shell_env = "inherit"` passes everything, if you want that.
+
 ## First session
 
 ```bash

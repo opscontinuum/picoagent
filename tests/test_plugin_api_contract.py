@@ -429,6 +429,19 @@ class RequiresIsCheckedAndWarnedAbout(unittest.TestCase):
         complaint = "\n".join(unmet_requirements(manifest, "0.1.0"))
         self.assertIn("picoagent ~ 0.1", complaint)
 
+    def test_a_running_version_this_cannot_read_satisfies_every_constraint(self):
+        """The grammar here is plain dotted numbers, and picoagent's own version need not be one.
+
+        A checkout, a nightly or a distribution patch calls itself something like ``0.2.0.dev1``,
+        and none of that parses. Silence is the deliberate answer and the only safe one: the
+        alternative is telling the user that every plugin they have is incompatible, on a build
+        picoagent chose the name of, over a constraint the plugin author wrote correctly. Pinned
+        with a constraint the numbers would definitely miss, so nothing but the unreadable-version
+        branch can produce this silence.
+        """
+        manifest = self._manifest('requires = ["picoagent>=99.0"]')
+        self.assertEqual(unmet_requirements(manifest, "0.2.0.dev1"), [])
+
     def test_a_requirement_naming_something_else_is_reported_rather_than_guessed_at(self):
         """``requires`` is about picoagent's version; a package a plugin imports is ``python_deps``.
         Read as a picoagent constraint it would silently pass, which is worse than saying so."""

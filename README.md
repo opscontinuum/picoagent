@@ -106,6 +106,35 @@ skill_dirs    = ["skills", ".picoagent/skills", ".agents/skills", ".claude/skill
 
 Both are read-only conventions — nothing else in picoagent changes either way.
 
+## What a command the model runs can see
+
+The `shell` tool runs commands as you, but it does **not** hand them your whole environment. It
+passes an allowlist — `PATH`, `HOME`, `USER`, `SHELL`, `PWD`, `TMPDIR`, the locale and timezone
+variables, the Windows equivalents, and toolchain locations like `VIRTUAL_ENV`, `PYTHONPATH`,
+`CARGO_HOME` and `JAVA_HOME` — and drops everything else. So `npm test` and `cargo build` work,
+and `env` does not return your API keys.
+
+It matters because tool output is not ephemeral: every result is written to the session log and
+sent back to the model as context on the next turn. A key that reaches a command reaches both.
+
+An allowlist rather than a list of secret-looking names, because no such list is complete —
+`OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY` and `DATABASE_URL` all get past one. If a command
+genuinely needs a variable, name it:
+
+```toml
+shell_env_allow = ["ACME_BUILD_FLAG"]   # add one variable
+shell_env = "inherit"                   # or pass everything, if that is what you want
+```
+
+Both are yours to set: a repository's `.picoagent/config.toml` cannot set either, so cloning
+somebody's project cannot widen what the first command sees.
+
+**File permissions.** `~/.picoagent/config.toml` and `~/.picoagent/endpoints/*.toml` can hold an
+`api_key`, and a file you create by hand is world-readable under the usual umask. picoagent
+narrows those to your account when it reads them, tells you on stderr that it did, and never
+widens anything or touches a repository's own config. (POSIX only — on Windows, mode bits are
+not access control; use `icacls` on `%USERPROFILE%\.picoagent`.)
+
 Network reads are separately bounded: the core makes exactly one kind of outbound request,
 `POST {base_url}/chat/completions` to whichever server you configure (plus `GET {base_url}/models`
 when you run `/model list`). Point `base_url` at a local or on-prem endpoint and it never talks

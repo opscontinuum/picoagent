@@ -20,6 +20,7 @@ import os
 import platform
 import signal
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -406,6 +407,78 @@ def own_process_group() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
+#: Environment variables a model-composed command is allowed to see.
+#:
+#: The built-in shell used to hand every command ``{**os.environ, "PICOAGENT": "1"}``, so ``env``
+#: - one of the first things a model runs when it wants to know where it is - returned the user's
+#: API keys as a tool result. Every tool result is appended to the session log and replayed to the
+#: model on the next turn, so one such command wrote a credential to a file on disk and put it in
+#: the next prompt. DISA ASD V6R4 records that as V-222444 (sensitive data in the application
+#: logs); making the log owner-only answered who may read it, not what is in it.
+#:
+#: An allowlist rather than a denylist of secret-shaped names, because a denylist can never be
+#: complete: ``OPENROUTER_KEY``, ``GH_PAT``, ``PRIVATE_KEY``, ``AWS_ACCESS_KEY_ID`` and
+#: ``DATABASE_URL`` all sail through one, and the site that invented the name is the site whose
+#: key leaks. Everything here is a path, a locale, a terminal setting or an identity the command
+#: could ask the operating system for anyway - nothing here carries a secret, which is the
+#: property to preserve when adding to it.
+#:
+#: The list is what an ordinary build needs and no wider: ``npm test``, ``cargo build``,
+#: ``pytest`` and ``git`` all want ``PATH`` and ``HOME``, and each toolchain wants the variable
+#: saying where it was installed. Deliberately absent, each because the value is a credential or
+#: carries one: ``PICOAGENT_API_KEY`` and ``OPENAI_API_KEY`` (the documented way to supply the
+#: model key - see ``provider.py``), ``SSH_AUTH_SOCK`` (a live agent socket), ``HTTP_PROXY`` and
+#: ``HTTPS_PROXY`` (routinely ``http://user:pass@proxy``), and every ``AWS_``/``GH_``/
+#: ``GITHUB_``/``NPM_`` variable. A site that needs one of those in a command names it in
+#: ``shell_env_allow``, which is a decision with somebody's name on it.
+SHELL_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    # POSIX: where things are, who you are, and how to print
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+    "TMPDIR", "PWD", "DISPLAY",
+    # Windows: the equivalents, plus what its shell needs to resolve a command at all
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA",
+    "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "SYSTEMDRIVE",
+    "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE", "USERNAME", "COMPUTERNAME",
+    # toolchain locations: paths to an installed toolchain, never credentials
+    "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "JAVA_HOME", "GOPATH", "GOROOT",
+    "CARGO_HOME", "RUSTUP_HOME", "NODE_PATH", "NVM_DIR", "DOTNET_ROOT",
+})
+
+#: The one value of ``shell_env`` that passes the whole environment through. Only this exact
+#: string opens the door, so a typo, a value of the wrong type, and a value that arrived from
+#: somewhere unexpected all fail closed onto the allowlist.
+SHELL_ENV_INHERIT = "inherit"
+
+
+def shell_env(base_env: Mapping[str, str], config: Mapping[str, Any]) -> dict[str, str]:
+    """The environment a model-composed command runs with, plus the ``PICOAGENT`` marker.
+
+    ``config["shell_env"]`` is ``"allowlist"`` - the default, and the answer for any value this
+    does not recognise - or ``"inherit"``, which passes the whole environment through for the
+    user who genuinely wants that. A config that has never heard of the setting gets the safe
+    one, so an embedder assembling a config dict by hand is covered too.
+
+    ``config["shell_env_allow"]`` adds names to :data:`SHELL_ENV_ALLOWLIST`, matched
+    case-insensitively like the list itself. Its shape is checked here rather than trusted: this
+    runs on whatever the config layering produced, and a ``TypeError`` raised inside a tool is a
+    failure the model is told about and the user is not. A value that is not a list of strings
+    names no variable, so it adds none.
+
+    Both settings are in :data:`picoagent.core.config.USER_ONLY`. A cloned repository naming
+    ``DATABASE_URL`` here would put it in the environment of the first command the model ran,
+    which is the hole ``[plugins.credential-guard] extra_allow_env`` was closed for.
+    """
+    if config.get("shell_env") == SHELL_ENV_INHERIT:
+        return {**base_env, "PICOAGENT": "1"}
+    extra = config.get("shell_env_allow")
+    named = ({name.upper() for name in extra if isinstance(name, str)}
+             if isinstance(extra, list) else set())
+    allowed = SHELL_ENV_ALLOWLIST | named
+    env = {name: value for name, value in base_env.items() if name.upper() in allowed}
+    env["PICOAGENT"] = "1"
+    return env
+
+
 async def spawn_shell(command: str, cwd: Path, env: dict) -> asyncio.subprocess.Process:
     """Start ``command`` in the platform's real shell: PowerShell on Windows, ``/bin/sh``
     elsewhere. ``cmd.exe`` (the default for ``create_subprocess_shell`` on Windows) doesn't
@@ -495,19 +568,27 @@ class ShellTool:
     Windows (auto-detected via ``platform.system()``) - not the same dialect everywhere, so
     the model should write commands appropriate to what it's told the platform is (see the
     ``env`` system-prompt section).
+
+    The command sees :func:`shell_env`, not the user's whole environment. The description says
+    so, because a variable that is simply absent looks to a model like a variable set to the
+    empty string, and it will otherwise report the build as broken rather than say what it
+    could not see.
     """
     name = "shell"
     description = ("Run a shell command in the project directory (bash/sh on Linux and macOS, "
                    "PowerShell on Windows - detected automatically, not the same dialect on both). "
                    "Returns stdout+stderr and exit code. Use timeout (seconds) for long commands. "
                    "Output is truncated at 50KB / 2000 lines (the full output is saved to a temp "
-                   "file whose path is reported).")
+                   "file whose path is reported). The environment is an allowlist - PATH, HOME, "
+                   "locale and toolchain paths - so API keys, tokens and other credentials the "
+                   "user exported are not visible to the command, by design. If one is genuinely "
+                   "needed, say which variable it is instead of trying to read it.")
     parameters = {"type": "object", "properties": {"command": {"type": "string"},
                   "timeout": {"type": "integer"}}, "required": ["command"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         timeout = int(args.get("timeout") or ctx.config["shell_timeout"])
-        proc = await spawn_shell(args["command"], ctx.cwd, {**os.environ, "PICOAGENT": "1"})
+        proc = await spawn_shell(args["command"], ctx.cwd, shell_env(os.environ, ctx.config))
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:

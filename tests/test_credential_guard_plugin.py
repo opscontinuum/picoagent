@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
+from picoagent.core.tools import SHELL_ENV_ALLOWLIST
 from picoagent.plugins import loader
 
 sys.path.insert(0, str(ROOT / "examples/plugins/credential-guard"))
@@ -117,9 +118,23 @@ class SanitizedEnvTests(unittest.TestCase):
         out = cg.sanitized_env({"MY_API_KEY": "x", "PATH": "/usr/bin"}, extra_allow=["MY_API_KEY"])
         self.assertEqual(out, {"PATH": "/usr/bin"})
 
-    def test_picoagent_settings_pass_but_its_api_key_does_not(self):
-        out = cg.sanitized_env({"PICOAGENT_MODEL": "m", "PICOAGENT_API_KEY": "k", "PATH": "/usr/bin"})
-        self.assertEqual(out, {"PICOAGENT_MODEL": "m", "PATH": "/usr/bin"})
+    def test_picoagents_own_settings_are_not_a_hole_in_the_allowlist(self):
+        """Every ``PICOAGENT_*`` name used to pass unless a deny pattern caught it.
+
+        That passthrough was this plugin's own argument turned around: the deny patterns look
+        for ``api_key``, not ``key``, so ``PICOAGENT_OPENROUTER_KEY`` matched nothing and went
+        to the command. A passthrough that is only safe because a denylist is complete is the
+        thing the allowlist exists instead of. ``PICOAGENT=1`` is still set by the tool, which
+        is what a command needs to know it is running under the agent.
+        """
+        out = cg.sanitized_env({"PICOAGENT_MODEL": "m", "PICOAGENT_API_KEY": "k",
+                                "PICOAGENT_OPENROUTER_KEY": "sk-x", "PATH": "/usr/bin"})
+        self.assertEqual(out, {"PATH": "/usr/bin"})
+
+    def test_the_allowlist_is_the_one_core_applies(self):
+        """One list, so the plugin and the built-in shell cannot disagree about what is safe."""
+        self.assertIs(cg._ALLOWED_ENV, SHELL_ENV_ALLOWLIST)
+
 
 
 class InlineKeyWarningTests(unittest.TestCase):
@@ -142,6 +157,15 @@ class GuardedShellToolTests(unittest.TestCase):
         finally:
             del os.environ["PICOAGENT_TEST_API_KEY"]
 
+    def test_a_variable_the_user_named_in_their_own_config_still_reaches_the_command(self):
+        """Core reads ``shell_env_allow``; installing this plugin must not silently un-fix a build."""
+        os.environ["ACME_BUILD_FLAG"] = "on"
+        self.addCleanup(os.environ.pop, "ACME_BUILD_FLAG", None)
+        result = run(cg.GuardedShellTool().execute(
+            {"command": "echo flag=$ACME_BUILD_FLAG"},
+            _ctx(temp_dir(), shell_env_allow=["ACME_BUILD_FLAG"])))
+        self.assertIn("flag=on", result.content)
+
     def test_ordinary_command_still_works(self):
         tool = cg.GuardedShellTool()
         ctx = _ctx(temp_dir())
@@ -157,9 +181,10 @@ class GuardedShellToolTests(unittest.TestCase):
         self.assertIn("timed out", result.content)
 
 
-def _ctx(tmp: Path):
+def _ctx(tmp: Path, **config):
     from picoagent.core.tools import ToolContext
-    return ToolContext(cwd=tmp, config={"shell_timeout": 10}, tool_call_id="t1", abort=asyncio.Event())
+    return ToolContext(cwd=tmp, config={"shell_timeout": 10, **config}, tool_call_id="t1",
+                       abort=asyncio.Event())
 
 
 class ToolCallGuardTests(unittest.TestCase):

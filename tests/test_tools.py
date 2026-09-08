@@ -96,6 +96,16 @@ class ShellToolTests(unittest.TestCase):
         r = run(ShellTool().execute({"command": "seq 1 5000"}, tool_ctx(self.tmp, tool_output_max_lines=50)))
         self.assertIn("5000", r.content); self.assertNotIn("\n1\n", r.content); self.assertIn("full output:", r.content)
 
+    def test_output_that_fits_is_handed_over_whole_with_no_note_and_no_spill_file(self):
+        """The other side of the truncation branch, which nothing was asserting.
+
+        Announcing a cut that did not happen is not cosmetic: the model is told the output it
+        can see is a fragment, so it goes looking for the rest, and the footer hands it a temp
+        file path to go looking in. Every short command would also leave a spill file behind.
+        """
+        result = run(ShellTool().execute({"command": "echo hi"}, tool_ctx(self.tmp)))
+        self.assertEqual(result.content, "hi\n\n[exit code 0]")
+
 
 class ShellDispatchTests(unittest.TestCase):
     """Windows can't be run here, so these prove the *dispatch logic* is correct via mocks:
@@ -151,6 +161,19 @@ class TruncateAndRegistryTests(unittest.TestCase):
         self.assertEqual(truncate(t, 1000, 3, "head")[0].strip().splitlines(), ["0", "1", "2"])
         self.assertEqual(truncate(t, 1000, 3, "tail")[0].strip().splitlines(), ["7", "8", "9"])
         self.assertFalse(truncate("short", 1000, 10)[1])
+
+    def test_the_byte_cut_keeps_the_same_end_the_line_cut_would(self):
+        """``truncate`` cuts twice - by lines, then by bytes - and only the first was pinned.
+
+        One long line reaches the second cut without the first having anything to do, so this is
+        the case that tells the two ends apart there. Getting it backwards is quiet in exactly the
+        way that matters: a command's output would be cut to its opening banner rather than to the
+        error it ended on, and a file read to its last page rather than its first, with the
+        ``[truncated]`` note reading the same either way.
+        """
+        one_line = "HEADHEAD" + "." * 50 + "TAILTAIL"
+        self.assertEqual(truncate(one_line, 8, 10, "head"), ("HEADHEAD", True))
+        self.assertEqual(truncate(one_line, 8, 10, "tail"), ("TAILTAIL", True))
 
     def test_registry_override_and_active_set(self):
         reg = ToolRegistry()

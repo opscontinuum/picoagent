@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Iterator
 
-from .core.config import UNREADABLE_PROJECT_CONFIG_KEY, load_config
+from .core.config import HARDENED_USER_FILES_KEY, UNREADABLE_PROJECT_CONFIG_KEY, load_config
 from .core.loop import AgentLoop, Runtime
 from .core.provider import OpenAICompatProvider
 from .core.session import Session, restrict_to_owner
@@ -150,6 +150,21 @@ def harden_session_dir(directory: Path) -> None:
               "by you; a session log holds the whole conversation", file=sys.stderr)
 
 
+def report_hardened_user_files(cfg: dict) -> None:
+    """Say which of the user's own key-holding files just stopped being world-readable.
+
+    ``load_config`` does the narrowing, because every entry point that reads a config needs it
+    and a library embedder never comes through here. Saying so is this layer's job, for the same
+    reason :func:`harden_session_dir` says it: somebody's files changed, and a mode a user set by
+    hand can be set again in one command, while a key another account has already read cannot be
+    taken back. Named one at a time - there are at most a handful, and which file held the key is
+    the part worth reading.
+    """
+    for path in cfg.get(HARDENED_USER_FILES_KEY) or []:
+        print(f"picoagent: made {path} readable only by you; it can hold an API key",
+              file=sys.stderr)
+
+
 def looks_like_session(path: Path) -> bool:
     """True when ``path``'s first line is a picoagent session header.
 
@@ -251,6 +266,7 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
     cwd = Path(args.cwd or ".").resolve()
     cfg = load_config(cwd, {"model": args.model, "provider": args.provider, "thinking": args.thinking,
                             "temperature": args.temperature})
+    report_hardened_user_files(cfg)
     rt = Runtime(cfg, cwd, open_session(cfg, cwd, args.resume))
     register_core(rt)
     headless = bool(args.prompt or args.json)
@@ -438,6 +454,7 @@ def upgrade_command(args: argparse.Namespace) -> int:
     pip install upgrade differently and guessing wrong breaks the install.
     """
     cfg = load_config(Path(args.cwd or ".").resolve())
+    report_hardened_user_files(cfg)
     statuses = upgrade_mod.check_plugins(cfg)
     report_app_version(cfg)
     if not statuses:
@@ -539,6 +556,7 @@ def plugin_command(args: argparse.Namespace) -> int:
     nothing can reach, to replace four lines argparse already validated.
     """
     cfg = load_config(Path(".").resolve())
+    report_hardened_user_files(cfg)
     trust = loader.TrustStore(Path(cfg["_user_dir"]))
     if args.pcmd != "list" and not args.spec:
         # Named rather than crashed on: every verb but `list` acts on something, and the three

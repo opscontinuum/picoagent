@@ -315,6 +315,11 @@ a child that opens a socket fails without it. It holds nothing that identifies y
 It is an allowlist rather than a denylist of secret-shaped names, because no such denylist is
 complete: `DATABASE_URL` passes every one of them.
 
+The built-in `shell` tool takes the same line for the same reason - `tools.SHELL_ENV_ALLOWLIST`,
+a longer list because a model-composed command has to be able to run a project's own build, and
+widened by the user's `shell_env_allow` rather than by a `pass_env` argument. If your plugin
+replaces `shell`, start from one of those two rather than from `os.environ`.
+
 Why this and not "inherit, it is only my own code": the output of a command a plugin runs is the
 thing plugins put into tool results and notices, and both go back to the model and into the
 session log on the next turn. A subprocess the model can influence is a subprocess whose

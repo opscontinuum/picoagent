@@ -145,12 +145,12 @@ does today.
 | ID | Threat | Asset | Entry | Rank | Status |
 |---|---|---|---|---|---|
 | T11 | Injected instructions in repository content drive arbitrary command execution | A5, A2 | E1 via E3 | **High** | **Open** by default (STIG V-222604) |
-| T20 | Every secret in the environment reaches a model-run command, and its output is logged | A1, A3 | E1 via E3 | **High** | **Open** by default (STIG V-222444) |
 | T1 | A cloned repository redirects the model endpoint and the user's key follows | A1 | E1 | High | Countered |
 | T6 | Code the user never approved, or approved and then changed, loads in-process | A5 | E1, E2 | High | Countered |
 | T2 | A cloned repository reads the credentials file into the system prompt | A1 | E1 | High | Countered |
+| T20 | Every secret in the environment reaches a model-run command, and its output is logged | A1, A3 | E1 via E3 | High | Countered by default (STIG V-222444) |
 | T3 | A cloned repository moves or takes over a plugin checkout the user owns | A4, A5 | E1 | High | Countered |
-| T23 | Any local account reads the entire session log | A3 | E5 | Medium | Countered on POSIX (STIG V-222500, V-222587); open on Windows |
+| T23 | Any local account reads the session log, `config.toml` or an endpoint file | A1, A3 | E5 | Medium | Countered on POSIX (STIG V-222500, V-222587); open on Windows |
 | T9 | Plugin code arrives with no provenance beyond the user's own review | A5 | E2, E4 | Medium | Partly countered; opt-in (STIG V-222513, Open on the CA clause) |
 | T4 | A repository sets a plugin's own settings and takes a decision through it | A1, A5 | E1 | Medium | Countered |
 | T7 | A security plugin does not load, and nothing says so loudly enough | A5 | E1, E2 | Medium | Countered |
@@ -532,27 +532,36 @@ The rule the design holds to: **an API key must never reach the prompt or the se
 Both are one problem, because tool results are persisted and replayed.
 
 **T20 - Every secret in the environment reaches a model-run command, and its output is logged.
-OPEN.**
-*Vulnerability:* the built-in `shell` tool passes `{**os.environ, "PICOAGENT": "1"}` to every
+COUNTERED by default.**
+*Vulnerability:* the built-in `shell` tool passed `{**os.environ, "PICOAGENT": "1"}` to every
 command the model runs, and the loop appends every tool result to the session. Demonstrated
 during the STIG assessment: a planted key was echoed by `echo $VAR` through the shell tool and
 came back in a tool result, which is persisted and replayed to the model next turn.
-*Countermeasures taken:* the `credential-guard` plugin closes exactly this - it replaces the
-environment with an allowlist rather than filtering secret-shaped names - and its own docstring
-calls this the leak path it exists to close. It is an example plugin, not a default. What *is*
-kept out of the log without it: a key typed into a slash command, because slash commands
+*Countermeasures taken:* the environment allowlist is the built-in shell's default. The list the
+`credential-guard` plugin invented is now `tools.SHELL_ENV_ALLOWLIST` and `tools.shell_env`
+applies it with no plugin loaded and nothing configured - paths, locale, identity and toolchain
+locations, and nothing that carries a credential. An allowlist rather than a denylist of
+secret-shaped names, because the site that invented the variable name is the site whose key
+leaks: `OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY`, `AWS_ACCESS_KEY_ID` and `DATABASE_URL` all
+sail past a denylist. `shell_env_allow` names a variable a build needs, and `shell_env =
+"inherit"` restores the old behaviour whole; both are `USER_ONLY`, so a cloned repository
+cannot widen what the first command sees. The tool description says the environment is trimmed,
+because a variable that is simply absent looks to a model like one set to the empty string.
+`credential-guard` still narrows further with `extra_deny_patterns`, which only ever refuses
+more. Also kept out of the log: a key typed into a slash command, because slash commands
 short-circuit before `session.append_message`; and a key echoed in a provider error body, which
 is scrubbed.
-*Potential mitigations:* make the environment allowlist the built-in shell's default; ship
-`credential-guard` enabled and required; refuse to log tool results from `shell`.
-*Selected, and why:* today, none by default. **Residual risk:** on a machine where the user's
-shell exports credentials - which is the normal case - the first command the model runs can
-surface one into the session file and into the next prompt. That file is owner-only now (T23),
-so the exposure is to this user's own account and to anything running as them rather than to
-every account on the host, but a secret that should never have been in the log is still in the
-log. Recorded as STIG V-222444. The compensating control available now is to load `credential-guard`; the stated fix
-is to make the allowlist the built-in default, at which point this threat is countered in the
-shipped configuration rather than in an opt-in one.
+*Potential mitigations:* ship `credential-guard` enabled and required; refuse to log tool
+results from `shell`.
+*Selected, and why:* neither, because neither is needed for this. Requiring a plugin makes the
+default install refuse to start without one; refusing to log `shell` results would blind the
+session to what the agent actually did, which is the audit record V-222500 exists for.
+**Residual risk:** what the allowlist passes is still passed - `PATH` and `HOME` name
+directories, `USER` names an account - and a command that reads a credential *file* still
+returns its contents, which is T21's surface and not this one. A user who sets `shell_env =
+"inherit"` is back where this started, by name, in their own config. Recorded as STIG
+V-222444, closed by `tests/test_shell_environment.py`, which drives the real tool and greps the
+result for a planted secret.
 
 **T21 - A tool is pointed at the credentials file or at `config.toml`.**
 *Vulnerability:* `read`, `grep_search`, `structured_data` and `shell` all take a path from the
@@ -588,7 +597,8 @@ happened.
 *Vulnerability:* `~/.picoagent/sessions/` and the files in it were created under the default
 umask - 0755 and 0644 on a standard install, verified by execution during the STIG assessment.
 The contents are the full conversation: repository content, every command executed, every tool
-result, and anything a command printed, including whatever T20 let through.
+result, and anything a command printed, including whatever T20 let through before the
+environment allowlist became the default.
 *Countermeasures taken:* the session file is created `0600` by the `open` call that creates it,
 not narrowed afterwards, so there is no window in which it exists world-readable; every
 directory made to hold it is created `0700`, parents included, because the names in
@@ -598,17 +608,29 @@ cleared, the owner's own left alone - and the user is told on stderr that their 
 changed and why. That retrofit runs only on the directory picoagent chose; a `-r` path the user
 typed narrows that one file and nothing around it. `tests/test_session_log_permissions.py`
 reads the modes back off the filesystem.
-*Potential mitigations:* also harden `~/.picoagent/config.toml` from core rather than from the
-opt-in plugin that does it today; restrict the file with `icacls` on Windows the way
-credential-guard restricts the credentials file.
-*Selected, and why:* owner-only at creation, the same answer `trust.json` and the credentials
-file already give, and the same one the OS gives `~/.ssh`. **Residual risk:** Windows, where
-mode bits are not access control - NTFS uses ACLs and `chmod` there sets a read-only flag and
-nothing else - so a Windows install is still readable by any account with filesystem access to
-the profile; restrict `%USERPROFILE%\.picoagent` with `icacls` by hand until core does it.
-`~/.picoagent/config.toml`, a documented `api_key` location, is also still `0644` unless
-credential-guard is loaded. Recorded as STIG V-222500 (audit information read access) and
-V-222587 (confidentiality of stored information).
+The same finding covers the other two files that hold a credential, and core answers them the
+same way now. `~/.picoagent/config.toml` is the documented home for `[providers.<name>]
+api_key` and each `~/.picoagent/endpoints/*.toml` holds one key for one service; both were
+whatever the umask gave, 0644 on the assessment machine, while the credentials file beside them
+was opened 0600. `config.harden_user_files` narrows those two and the `endpoints` directory
+around them - the same one-way rule, group and world cleared and the owner's own bits left
+alone - as `load_config` runs, before the file is read, and the CLI names each narrowed path on
+stderr. It creates nothing, because picoagent creates neither file: the user writes
+`config.toml` by hand, following the README, so narrowing an existing file is the whole of the
+fix. A repository's `<project>/.picoagent/config.toml` is deliberately untouched - it is the
+repository's file, `providers` is `USER_ONLY` so it must not hold a credential, and rewriting
+modes inside somebody's checkout is a surprise. `tests/test_config_permissions.py` reads those
+modes back off the filesystem.
+*Potential mitigations:* restrict the files with `icacls` on Windows the way credential-guard
+restricts the credentials file.
+*Selected, and why:* owner-only at creation where there is a creation to own, narrowing where
+there is not - the same answer `trust.json` and the credentials file already give, and the same
+one the OS gives `~/.ssh`. **Residual risk:** Windows, where mode bits are not access control -
+NTFS uses ACLs and `chmod` there sets a read-only flag and nothing else - so a Windows install
+is still readable by any account with filesystem access to the profile. `harden_user_files`
+returns early there rather than reporting a protection it did not obtain; restrict
+`%USERPROFILE%\.picoagent` with `icacls` by hand until core does it. Recorded as STIG V-222500
+(audit information read access) and V-222587 (confidentiality of stored information).
 
 **T24 - The record cannot distinguish a clean exit from a crash. COUNTERED, with a limit worth
 reading.**
@@ -649,9 +671,10 @@ A short reader's map of section 5, in the order someone auditing the code would 
 | Plugin trust store and fingerprinting | approval per directory, SHA-256 over every file, per-file diffs, commit provenance, atomic write, fail-closed read | what approved code may then do; a file boundary moved, a rename, or an added empty file, none of which the digest sees (T6) |
 | Plugin verification policy (`~/.picoagent/plugin-pins.toml`) | a publisher hash or an accepted signer required before install, checked at fetch and again at approval; hash-pinned `python_deps`; refuses when the verifier is missing or the file will not parse | anything, until a site writes the file - it is off by default; and a CA-issued certificate, which OpenPGP keys are not (T9) |
 | The tool/gate path seam | one resolution function for tools and guards, symlink-following, refusal as a value for guards and an exception for tools | paths reached through `shell`, which is not a path argument |
-| The `shell` tool | a timeout, a process-tree kill, output truncation | **authorization: there is none by default** (T11), and the environment it passes (T20) |
-| Credential travel | key held on the provider instance, never in a `Message`; same-origin redirect refusal; error scrubbing; inode-identity tool guard | the environment handed to subprocesses unless credential-guard is loaded |
+| The `shell` tool | a timeout, a process-tree kill, output truncation, an environment allowlist | **authorization: there is none by default** (T11); a file the command reads for itself, which is T21's surface |
+| Credential travel | key held on the provider instance, never in a `Message`; same-origin redirect refusal; error scrubbing; inode-identity tool guard; an environment allowlist on every model-run command | a variable named in `shell_env_allow`, and `shell_env = "inherit"`, which are the user's own decisions |
 | The session log | append-only, torn-write recovery, replayed deliberately, owner-only from creation, a shutdown entry last | Windows, where mode bits are not access control (T23); a kill, which records nothing (T24) |
+| The user's key files (`config.toml`, `endpoints/*.toml`) | narrowed to their owner as the config is read, one way, each named on stderr | Windows, again; and a repository's own `.picoagent/config.toml`, which is out of scope by design |
 
 ## 7. Out of scope, and why
 
@@ -702,11 +725,12 @@ assessment of this artifact, and each names what would close it.
 | ID | Residual risk | STIG | Closes when |
 |---|---|---|---|
 | T11 | Injected content in a cloned repository can run commands as the user, out of the box | V-222604 (CAT I) | an execution authorization gate is the default and running open is a documented deviation |
-| T20 | Secrets in the environment reach model-run commands, and from there the log | V-222444 (CAT II) | the environment allowlist is the built-in shell's default |
-| T23 | On Windows the session log is still readable by any account that can reach the profile, because mode bits are not access control there; `config.toml` is hardened only by the opt-in plugin | V-222500, V-222587 (CAT II) | the log is ACL-restricted on Windows and core hardens `config.toml` |
+| T23 | On Windows the session log, `config.toml` and the endpoint files are still readable by any account that can reach the profile, because mode bits are not access control there | V-222500, V-222587 (CAT II) | those files are ACL-restricted on Windows |
 | T9 | Out of the box a plugin is still whatever the git host served; the verification policy exists but no site has it until it writes `plugin-pins.toml`, and the signature half rests on OpenPGP keys rather than a certificate from an approved CA | V-222513 (CAT II) | verification is against a CA-issued certificate, and picoagent's own releases are signed so the default can be strict |
 
-T11 and T20 share a shape: the control exists in the codebase and is reachable, and the default
-configuration does not use it. That is the single most useful thing an assessor can take from
-this document. T23 is a different shape - the control is the default now, on a platform whose
-permission model this one does not have.
+T11 is the one left with that shape: the control exists in the codebase and is reachable, and
+the default configuration does not use it. That is the single most useful thing an assessor can
+take from this document. T20 used to sit beside it and no longer does - the allowlist it names
+is what the built-in shell applies with nothing installed and nothing configured, and the
+opt-out is a line the user writes in their own config. T23 is a different shape again: the
+control is the default now, on a platform whose permission model this one does not have.

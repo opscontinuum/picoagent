@@ -218,5 +218,35 @@ class ATornSessionLog(unittest.TestCase):
         self.assertIn("line 2", str(caught.exception))
 
 
+class OpeningASessionWithoutResuming(unittest.TestCase):
+    """``resume`` defaults to off, and the callers that rely on that default name no argument.
+
+    Both of them build a filename out of ``int(time.time())`` - ``open_session`` for a fresh run
+    and ``/new`` for a fresh conversation inside one - so a second start inside the same second
+    lands on a file that already holds a conversation. Off, that conversation is left where it is
+    and a new one begins. On, ``/new`` would answer "started a new session" while carrying the
+    whole of the old one forward, and a plain ``picoagent`` run would silently inherit the
+    previous run's history and send it to the model.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        self.path = self.tmp / "session.jsonl"
+        before = Session(self.path, self.tmp)
+        before.append_message(Message(role="user", text="the conversation before"))
+
+    def test_the_history_already_in_the_file_is_not_adopted(self):
+        fresh = Session(self.path, self.tmp)
+        fresh.append_message(Message(role="user", text="the conversation after"))
+        self.assertEqual([m.text for m in fresh.messages()], ["the conversation after"])
+
+    def test_asking_to_resume_is_what_picks_the_old_conversation_up(self):
+        """The other half, so the test above is about the default and not about ``resume`` itself."""
+        resumed = Session(self.path, self.tmp, resume=True)
+        resumed.append_message(Message(role="user", text="the conversation after"))
+        self.assertEqual([m.text for m in resumed.messages()],
+                         ["the conversation before", "the conversation after"])
+
+
 if __name__ == "__main__":
     unittest.main()

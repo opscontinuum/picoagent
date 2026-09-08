@@ -64,8 +64,11 @@ Two paths were open before `USER_ONLY` existed, both confirmed by execution:
 | `context_files = ["~/.picoagent/credentials"]` | `find_context_files` joins with `/`, which discards the left side for an absolute path, so the credentials file was read into the system prompt |
 
 Also closed: `skill_dirs` (prompt text), `plugins.rewrite` (redirects a plugin clone before you
-approve it), `upgrade` (redirects where picoagent upgrades itself from), and
-`confine_to_project` (a repo must not switch off its own confinement).
+approve it), `upgrade` (redirects where picoagent upgrades itself from),
+`confine_to_project` (a repo must not switch off its own confinement), and `shell_env` /
+`shell_env_allow` (what a model-run command sees of your environment - `inherit` would hand
+every exported credential to the first command, and a named variable goes into a tool result
+and from there into the session log).
 
 A repo may still set `model`, `max_tokens`, `thinking`, `parallel_tools` and add to
 `plugins.enabled` - each added plugin still faces the trust prompt, and installs under the
@@ -421,6 +424,37 @@ One file per endpoint, one key per endpoint. A git host, an artifact repository 
 gateway never share a credential, and none of them sits in a file a project could try to
 override. These are read from the user directory only - a project's `endpoints/` is ignored.
 
+### Who else on the machine can read those files
+
+Both these files and `~/.picoagent/config.toml` - the documented place for
+`[providers.<name>] api_key` - are written by hand, by the user, following the README. So they
+were created under whatever the umask gives: `-rw-r--r--` on a standard install, confirmed by
+execution, meaning every account on the host could read a key out of them while the credentials
+file beside them was opened `0600` from the start. DISA ASD V6R4 records that as V-222587.
+
+`load_config` narrows them as it reads them - `config.toml`, every `endpoints/*.toml`, and the
+`endpoints` directory around them, whose entries are the names of every service this user holds
+a credential for. The rule is the session log's, for the same reasons:
+
+* **One way.** Group and world bits are cleared and the owner's own are left exactly as they
+  were, so this removes the access the finding is about and nothing else, and a file somebody
+  deliberately made read-only stays read-only.
+* **Before the read, not after.** The window in which the file is still world-readable is the
+  finding.
+* **Said out loud.** Each narrowed path is printed on stderr. A mode a user set by hand can be
+  set again in one command; a key another account has already read cannot be taken back, so the
+  narrowing happens - but silently rewriting somebody's file modes is not on.
+* **Not fatal.** A path this user cannot `chmod` - someone else's file, a read-only mount - is
+  logged and skipped. Refusing to start over a mode picoagent could not set is the worse answer.
+* **The user's directory only.** A repository's `<project>/.picoagent/config.toml` is untouched.
+  It is the repository's file, `providers` is `USER_ONLY` so it must not hold a credential
+  anyway, and rewriting modes inside somebody's checkout is a surprise.
+
+POSIX only, and stated rather than implied: on Windows `os.chmod` sets a read-only flag and
+nothing else, because NTFS uses ACLs, so `harden_user_files` returns early there instead of
+reporting a protection it did not obtain. `icacls` is the hand fix, and T23 in the threat model
+carries the residual.
+
 ## Where a credential may travel
 
 The rule the design holds to: **an API key must never reach the prompt or the session log.**
@@ -434,7 +468,7 @@ flowchart LR
 
     prov -.->|blocked: scrubbed<br/>from error text| errs["terminal and --json"]
     store -.->|blocked: tool_call guard<br/>on any path argument| tools["read, grep_search,<br/>structured_data, shell"]
-    env["environment variables"] -.->|blocked: allowlist<br/>strips secret-shaped names| sub["shell subprocess"]
+    env["environment variables"] -.->|blocked: core's allowlist<br/>on every shell command| sub["shell subprocess"]
 
     tools --> res["tool result"]
     sub --> res
@@ -454,10 +488,58 @@ Dotted arrows are paths that were closed deliberately, each because it was reach
 | Path | Control |
 |---|---|
 | A tool reads the credentials file or `config.toml` | `tool_call` guard blocks any tool whose path argument names a protected file, by inode identity, and blocks recursive tools pointed at a containing directory |
-| `env` or `echo $VAR` in a shell command | The shell tool passes an allowlist of variables, not a denylist of secret-shaped names |
+| `env` or `echo $VAR` in a shell command | The built-in shell tool passes an allowlist of variables, not a denylist of secret-shaped names - by default, with nothing installed. See below |
 | A gateway echoes the key back in a 401 body | Provider error text is scrubbed before it reaches the terminal or the `--json` stream |
 | A gateway answers the model request with a 302 to another host | The redirect is refused. `urllib` re-sends every header that is not about the body, so the key arrived at the second host in full - confirmed by execution against a local server. Same origin means the same scheme, host and port; a redirect that stays inside one is followed |
 | A key typed into a slash command | Slash commands short-circuit before `session.append_message`, so they are never recorded |
+
+### What a model-run command sees of your environment
+
+The shell tool used to hand every command `{**os.environ, "PICOAGENT": "1"}`. `env` is one of
+the first things a model runs when it wants to know where it is, and the answer came back as a
+tool result - which is appended to the session log and replayed as prompt context on the next
+turn. One command put a key in a file on disk and in the next request to the model. Recorded as
+DISA V-222444, and as T20 in the threat model.
+
+The allowlist that closes it is `tools.SHELL_ENV_ALLOWLIST`, applied by `tools.shell_env` in the
+built-in tool, with nothing installed and nothing configured. It was `credential-guard`'s, and
+moving it into core is the whole of the fix: a control that lives only in an opt-in plugin is
+absent for everyone who has not opted in, which was the shipped default.
+
+An allowlist and not a denylist of secret-shaped names, because the site that invented the
+variable name is the site whose key leaks: `OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY`,
+`AWS_ACCESS_KEY_ID` and `DATABASE_URL` all sail past one. What is on it is what an ordinary
+build needs - `PATH`, `HOME`, `USER`, `SHELL`, `PWD`, `TMPDIR`, `DISPLAY`, the locale and
+timezone variables, the Windows equivalents, and the toolchain locations (`VIRTUAL_ENV`,
+`PYTHONPATH`, `CARGO_HOME`, `JAVA_HOME`, `GOPATH`, `NVM_DIR` and the rest). Every one of those
+is a path, a locale, a terminal setting or an identity the command could ask the operating
+system for anyway. That is the property to preserve when adding to it.
+
+Deliberately absent, each because the value is a credential or carries one: `PICOAGENT_API_KEY`
+and `OPENAI_API_KEY` (the documented way to supply the model key), `SSH_AUTH_SOCK` (a live
+agent socket), `HTTP_PROXY` and `HTTPS_PROXY` (routinely `http://user:pass@proxy`), and every
+`AWS_`/`GH_`/`GITHUB_`/`NPM_` variable.
+
+An allowlist too tight is a tool that cannot do its job, so there are two ways out, and both are
+`USER_ONLY` - a cloned repository may not decide what a command sees, which is exactly the hole
+`[plugins.credential-guard] extra_allow_env` was closed for:
+
+```toml
+shell_env_allow = ["ACME_BUILD_FLAG"]   # one more variable, named by you
+shell_env = "inherit"                   # the old behaviour, whole, by name
+```
+
+Anything that is not the exact string `inherit` means the allowlist, so a typo or a value of the
+wrong type fails closed; a `shell_env_allow` that is not a list of strings names no variable and
+adds none.
+
+What still gets through, stated so it is not assumed. The allowlist passes what it passes:
+`PATH` and `HOME` name directories, `USER` names an account, and a build that prints its own
+configuration prints it. A command that opens a credential *file* still reads it - that is the
+tool-layer guard's surface, above, and the shell file check there is a speed bump. And the tool
+description tells the model the environment is trimmed, because a variable that is simply
+absent looks like one set to the empty string, and an agent that does not know the difference
+reports a broken build instead of saying what it could not see.
 
 ### The endpoint check is on the scheme, and not on the host
 
@@ -508,10 +590,13 @@ naming a protected path. `sed`, `xxd`, `python -c`, a relative path, or copying 
 all defeat it. A shell running as you can read anything you can read; the real controls are the
 environment allowlist and the tool-layer refusal.
 
-**Every control is void if the plugin is not loaded.** credential-guard supplies the guards.
-Untrusted or disabled, the built-in shell tool passes the entire environment through and no
-`tool_call` guard exists. This is why a skip is reported the way it is above, on stderr and as a
-`plugin_skipped` event.
+**A plugin's controls are void if the plugin is not loaded**, and it is worth being exact about
+which ones those now are. The environment allowlist is core's and holds either way. What
+credential-guard supplies on top is the `tool_call` guard over every protected path, the
+`/secrets` store, and `extra_deny_patterns` - the narrowing that refuses a variable the
+allowlist would have passed. Untrusted or disabled, those are the controls that are absent,
+which is still worth knowing at the moment it happens: a skip is reported the way it is above,
+on stderr and as a `plugin_skipped` event.
 
 A plugin can say that reporting is not enough. `required = true` in its `plugin.toml` is read
 before any of its code runs, so unlike `api.declare_required` - which is a statement made from

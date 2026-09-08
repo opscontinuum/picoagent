@@ -10,5 +10,6 @@ skills = ["skills"]
 # this plugin is the one that went missing.
 required = true
 required_reason = """\
-without it the shell tool is the built-in one, which passes every environment variable, \
-API keys included, to whatever the model runs"""
+without it nothing guards the credentials file against a tool that names it, and the shell \
+tool is the built-in one - which strips the environment to core's allowlist but applies none \
+of your deny patterns"""

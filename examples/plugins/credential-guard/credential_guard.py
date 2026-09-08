@@ -18,14 +18,18 @@ Two concerns, kept separate:
    session log or a later prompt through that path either.
 
 2. Leak prevention: even with storage handled, the key still lives in ``os.environ`` fallbacks
-   and gets loaded into the process either way - and picoagent's built-in ``shell`` tool passes
-   the *entire* environment to every command the model runs. If the model runs ``env`` (or, on
-   Windows, ``$env:PICOAGENT_API_KEY``), that output becomes a ``ToolResult`` - which the loop
-   appends to the session and sends back as prompt context on the next turn. That is the actual
-   leak path this plugin closes: a replacement ``shell`` tool strips secret-looking env vars
-   before the command ever sees them, and a ``tool_call`` guard blocks ``read``/``write``/
-   ``edit``/``grep_search`` (and a shell ``cat``/``Get-Content``-style command) from touching
-   the credentials file.
+   and gets loaded into the process either way. The built-in ``shell`` tool used to pass the
+   *entire* environment to every command the model runs, so ``env`` (or, on Windows,
+   ``$env:PICOAGENT_API_KEY``) came back as a ``ToolResult`` - which the loop appends to the
+   session and sends back as prompt context on the next turn.
+
+   That leak is closed in core now: the allowlist this plugin invented is
+   ``tools.SHELL_ENV_ALLOWLIST``, and the built-in shell applies it whether or not anything is
+   installed (DISA V-222444; T20 in the threat model). What is left here is the narrowing on
+   top - ``extra_deny_patterns``, which refuses a name the allowlist would have passed - and a
+   ``tool_call`` guard that blocks ``read``/``write``/``edit``/``grep_search`` (and a shell
+   ``cat``/``Get-Content``-style command) from touching the credentials file, which core does
+   not do.
 
 Configuration (``[plugins.credential-guard]``)::
 
@@ -43,7 +47,7 @@ import sys
 import threading
 from pathlib import Path
 
-from picoagent.core.tools import resolve_tool_path
+from picoagent.core.tools import SHELL_ENV_ALLOWLIST, resolve_tool_path
 
 log = logging.getLogger("credential_guard")
 
@@ -56,22 +60,12 @@ _LINE = re.compile(r"^([A-Za-z0-9_-]+)=(.*)$")
 _DEFAULT_DENY = re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|credential|auth|bearer|cookie)")
 _CAT_LIKE = re.compile(r"\b(cat|less|more|head|tail|type|bat|Get-Content|gc)\b", re.I)
 
-# Variables a subprocess genuinely needs, and that don't carry credentials. Everything else is
-# dropped: a denylist of secret-shaped *names* can never be complete (OPENROUTER_KEY, GH_PAT,
-# PRIVATE_KEY, DATABASE_URL and AWS_ACCESS_KEY_ID all sail through one), so this fails closed
-# instead. Add project-specific names via `extra_allow` in [plugins.credential-guard].
-_ALLOWED_ENV = {
-    # POSIX
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
-    "TMPDIR", "PWD", "DISPLAY",
-    # Windows
-    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA",
-    "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "SYSTEMDRIVE",
-    "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE", "USERNAME", "COMPUTERNAME",
-    # toolchain locations (paths, not credentials)
-    "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX", "JAVA_HOME", "GOPATH", "GOROOT",
-    "CARGO_HOME", "RUSTUP_HOME", "NODE_PATH", "NVM_DIR", "DOTNET_ROOT",
-}
+# The list this plugin used to carry itself. It is core's now - `tools.SHELL_ENV_ALLOWLIST`,
+# which the built-in shell tool applies by default - so the two cannot drift into disagreeing
+# about which variables are safe, and a user who has not installed this plugin is no longer
+# handing every exported credential to the first command the model runs. What is left here is
+# the narrowing: `extra_deny_patterns` on top, which only ever refuses more.
+_ALLOWED_ENV = SHELL_ENV_ALLOWLIST
 
 
 # --------------------------------------------------------------------------- storage
@@ -174,21 +168,38 @@ def sanitized_env(base_env: dict[str, str], extra_deny: list[str] | None = None,
                   extra_allow: list[str] | None = None) -> dict[str, str]:
     """Build the environment a subprocess is allowed to see.
 
-    Allowlist, not denylist: only ``_ALLOWED_ENV`` (plus any ``extra_allow`` names and
-    ``PICOAGENT_*`` settings that aren't themselves secret-shaped) survive. Naming a variable
-    something a denylist doesn't recognise is the single easiest way to leak a key, so the
-    default is to drop anything not positively known to be safe. ``extra_deny`` still applies
-    on top, so an explicitly allowed name that looks secret-shaped is still refused.
+    Allowlist, not denylist: only ``SHELL_ENV_ALLOWLIST`` and any ``extra_allow`` names survive.
+    Naming a variable something a denylist doesn't recognise is the single easiest way to leak a
+    key, so the default is to drop anything not positively known to be safe. ``extra_deny`` still
+    applies on top, so an explicitly allowed name that looks secret-shaped is still refused - it
+    is the one direction this plugin adds over core's default, and it only ever refuses more.
+
+    Every ``PICOAGENT_*`` variable that was not itself secret-shaped used to pass as well, so
+    that a command could see picoagent's own settings. It was the plugin's own argument turned
+    around: ``PICOAGENT_OPENROUTER_KEY`` matches none of the deny patterns - they look for
+    ``api_key``, not ``key`` - so a passthrough that was only safe because of a denylist let one
+    through. ``PICOAGENT=1`` is still set by the tool, which is what a command actually needs to
+    know it is running under the agent.
     """
-    allowed = _ALLOWED_ENV | {name.upper() for name in (extra_allow or [])}
+    allowed = _ALLOWED_ENV | {name.upper() for name in (extra_allow or []) if isinstance(name, str)}
     deny = [_DEFAULT_DENY] + [re.compile(p, re.I) for p in (extra_deny or [])]
 
     def is_safe(name: str) -> bool:
         if any(pattern.search(name) for pattern in deny):
             return False        # secret-shaped wins, even if explicitly allowed
-        return name.upper() in allowed or name.upper().startswith("PICOAGENT_")
+        return name.upper() in allowed
 
     return {k: v for k, v in base_env.items() if is_safe(k)}
+
+
+def _configured_allow(config: dict) -> list[str]:
+    """``shell_env_allow`` from the running config, if it is the shape the setting declares.
+
+    Total, like core's own read of it: this runs inside a tool, and a ``TypeError`` raised there
+    is a failure the model is told about and the user is not.
+    """
+    names = config.get("shell_env_allow")
+    return [name for name in names if isinstance(name, str)] if isinstance(names, list) else []
 
 
 class GuardedShellTool:
@@ -215,7 +226,14 @@ class GuardedShellTool:
         from picoagent.core.types import ToolResult
 
         timeout = int(args.get("timeout") or ctx.config.get("shell_timeout", 120))
-        env = sanitized_env(os.environ, self.extra_deny, self.extra_allow)
+        # The user's own ``shell_env_allow`` counts here too. Core's shell reads it, so a build
+        # that needs one project variable is already fixed there; installing this plugin must
+        # not silently un-fix it and leave somebody debugging a working config. ``shell_env``
+        # itself is not read: ``inherit`` means "pass everything", which is the behaviour this
+        # tool exists to replace, and a denylist over the whole environment is the shape the
+        # allowlist was chosen against.
+        env = sanitized_env(os.environ, self.extra_deny,
+                            self.extra_allow + _configured_allow(ctx.config))
         env["PICOAGENT"] = "1"
         proc = await spawn_shell(args["command"], ctx.cwd, env)
         try:
@@ -460,8 +478,9 @@ async def warn_about_inline_keys(event: dict, rt) -> None:
 # --------------------------------------------------------------------------- register
 
 def register(api):
-    api.declare_required("without it the shell tool is the built-in one, which passes every "
-                         "environment variable, API keys included, to whatever the model runs")
+    api.declare_required("without it nothing guards the credentials file against a tool that "
+                         "names it, and the shell tool is the built-in one - which strips the "
+                         "environment to core's allowlist but applies none of your deny patterns")
     # ``extra_allow_env`` names variables a shell command may see, so it is the boundary this
     # plugin exists to hold, and it is read from the user's config only. A cloned repository that
     # added ``DATABASE_URL`` (which the secret-shaped denylist does not match, because no denylist

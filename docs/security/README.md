@@ -34,6 +34,11 @@ These hold across the codebase and are worth stating once:
 * **A tool result is untrusted input.** Tool output is appended to the session and replayed to
   the model as prompt context. Anything a tool prints is in the conversation from then on -
   which is both the leak path to defend and a prompt-injection surface to treat as data.
+* **A model-run command sees an allowlist of the environment.** The built-in `shell` tool
+  passes paths, locale, identity and toolchain locations, and drops everything else, so an
+  exported API key does not come back in a tool result and from there into the session log.
+  `shell_env_allow` names a variable a build needs and `shell_env = "inherit"` turns the whole
+  thing off; both are `USER_ONLY`, so a cloned repository cannot make either decision.
 * **Plugin code runs with the user's privileges.** There is no sandbox. The boundary is the
   trust decision at load time, not containment at run time.
 * **A site can require verified plugins, and none does by default.** Writing

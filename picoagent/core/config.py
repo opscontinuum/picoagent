@@ -32,7 +32,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from .session import restrict_to_owner
 from .text import describe_exception
+from .tools import is_windows
 
 log = logging.getLogger("picoagent.config")
 
@@ -47,6 +49,12 @@ DEFAULTS: dict[str, Any] = {
     "tool_output_max_bytes": 50_000, # tool output larger than this is truncated (Pi's limits)
     "tool_output_max_lines": 2000,
     "shell_timeout": 120,            # seconds, unless the model passes its own timeout
+    # What the shell tool lets a model-composed command see of your environment. "allowlist"
+    # (paths, locale, toolchain locations - see tools.SHELL_ENV_ALLOWLIST) keeps exported API
+    # keys out of a tool result, and out of the session log that result is written to.
+    # "inherit" is the old behaviour, for whoever wants it, by name.
+    "shell_env": "allowlist",        # allowlist | inherit
+    "shell_env_allow": [],           # extra variable names the command may see
     # Interop with other harnesses' context/skill locations is off. Add "CLAUDE.md" and
     # ".claude/skills" back to these lists (or set them in config.toml) to re-enable it -
     # both are read-only conventions, so nothing else has to change.
@@ -73,6 +81,8 @@ USER_ONLY: tuple[tuple[str, ...], ...] = (
     ("context_files",),       # absolute paths allowed, and contents enter the system prompt
     ("skill_dirs",),          # skill text is injected into the prompt
     ("confine_to_project",),  # a repo must not be able to switch off its own confinement
+    ("shell_env",),           # "inherit" hands every exported credential to the first command
+    ("shell_env_allow",),     # naming DATABASE_URL here puts it in a tool result, and in the log
     ("plugins", "rewrite"),   # redirects a plugin clone to another host before you approve it
     ("upgrade",),             # redirects where picoagent upgrades *itself* from
 )
@@ -377,6 +387,52 @@ def user_dir() -> Path:
     return Path(os.environ.get("PICOAGENT_HOME", Path.home() / ".picoagent"))
 
 
+#: Where the paths narrowed by :func:`harden_user_files` are recorded, so the CLI can say a
+#: user's own files changed. A list on the config rather than a return value, for the reason
+#: :data:`REFUSED_PROJECT_VALUES_KEY` is one: the code that changed the mode and the code that
+#: talks to the user are not the same call.
+HARDENED_USER_FILES_KEY = "_hardened_user_files"
+
+
+def harden_user_files(directory: Path) -> list[str]:
+    """Take group and world access off the user's own files that can hold an API key.
+
+    ``config.toml`` is the documented home for ``[providers.<name>] api_key`` and every
+    ``endpoints/*.toml`` holds one key for one service, and both were created under the umask -
+    0644 on a standard install - so any account on the host could read a key out of them, while
+    the credentials file beside them was opened 0600 from the start. DISA ASD V6R4 records that
+    as V-222587. Returns what was narrowed, worded as paths, so the caller can say so out loud.
+
+    The rule is the session log's, which answered the same finding for its own file:
+    :func:`~picoagent.core.session.restrict_to_owner` clears the group and other bits and leaves
+    the owner's own alone, so this removes exactly the access the finding is about, widens
+    nothing, and a file somebody deliberately made read-only stays read-only. A path this user
+    cannot ``chmod`` is logged and skipped rather than raised: refusing to start over a mode
+    picoagent could not set would be a worse answer than saying which file is unprotected.
+
+    Narrowing rather than only creating owner-only is the whole point here, because picoagent
+    does not create either file - the user writes ``config.toml`` by hand, following the README.
+    There is nothing to pass a mode to, so every one of these files already exists by the time
+    any of this code runs.
+
+    The ``endpoints`` directory is included: its entries are the names of every service this
+    user holds a credential for, which is the same argument the session code makes for the
+    ``sessions`` directory above a log. Scope stops there. A repository's
+    ``<project>/.picoagent/config.toml`` is not touched - it is the repository's file, it must
+    not hold a credential (``providers`` is :data:`USER_ONLY`), and rewriting modes inside
+    somebody's checkout is a surprise.
+
+    POSIX only. On Windows ``os.chmod`` sets a read-only flag and nothing else - NTFS uses ACLs -
+    so this does nothing there rather than reporting a protection it did not obtain. That half of
+    T23 in ``docs/security/threat-model.md`` stays open, with ``icacls`` as the hand fix.
+    """
+    if is_windows():
+        return []
+    endpoints = directory / "endpoints"
+    candidates = [directory / "config.toml", endpoints, *sorted(endpoints.glob("*.toml"))]
+    return [str(path) for path in candidates if path.exists() and restrict_to_owner(path)]
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Return ``base`` updated by ``override``; nested dicts merge instead of replacing."""
     merged = dict(base)
@@ -453,6 +509,10 @@ def load_config(cwd: Path, overrides: dict | None = None) -> dict:
     dropped with a warning: it arrived with a clone, and a repository must not be able to deny
     somebody their own tool by shipping a broken file.
     """
+    # Before the read, not after: these files hold the key, and the window where one is still
+    # world-readable is the finding. Nothing here can stop the session - the worst case is a
+    # mode this user cannot set, which is reported rather than raised.
+    hardened = harden_user_files(user_dir())
     try:
         user_cfg = _read_toml(user_dir() / "config.toml")
         endpoints = load_endpoints(user_dir())
@@ -498,6 +558,7 @@ def load_config(cwd: Path, overrides: dict | None = None) -> dict:
     cfg["_user_dir"] = str(user_dir())
     cfg["_cwd"] = str(cwd)
     cfg["_ignored_project_keys"] = ignored
+    cfg[HARDENED_USER_FILES_KEY] = hardened
     return cfg
 
 

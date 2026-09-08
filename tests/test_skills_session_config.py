@@ -77,6 +77,19 @@ class SessionTests(unittest.TestCase):
         texts = [m.text for m in s.messages()]
         self.assertEqual(texts[0], "[Conversation summary]\nSUMMARY"); self.assertEqual(texts[1:], ["c", "d"])
 
+    def test_the_summary_is_marked_as_one_rather_than_passing_for_a_user_turn(self):
+        """The summary is built in ``messages()`` and never appended to the log, so the only thing
+        telling it from something the user typed is this flag. Without it a frontend replaying
+        history attributes picoagent's own summary to the user, and anything counting the user's
+        turns counts one that never happened. The message beside it carries no marker, which is
+        what makes the flag mean something."""
+        s = Session(self.path, self.tmp)
+        kept = s.append_message(Message(role="user", text="kept"))
+        s.append_compaction("SUMMARY", kept["id"])
+        summary, carried = s.messages()
+        self.assertEqual(summary.meta, {"compaction": True})
+        self.assertEqual(carried.meta, {})
+
     def test_custom_entries_are_not_messages(self):
         s = Session(self.path, self.tmp)
         s.append_custom("todo", {"items": [1]})

@@ -3,6 +3,7 @@ for each provider dialect. Standard library only:  python -m unittest discover -
 from __future__ import annotations
 import asyncio, json, os, sys, tempfile, threading, unittest, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -509,6 +510,87 @@ class RefusedRedirectClosesTheResponse(unittest.TestCase):
         response = _OpenResponse()
         self.assertIsNotNone(self._refuse(response, "https://gateway.example/v2/models"))
         self.assertFalse(response.closed)
+
+
+class RequestBodyTests(unittest.TestCase):
+    """What actually goes on the wire for a ``POST /chat/completions``.
+
+    Everything else about this provider is tested through what comes *back* - the stream, the
+    refusals, the redirect rule - so the request body itself was never read by an assertion. Each
+    line below is one that can be wrong without any of that noticing, because the server answers
+    a wrong request exactly as readily as a right one: a request that silently carries no image,
+    one that asks for no token accounting, and one that offers an ``Authorization`` header built
+    out of an absent key.
+
+    Asserted against a real server rather than by reaching into ``_request``, because the question
+    is what a server receives, and the mapping and the header assembly both sit between the two.
+    """
+
+    def _sent(self, messages, **provider_kwargs) -> dict:
+        """Drive one turn through ``stream`` and hand back the request the server recorded."""
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1", **provider_kwargs)
+
+            async def drain():
+                async for _ in provider.stream(system="sys", messages=messages, tools=[],
+                                               model="m", max_tokens=16, thinking="off"):
+                    pass
+
+            asyncio.run(drain())
+        return srv.requests[0]
+
+    @staticmethod
+    def _authorization(request) -> list[str]:
+        """Every ``Authorization`` header on the request, however the server spelled the name."""
+        return [value for name, value in request["headers"].items()
+                if name.lower() == "authorization"]
+
+    def test_an_image_reaches_the_server_as_a_data_uri_part(self):
+        """``Message.images`` is a documented field with a mapping of its own and no test on it.
+
+        Dropping the images silently is the failure worth catching: the request stays valid, the
+        server answers, and the model simply talks about a picture it was never shown.
+        """
+        message = Message(role="user", text="what is this?",
+                          images=[{"media_type": "image/png", "data": "iVBORw0KGgo="}])
+        body = self._sent([message], api_key="k")["body"]
+        self.assertEqual(body["messages"][-1]["content"],
+                         [{"type": "image_url",
+                           "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                          {"type": "text", "text": "what is this?"}])
+
+    def test_a_text_only_message_stays_a_plain_string(self):
+        """The other half of the same branch: a message with no images must not become a list.
+
+        Servers that accept the multi-part form for an image do not all accept it for text alone,
+        so taking the multimodal path unasked is its own way to break every ordinary turn.
+        """
+        body = self._sent([Message(role="user", text="hi")], api_key="k")["body"]
+        self.assertEqual(body["messages"][-1], {"role": "user", "content": "hi"})
+
+    def test_the_request_asks_the_server_to_report_token_usage(self):
+        """Usage arrives in a streamed response only when the request asks for it.
+
+        Without this flag an OpenAI-compatible server streams the same text and no usage block, so
+        every turn reports zero tokens and nothing else in the session looks wrong.
+        """
+        body = self._sent([Message(role="user", text="hi")], api_key="k")["body"]
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+
+    def test_a_configured_key_is_sent_as_a_bearer_token(self):
+        request = self._sent([Message(role="user", text="hi")], api_key="sekrit")
+        self.assertEqual(self._authorization(request), ["Bearer sekrit"])
+
+    def test_a_keyless_provider_sends_no_authorization_header_at_all(self):
+        """Ollama, llama.cpp and LM Studio are the headline configuration and want no key.
+
+        The header is built from the key only when there is one; built unconditionally it becomes
+        ``Bearer`` with the empty string after it, which a gateway in front of a local model reads
+        as a credential that was offered and is wrong.
+        """
+        with patch.dict(os.environ, {"PICOAGENT_API_KEY": "", "OPENAI_API_KEY": ""}):
+            request = self._sent([Message(role="user", text="hi")])
+        self.assertEqual(self._authorization(request), [])
 
 
 class InterruptedToolBatchTests(unittest.TestCase):
