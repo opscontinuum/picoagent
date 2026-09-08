@@ -28,12 +28,9 @@ in `picoagent/testing/fakes.py`.
 | `test_command_injection.py` | that untrusted data reaches a subprocess as argv and never as shell text, and that only the two intended places hand a string to a shell |
 | `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run, and no test file calling `tempfile.mkdtemp` instead of the resolved `temp_dir()` |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
-| `test_example_plugins.py` | permission-gate and compaction behaviour |
 | `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |
-| `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident), including the read-only gate `allow_destructive` opens |
 | `test_headless_run.py` | what a program driving `-p` reads: the exit code of a run whose model call failed, and which project's sessions `-r last` resumes |
 | `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
-| `test_mcp_live.py` | live end-to-end against a real MCP server in a container (opt-in, skipped by default) |
 
 `tests/helpers.py` has the fixtures: `make_runtime`, `ScriptedProvider`, `CaptureFrontend`,
 the `text()` / `call()` shorthands for scripting model turns, and `temp_dir()`.
@@ -55,9 +52,10 @@ python3 tools/coverage_report.py -p 'test_tools.py'   # one file, while you work
 
 Runs the suite under the standard library's `trace` and prints, per module, how many of that
 module's executable lines the run reached. Three tables, because they answer different
-questions: `picoagent/` is the application, `examples/plugins/` is code the repository ships for
-people to load, and `picoagent/testing/` is the fake servers the suite runs against - averaging
-the fakes into the application's number would flatter it.
+questions: `picoagent/` is the application, `examples/plugins/` is the two provider references
+the docs teach with, and `picoagent/testing/` is the fake servers the suite runs against -
+averaging the fakes into the application's number would flatter it. The plugin family that
+used to be measured here reports its own coverage from its own repositories.
 
 **There is no threshold and no gate.** The suite is what fails a build; this reports a number.
 A threshold picked on a Tuesday becomes an obstacle on a Thursday, and the statistic's job is to
@@ -82,28 +80,28 @@ one; do not edit an old row, because it describes a release that shipped.
 |---|---|---|---|---|
 | 0.1.0 (development) | 2026-09-07 | 972 tests, `OK (skipped=5)` | 91.6% | 93.4% |
 
-The current breakdown:
+The current breakdown, after the plugin extraction:
 
 | | Covered / executable lines | |
 |---|---|---|
-| `picoagent/` - the application | 2475 / 2703 | **91.6%** |
-| `examples/plugins/` - shipped plugins | 5238 / 5558 | 94.2% |
-| `picoagent/testing/` - fake servers | 1154 / 1309 | 88.2% |
-| Application + shipped plugins | 7713 / 8261 | **93.4%** |
+| `picoagent/` - the application | 2779 / 3024 | **91.9%** |
+| `examples/plugins/` - the provider references | 176 / 188 | 93.6% |
+| `picoagent/testing/` - fake servers | 116 / 136 | 85.3% |
+| Application + provider references | 2955 / 3212 | **92.0%** |
 
-Python 3.12.3; the five skips are the two opt-in live files. The least-covered modules, which
-is the part of the report worth reading:
+Python 3.12.3; the three skips are the opt-in live Ollama file. The least-covered modules,
+which is the part of the report worth reading:
 
 | Module | Coverage | Why |
 |---|---|---|
 | `picoagent/frontends/plain.py` | 51.8% | the interactive REPL: its read-and-dispatch loop needs a terminal, so most tests drive the loop directly instead |
-| `picoagent/cli.py` | 83.4% | argument handling and startup wiring, parts of which only run from a real command line |
+| `picoagent/cli.py` | 84.1% | argument handling and startup wiring, parts of which only run from a real command line |
 | `picoagent/frontends/base.py` | 0% | the `Frontend` protocol. Nothing imports it - it is a written contract, and the frontends satisfy it structurally |
-| `picoagent/__main__.py`, `picoagent/testing/fake_mcp.py` | 0% | both only ever run in a **child process**, which `trace` cannot follow. `fake_mcp` is exercised hard by `tests/test_mcp_plugin.py`, over a pipe |
+| `picoagent/__main__.py` | 0% | only ever runs in a **child process**, which `trace` cannot follow |
 
 Read the numbers with three caveats. Line coverage is not branch coverage: a line that ran is
 not a line whose every outcome was tested. A child process is not counted, which is the
-`__main__.py` and `fake_mcp.py` row above. And the tool reports how often it lost the trace
+`__main__.py` row above. And the tool reports how often it lost the trace
 function and re-armed it - CPython removes a trace function that raises, and
 `test_config_refusals` deliberately recurses past the parser's stack, so a handful of lines
 around that point go uncounted. The script says how many times that happened rather than
@@ -203,60 +201,10 @@ it listens beyond loopback.
 
 ## Running the live MCP tests
 
-`tests/test_mcp_live.py` is the other opt-in file. The rest of the MCP suite runs against
-`picoagent/testing/fake_mcp.py`, a server written from the same reading of the specification as the
-client. That proves the two agree. It cannot prove either one matches the protocol, because a
-misreading would be a mistake both sides share and every test would agree with it. This file closes
-that gap by talking to a server nobody here wrote: `@modelcontextprotocol/server-everything`, the
-protocol's own reference server.
-
-```bash
-export PICOAGENT_E2E_MCP=1
-python -m unittest discover -s tests -v
-```
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `PICOAGENT_E2E_MCP` | unset | the switch; unset, `0` or `false` skips every test in the file |
-| `PICOAGENT_E2E_MCP_IMAGE` | `node:22-alpine` | the container the server runs in |
-| `PICOAGENT_E2E_MCP_PACKAGE` | `@modelcontextprotocol/server-everything` | the server `npx` runs |
-| `PICOAGENT_E2E_MCP_STARTUP_TIMEOUT` | `300` | seconds for the handshake and `tools/list` |
-| `PICOAGENT_E2E_MCP_TIMEOUT` | `60` | seconds for one `tools/call` |
-
-The startup budget is high because `--rm` throws the container away, so every run starts on a cold
-npm cache and `npx` fetches the package again. A warm image and a fast link finish the whole file in
-about 12 seconds; the ceiling is there to fail a stuck start rather than to pace a healthy one.
-
-Three things can be missing, and each skips with its own fix: the switch is off, Docker is not
-installed, or the daemon is not reachable. "You did not opt in", "Docker is not installed" and "the
-daemon is not running" send you to three different places, so they are never reported as one flat
-"not available".
-
-The assertions are on protocol facts and side effects: the handshake completed and recorded a
-negotiated revision, `tools/list` came back and its tools were registered, `everything_echo` ran and
-returned content the server produced, and the built-in `read` is still `ReadTool` afterwards. The
-count of tools the reference server ships is its business and moves with its version, so nothing
-asserts on it. Against version 2.0.0 the connection reports:
-
-```
-everything: mcp-servers/everything 2.0.0 (protocol 2024-11-05, running), 13 tools
-```
-
-Every container is stamped with a `picoagent-e2e-mcp=<run>` label, unique per connection. That is
-the one addition these tests make to the command a user would write, and it is what lets
-`ShutdownTests` assert that `session_end` left nothing running instead of assuming it. Each test
-also force-removes its own label on the way out, so a failed assertion still leaves the machine
-clean.
-
-### Why the server runs in a container
-
-The server is started as `docker run -i --rm ...`, which is a stdio command like any other, so a
-stdio-only client reaches any containerised server without gaining a transport. It also sidesteps a
-failure that costs an afternoon. On a WSL machine with no Linux Node installed, `npx` resolves
-through interop to the Windows binary under `/mnt/c`, which starts the server under `CMD.EXE` in a
-UNC path it cannot use. The child comes up, the pipe is there, and the `initialize` handshake never
-completes. It looks exactly like a client bug and it is not one. If you point these tests at a
-server on the host instead, check which `npx` you actually got first.
+The MCP plugin and both its test files - the fake-server suite and the opt-in live run
+against the protocol's reference server - live in
+[opscontinuum/picoagent-plugins](https://github.com/opscontinuum/picoagent-plugins);
+its README carries the run instructions that used to sit here.
 
 ## TDD workflow we follow
 

@@ -39,7 +39,7 @@ Three consequences, and the first is buildable today:
 
 - **The dependency graph is already in the IaC.** "What connects to it and what it connects to"
   is the edge set that `terraform show -json` already carries, as implicit references plus
-  `depends_on`. `examples/plugins/iscp-author/iac_inventory.py` extracts configuration items as
+  `depends_on`. `iac_inventory.py` in [opscontinuum/iscp-author](https://github.com/opscontinuum/iscp-author) extracts configuration items as
   a flat list and drops the edges. Extracting them yields the connectivity map as *derived* data
   rather than something a human asserted and nobody rechecked. *(Inference from the above.)*
 - **"Available" must be a definition, not a vibe.** An SLI for the application, written down.
@@ -56,7 +56,7 @@ and misses COOP requirements it does.
 
 | Family | Term | Level | Governing instrument | Status |
 |---|---|---|---|---|
-| **ISCP** | Information System Contingency Plan | system | NIST SP 800-34 Rev. 1; FedRAMP Appendix G | built - `examples/plugins/iscp-author` |
+| **ISCP** | Information System Contingency Plan | system | NIST SP 800-34 Rev. 1; FedRAMP Appendix G | built - [opscontinuum/iscp-author](https://github.com/opscontinuum/iscp-author) |
 | **ITSCP** | IT Service Continuity Plan | service | ITIL 4 / ITSCM | worked reference at `opscontinuum/oci-itscp` |
 | **COOP** | Continuity of Operations Plan | organisation | HSPD-20/NSPD-51, FCD 1 | planned, not started |
 
@@ -132,9 +132,9 @@ expensive. Decide before building the discovery layer; it is cheaper now than la
 
 | Component | Does |
 |---|---|
-| `examples/plugins/iscp-author` | Generates a FedRAMP-compliant ISCP, DRP and BIA with a provenance-checked renderer; derives configuration items from Terraform via `iac_inventory.py` |
-| `examples/plugins/es-doctor` | Elasticsearch administration and troubleshooting entirely through the API, no SSH |
-| `examples/plugins/stig-runner` | Runs a DISA ASD STIG from a CKL file against a repository, human-gated |
+| [opscontinuum/iscp-author](https://github.com/opscontinuum/iscp-author) | Generates a FedRAMP-compliant ISCP, DRP and BIA with a provenance-checked renderer; derives configuration items from Terraform via `iac_inventory.py` |
+| [opscontinuum/es-doctor](https://github.com/opscontinuum/es-doctor) | Elasticsearch administration and troubleshooting entirely through the API, no SSH |
+| [opscontinuum/stig-runner](https://github.com/opscontinuum/stig-runner) | Runs a DISA ASD STIG from a CKL file against a repository, human-gated |
 | `opscontinuum/oci-itscp` | The worked ITSCP reference: Oracle EBS on Exadata, Ashburn to Phoenix |
 
 Not built: COOP generation, Ansible ingestion, the dependency-edge extraction, the SLI and alert

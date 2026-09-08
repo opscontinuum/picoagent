@@ -75,6 +75,7 @@ Neither is a blocker for codify-on-request. Both would matter more for recurrenc
 ## Architecture
 
 A plugin at `examples/plugins/skillify/`, matching how every other capability here ships.
+*(2026-09-08: the capability plugins have since moved to `opscontinuum/picoagent-plugins`; land skillify there instead.)*
 
 ```
 examples/plugins/skillify/

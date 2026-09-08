@@ -338,7 +338,11 @@ lifted out of the merge into `_project_plugin_config` and handed to plugins as a
   the same way `_ignored_project_keys` names a refused `USER_ONLY` key.
 
 The line the shipped plugins draw: a repository may **tighten** and may set what is only taste.
-It may not choose a destination, a command, or a permission.
+It may not choose a destination, a command, or a permission. The plugins in this table live in
+their own repositories now - `opscontinuum/picoagent-plugins` for the capability plugins,
+`opscontinuum/es-doctor`, `opscontinuum/iscp-author` and `opscontinuum/stig-runner` for the
+domain ones, the two providers still in this tree - and each repository's tests pin its row;
+the table stays here because the *line* is this document's to state.
 
 | Plugin | Taken from a repository | Refused |
 |---|---|---|
@@ -374,41 +378,12 @@ boundary around plugin code remains the load-time trust decision.
 ### What `allow_destructive` refuses
 
 `allow_destructive` is in the table above because a repository must not be able to switch it
-on. That is only worth anything if the gate holds when it is off, and for a while it did not.
-It was a denylist: method `DELETE`, plus seven substrings of a path. Elasticsearch has hundreds
-of endpoints that change something, so everything nobody had enumerated went through with
-`allow_destructive = false` - `PUT /_cluster/settings` to stop allocation across the cluster,
-`POST /<index>/_bulk` carrying delete actions, `PUT /_scripts/<id>` to store a script,
-`POST /_aliases` to change what every read resolves to, `_restore` over live indices, and
-`POST /<index>/_doc` to write forged evidence into the logs somebody is reading. This plugin is
-fed logs and traces, which is data an attacker writes, so the realistic route to any of those is
-an instruction injected into a document and followed by the model.
-
-The gate is now a list of what is permitted, so an endpoint nobody has thought about is refused
-rather than allowed:
-
-* `GET` and `HEAD` reach the cluster. Nothing else does.
-* Except four `POST` paths that only read, because Elasticsearch takes the query in a request
-  body and a body on a GET does not survive every proxy in front of a cluster:
-  `<index>/_search`, `<index>/_count`, `_cluster/allocation/explain`, and
-  `_index_template/_simulate_index/<index>`. Whole-path matches, not substrings, with `%2f` and
-  `..` refused before the list is consulted.
-* The gate lives in `ESClient.request`, which every module in the plugin goes through, so it
-  covers the tools in `es_admin.py` and the next tool somebody writes as well as `es_request`.
-  The `tool_call` guard still blocks `es_request` first, so the model reads a refusal that names
-  the setting and nothing is dispatched, but it is not what makes the gate hold.
-* `ESClient.request_after_confirmation` is the only bypass, and it exists for the two writes a
-  person is shown in full and agrees to before they happen: `es_slowlog enable|disable` (three
-  named threshold keys) and `es_snapshots verify` (a test blob per node). Grep for the name to
-  see every call that takes it, and what you get is only the confirmed writes: with no
-  interactive session `es_snapshots verify` is skipped outright, and `es_slowlog` is too unless
-  `allow_destructive` is set, in which case it writes through the ordinary gated `request` -
-  authorised by the setting rather than confirmed by a person, which is what happened.
-
-What this does not cover: a call that is genuinely a read but is not on the list is refused too,
-so a person who needs one either uses `es_search` or sets `allow_destructive` - a false refusal
-rather than a false permit. And with `allow_destructive = true` the gate is not a gate; it is
-the user saying this cluster is one the model may change.
+on. The gate itself - an allowlist of permitted endpoints, with the reasoning for every
+exception - lives with the plugin, in
+[opscontinuum/es-doctor](https://github.com/opscontinuum/es-doctor)'s README, and its tests
+pin it there. What this document owes is only the boundary: with the setting off, `GET`,
+`HEAD` and four read-only `POST` paths reach the cluster and nothing else does; a repository
+cannot change that answer.
 
 ## Where an endpoint's key lives
 

@@ -178,15 +178,16 @@ Out of the box the agent will run *any* shell command without asking. Most peopl
 least the permission gate:
 
 ```bash
-picoagent -e examples/plugins/permission-gate          # try it for one run
-picoagent plugin add ./examples/plugins/permission-gate  # install + trust it
+git clone https://github.com/opscontinuum/picoagent-plugins ../picoagent-plugins
+picoagent -e ../picoagent-plugins/permission-gate            # try it for one run
+picoagent plugin add ../picoagent-plugins/permission-gate    # install + trust it
 ```
 
 Then list it in your config so it loads every time:
 
 ```toml
 [plugins]
-enabled = ["./examples/plugins/permission-gate", "./examples/plugins/compaction"]
+enabled = ["/path/to/picoagent-plugins/permission-gate", "/path/to/picoagent-plugins/compaction"]
 ```
 
 Plugins can also come straight from git: `picoagent plugin add git:github.com/you/repo@v1.0.0`.

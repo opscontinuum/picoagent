@@ -15,7 +15,7 @@ export PICOAGENT_MODEL=qwen2.5-coder:32b
 python3 -m picoagent                                  # REPL
 python3 -m picoagent -p "explain this repo"           # one-shot
 python3 -m picoagent -p "fix the failing test" --json # JSONL event stream
-python3 -m picoagent -e examples/plugins/permission-gate -e examples/plugins/compaction
+python3 -m picoagent -e ../picoagent-plugins/permission-gate    # load a plugin for one run
 python3 -m picoagent plugin add git:github.com/you/some-plugin@v0.1.0
 python3 -m picoagent plugin list
 ```
@@ -242,10 +242,17 @@ developing a plugin, when re-approving after every edit would be noise.
 
 ## Example plugins
 
-See `examples/plugins/`: `permission-gate`, `compaction`, `grok-provider`, `vertex-provider`, and `es-doctor` (an Elasticsearch diagnostics plugin that digs through Beats/Elastic Agent logs and correlates them with metrics and APM - a worked example of a domain-specific plugin).
+`examples/plugins/` holds the two provider references the docs teach with: `grok-provider`
+(an OpenAI-compatible endpoint in 12 lines) and `vertex-provider` (a different wire dialect,
+implemented whole). Everything that used to live beside them moved to its own repository when
+the examples outgrew the harness - see below.
 
 ## Companion plugin repos
 
+* [picoagent-plugins](https://github.com/opscontinuum/picoagent-plugins) - the capability plugins the core deliberately does not ship: `mcp`, `permission-gate`, `credential-guard`, `rules`, `agents`, `compaction`, `complete`. Clone and enable by path.
+* [es-doctor](https://github.com/opscontinuum/es-doctor) - Elasticsearch diagnostics and administration: digs through Beats/Elastic Agent logs, correlates them with metrics and APM, and inspects the cluster itself. The worked example of a domain-specific plugin.
+* [stig-runner](https://github.com/opscontinuum/stig-runner) - runs a DISA ASD STIG from a CKL file against a repository, human-gated.
+* [iscp-author](https://github.com/opscontinuum/iscp-author) - generates a FedRAMP-compliant ISCP, DRP and BIA with a provenance-checked renderer.
 * [picoagent-tools](https://github.com/opscontinuum/picoagent-tools) - stdlib-only tools: `mermaid_reference` and `mermaid_lint` for writing Mermaid diagrams that actually render.
 * [picoagent-skills](https://github.com/opscontinuum/picoagent-skills) - curated, code-free `SKILL.md` packs, starting with `docs-and-diagrams`.
 

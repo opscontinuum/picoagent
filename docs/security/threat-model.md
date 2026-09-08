@@ -15,8 +15,14 @@ behind it, and every gap named is a gap today.
 ## Scope, and how this document is kept honest
 
 **In scope:** the picoagent package (`picoagent/`), the plugins this repository ships as
-examples (`examples/plugins/`), and the files picoagent creates and reads under the user's home
-directory and inside a project. All of it runs as one local process, as the invoking user.
+examples (`examples/plugins/`, the two provider references), and the files picoagent creates
+and reads under the user's home directory and inside a project. All of it runs as one local
+process, as the invoking user. The plugin family that used to ship here lives in companion
+repositories now (`opscontinuum/picoagent-plugins`, `es-doctor`, `iscp-author`,
+`stig-runner`); the register below keeps the threats whose *seams* are core's - the
+environment a child gets, the config layers, the path resolution - because those hold
+whichever repository the plugin arrives from, and each plugin repository's tests pin its own
+side.
 
 **Reviewed:** at each release, and whenever a new threat is found rather than only on a
 calendar. The trigger for an out-of-cycle review is any of: a new entry point (a new tool, a new
@@ -521,7 +527,8 @@ description less persuasive to a model.
 default. Compounded by a repository being able to name the command, which is T4.
 *Countermeasures taken:* the child starts from a minimal allowlist, and a server entry's own
 `pass_env` names by hand anything else it may see. `servers` is refused from a repository's
-config. `tests/test_mcp_plugin.py` asserts on the child's actual environment.
+config. The mcp plugin's tests (in `opscontinuum/picoagent-plugins`) assert on the child's
+actual environment; `minimal_env` itself is core's, covered here.
 *Potential mitigations:* pass the environment and document it.
 *Selected, and why:* allowlist, for the same reason as T20: a denylist of secret-shaped names
 does not know what a site calls its secrets.
@@ -567,7 +574,8 @@ result for a planted secret.
 **T21 - A tool is pointed at the credentials file or at `config.toml`.**
 *Vulnerability:* `read`, `grep_search`, `structured_data` and `shell` all take a path from the
 model, and the credentials file is a path.
-*Countermeasures taken:* with `credential-guard` loaded, the `tool_call` guard blocks any tool
+*Countermeasures taken:* with `credential-guard` (from `opscontinuum/picoagent-plugins`)
+loaded, the `tool_call` guard blocks any tool
 whose path argument names a protected file, matched by inode identity rather than by string, and
 blocks recursive tools pointed at a containing directory. The guard resolves through the same
 seam the tool uses (T13), which is why the match holds against respellings.
