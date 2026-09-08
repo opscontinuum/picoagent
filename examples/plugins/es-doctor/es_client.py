@@ -14,6 +14,7 @@ So: ``ESClient``/``ESError``/``Settings``/``_ESTool``/``result``/``text_table`` 
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import re
@@ -174,7 +175,21 @@ class ESClient:
         try:
             with self._opener.open(req, timeout=60) as resp:
                 payload = resp.read()
-                return payload.decode(errors="replace") if raw else json.loads(payload or b"null")
+                if raw:
+                    return payload.decode(errors="replace")
+                try:
+                    return json.loads(payload or b"null")
+                except json.JSONDecodeError as exc:
+                    # ``es_request`` takes its path from the model, and several endpoints answer
+                    # plain text: every /_cat/* without format=json, and _nodes/hot_threads. That
+                    # is an expected failure, so it becomes an ESError like any other and reaches
+                    # the model as a result naming the two ways out. Left unhandled it was a
+                    # JSONDecodeError raised out of the tool, which is the one thing the "expected
+                    # failures are values" rule exists to prevent.
+                    raise ESError(f"{method} {path} did not answer JSON ({exc}). Elasticsearch "
+                                  "answers plain text for /_cat/* without format=json and for "
+                                  "_nodes/hot_threads: add format=json to a cat call, or use "
+                                  "es_hot_threads, which reads the text form.") from exc
         except urllib.error.HTTPError as exc:
             raise ESError(f"HTTP {exc.code} {method} {path}: {exc.read().decode(errors='replace')[:800]}") from exc
         except RedirectRefused as exc:
@@ -198,14 +213,22 @@ class Settings:
 
 
 class _ESTool:
-    """Base: holds the client and turns ESError into an error ToolResult."""
+    """Base for every tool in this plugin: holds the client, turns ESError into an error result.
+
+    ``run`` may be written ``def`` or ``async def``. Most of these tools are one HTTP call and
+    a render, which is synchronous; two of the administration tools stop to ask the user
+    through ``ctx.ui.ask`` and so must be awaited. One base that awaits an awaitable covers
+    both, and keeps the ``ESError`` conversion in a single place - a second base for the async
+    half would have to repeat the ``except`` clause that is the whole reason this class exists.
+    """
 
     def __init__(self, es: ESClient, settings: Settings):
         self.es, self.settings = es, settings
 
     async def execute(self, args: dict, ctx) -> ToolResult:
         try:
-            return self.run(args, ctx)
+            outcome = self.run(args, ctx)
+            return await outcome if inspect.isawaitable(outcome) else outcome
         except ESError as exc:
             return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
 

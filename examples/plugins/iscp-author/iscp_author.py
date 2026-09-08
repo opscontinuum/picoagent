@@ -47,6 +47,7 @@ A repository that sets either is told so at session start rather than left wonde
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -141,25 +142,43 @@ def validate(question: iscp_questions.Question, value: Any) -> str:
 
     Validation is deliberately strict: a table row missing a column would render as a blank
     cell that looks filled, and a free-text impact level would land in a FIPS 199 sentence.
+
+    One checker per ``kind``, looked up here, so the rule for a kind is findable by its name
+    and the reader of one rule is not reading the other four. The lookup is not an extension
+    point: the five kinds are fixed by the two source templates, and ``iscp_questions`` says
+    why a sixth would be dead code. ``text`` is the fallback because a question with no
+    explicit kind is text.
     """
-    if question.kind == "number":
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return f"{question.id} is a number{f' in {question.unit}' if question.unit else ''}; " \
-                   f"got {type(value).__name__}"
-    elif question.kind == "enum":
-        if value not in question.options:
-            return f"{question.id} must be one of {', '.join(question.options)}; got {value!r}"
-    elif question.kind == "list":
-        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-            return f"{question.id} is a list of strings"
-        if question.options:
-            unknown = [item for item in value if item not in question.options]
-            if unknown:
-                return f"{question.id} accepts only {', '.join(question.options)}; " \
-                       f"got {', '.join(unknown)}"
-    elif question.kind == "table":
-        return _validate_table(question, value)
-    elif not isinstance(value, (str, int, float)):
+    return _CHECKERS.get(question.kind, _validate_text)(question, value)
+
+
+def _validate_number(question: iscp_questions.Question, value: Any) -> str:
+    # ``bool`` is a subclass of ``int``, so True would pass an isinstance check for a number
+    # and render as "True" where the plan wants an hour count.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"{question.id} is a number{f' in {question.unit}' if question.unit else ''}; " \
+               f"got {type(value).__name__}"
+    return ""
+
+
+def _validate_enum(question: iscp_questions.Question, value: Any) -> str:
+    if value not in question.options:
+        return f"{question.id} must be one of {', '.join(question.options)}; got {value!r}"
+    return ""
+
+
+def _validate_list(question: iscp_questions.Question, value: Any) -> str:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return f"{question.id} is a list of strings"
+    unknown = [item for item in value if item not in question.options] if question.options else []
+    if unknown:
+        return f"{question.id} accepts only {', '.join(question.options)}; " \
+               f"got {', '.join(unknown)}"
+    return ""
+
+
+def _validate_text(question: iscp_questions.Question, value: Any) -> str:
+    if not isinstance(value, (str, int, float)):
         return f"{question.id} is text; got {type(value).__name__}"
     return ""
 
@@ -178,17 +197,32 @@ def _validate_table(question: iscp_questions.Question, value: Any) -> str:
     return ""
 
 
+#: ``kind`` -> the checker for it. See :func:`validate`.
+_CHECKERS = {"number": _validate_number, "enum": _validate_enum, "list": _validate_list,
+             "table": _validate_table, "text": _validate_text}
+
+
 # --------------------------------------------------------------------------- tools
 
 class _ISCPTool:
-    """Base: holds the store and the project root, turns StoreError into an error result."""
+    """Base: holds the answers store and the default output directory, turns StoreError into
+    an error result.
+
+    ``run`` may be written ``def`` or ``async def``. Three of these tools read and write the
+    answers file synchronously; ``iscp_render`` writes several documents and takes the core
+    ``file_lock`` around each, so it has to be awaited. One base that awaits an awaitable
+    covers both, and keeps the ``StoreError`` conversion here: a tool that overrode
+    ``execute`` to get its ``await`` would have to repeat that ``except`` clause, and a tool
+    that forgot to would report a corrupt answers file as a crash.
+    """
 
     def __init__(self, store: AnswerStore, output_dir: str):
         self.store, self.output_dir = store, output_dir
 
     async def execute(self, args: dict, ctx) -> ToolResult:
         try:
-            return self.run(args, ctx)
+            outcome = self.run(args, ctx)
+            return await outcome if inspect.isawaitable(outcome) else outcome
         except StoreError as exc:
             return result(ctx, str(exc), is_error=True)
 
@@ -430,11 +464,8 @@ class RenderTool(_ISCPTool):
                       "description": "subset of iscp | runbooks | ci_inventory (default all)"}},
     }
 
-    async def execute(self, args: dict, ctx) -> ToolResult:
-        try:
-            data = self.store.read()
-        except StoreError as exc:
-            return result(ctx, str(exc), is_error=True)
+    async def run(self, args: dict, ctx) -> ToolResult:
+        data = self.store.read()
         documents = tuple(args.get("documents") or iscp_render.DOCUMENTS)
         unknown = [name for name in documents if name not in iscp_render.DOCUMENTS]
         if unknown:

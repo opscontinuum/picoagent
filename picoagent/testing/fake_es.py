@@ -690,48 +690,78 @@ def _nearest_rank(values: list, percent: float):
 
 
 def _run_aggs(docs: list[dict], aggs: dict) -> dict:
-    """Compute the supported aggregation subset."""
+    """Compute the supported aggregation subset.
+
+    One function per aggregation type, dispatched here in the order Elasticsearch's own
+    reference lists them, so "what does this fake do with a ``terms`` agg?" is answered by
+    reading one named function rather than the fifth arm of a chain. An aggregation type this
+    fake does not implement contributes nothing to the response, which is how a test that
+    needs one finds out it needs adding.
+    """
     out: dict = {}
     for name, spec in aggs.items():
         sub = spec.get("aggs") or spec.get("aggregations") or {}
         if "date_histogram" in spec:
-            dh = spec["date_histogram"]
-            step = _interval_seconds(dh.get("fixed_interval") or dh.get("calendar_interval") or "1m")
-            buckets: dict[int, list[dict]] = {}
-            for d in docs:
-                ts = datetime.strptime(d["@timestamp"], "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc)
-                key = int(ts.timestamp()) // step * step
-                buckets.setdefault(key, []).append(d)
-            out[name] = {"buckets": [
-                {"key": k * 1000, "key_as_string": datetime.fromtimestamp(k, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-                 "doc_count": len(v), **_run_aggs(v, sub)} for k, v in sorted(buckets.items())]}
+            out[name] = _agg_date_histogram(docs, spec["date_histogram"], sub)
         elif "terms" in spec:
-            field = spec["terms"]["field"]
-            counts: dict[str, int] = {}
-            for d in docs:
-                value = _get(d, field)
-                if value is not None:
-                    counts[str(value)] = counts.get(str(value), 0) + 1
-            top = sorted(counts.items(), key=lambda kv: -kv[1])[: spec["terms"].get("size", 10)]
-            out[name] = {"buckets": [{"key": k, "doc_count": n} for k, n in top]}
+            out[name] = _agg_terms(docs, spec["terms"])
         elif "avg" in spec or "max" in spec:
             kind = "avg" if "avg" in spec else "max"
-            values = [v for v in (_get(d, spec[kind]["field"]) for d in docs) if isinstance(v, (int, float))]
-            out[name] = {"value": (sum(values) / len(values) if kind == "avg" else max(values)) if values else None}
+            out[name] = _agg_metric(docs, spec[kind]["field"], kind)
         elif "percentiles" in spec:
-            # Answered so the offline correlate demo still prints latency. A real cluster
-            # interpolates between neighbouring values; nearest-rank is close enough for a
-            # fixture and never invents a number that is not in the data.
-            values = sorted(v for v in (_get(d, spec["percentiles"]["field"]) for d in docs)
-                            if isinstance(v, (int, float)))
-            out[name] = {"values": {f"{percent:.1f}": _nearest_rank(values, percent)
-                                    for percent in spec["percentiles"].get("percents", [50])}}
+            out[name] = _agg_percentiles(docs, spec["percentiles"])
         elif "filter" in spec:
-            kept = [d for d in docs if _matches(d, spec["filter"])]
+            kept = [doc for doc in docs if _matches(doc, spec["filter"])]
             out[name] = {"doc_count": len(kept), **_run_aggs(kept, sub)}
         elif "value_count" in spec:
-            out[name] = {"value": sum(1 for d in docs if _get(d, spec["value_count"]["field"]) is not None)}
+            field = spec["value_count"]["field"]
+            out[name] = {"value": sum(1 for doc in docs if _get(doc, field) is not None)}
     return out
+
+
+def _agg_date_histogram(docs: list[dict], spec: dict, sub: dict) -> dict:
+    """Bucket by timestamp, then run the sub-aggregations inside each bucket."""
+    step = _interval_seconds(spec.get("fixed_interval") or spec.get("calendar_interval") or "1m")
+    buckets: dict[int, list[dict]] = {}
+    for doc in docs:
+        stamp = datetime.strptime(doc["@timestamp"], "%Y-%m-%dT%H:%M:%S.000Z").replace(tzinfo=timezone.utc)
+        buckets.setdefault(int(stamp.timestamp()) // step * step, []).append(doc)
+    return {"buckets": [
+        {"key": key * 1000,
+         "key_as_string": datetime.fromtimestamp(key, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+         "doc_count": len(members), **_run_aggs(members, sub)}
+        for key, members in sorted(buckets.items())]}
+
+
+def _agg_terms(docs: list[dict], spec: dict) -> dict:
+    """The most common values of one field, biggest count first."""
+    counts: dict[str, int] = {}
+    for doc in docs:
+        value = _get(doc, spec["field"])
+        if value is not None:
+            counts[str(value)] = counts.get(str(value), 0) + 1
+    top = sorted(counts.items(), key=lambda item: -item[1])[: spec.get("size", 10)]
+    return {"buckets": [{"key": key, "doc_count": count} for key, count in top]}
+
+
+def _agg_metric(docs: list[dict], field: str, kind: str) -> dict:
+    """``avg`` or ``max`` of one numeric field. No matching document answers ``null``, as ES does."""
+    values = [value for value in (_get(doc, field) for doc in docs) if isinstance(value, (int, float))]
+    if not values:
+        return {"value": None}
+    return {"value": sum(values) / len(values) if kind == "avg" else max(values)}
+
+
+def _agg_percentiles(docs: list[dict], spec: dict) -> dict:
+    """Answered so the offline correlate demo still prints latency.
+
+    A real cluster interpolates between neighbouring values; nearest-rank is close enough for
+    a fixture and never invents a number that is not in the data.
+    """
+    values = sorted(value for value in (_get(doc, spec["field"]) for doc in docs)
+                    if isinstance(value, (int, float)))
+    return {"values": {f"{percent:.1f}": _nearest_rank(values, percent)
+                       for percent in spec.get("percents", [50])}}
 
 
 # ------------------------------------------------------------------ server
@@ -829,7 +859,22 @@ class ESHandler(BaseHTTPRequestHandler):
         """Answer one of ``build_cluster``'s endpoints, or ``None`` to fall through.
 
         Returns ``(body, status)``; a ``str`` body is sent as text/plain (hot threads).
+
+        The routes are split three ways - what a node reports about itself, what the cluster
+        reports about its own state, and what is scoped to an index or a template - because
+        that is how the Elasticsearch reference is organised and how somebody asking "does
+        this fake serve X?" looks for X. Each router answers ``None`` for a path it does not
+        recognise, so the order the three are tried in is the order the routes were written
+        in, unchanged.
         """
+        for router in (self._node_get, self._cluster_get, self._index_get):
+            answer = router(path)
+            if answer is not None:
+                return answer
+        return None
+
+    def _node_get(self, path: str) -> tuple[Any, int] | None:
+        """cat endpoints and the per-node stats: what the nodes report about themselves."""
         cluster, query = self.server.cluster, self._query
         if path.startswith("/_cat/shards"):
             return self._cat_rows(cluster["shards"], path, "/_cat/shards"), 200
@@ -848,6 +893,11 @@ class ESHandler(BaseHTTPRequestHandler):
             return cluster["hot_threads"], 200
         if "/stats" in path and path.startswith("/_nodes"):
             return self._node_stats_for(path), 200
+        return None
+
+    def _cluster_get(self, path: str) -> tuple[Any, int] | None:
+        """Tasks, allocation, lifecycle and snapshots: what the cluster reports about itself."""
+        cluster, query = self.server.cluster, self._query
         if path == "/_tasks":
             return cluster["tasks"], 200
         if path == "/_cluster/pending_tasks":
@@ -869,6 +919,11 @@ class ESHandler(BaseHTTPRequestHandler):
             return cluster["slm_stats"], 200
         if path == "/_snapshot" or path.startswith("/_snapshot/"):
             return self._snapshot_get(path, query)
+        return None
+
+    def _index_get(self, path: str) -> tuple[Any, int] | None:
+        """Templates, data streams, and the settings/mapping/stats of one index pattern."""
+        cluster = self.server.cluster
         if path.startswith("/_index_template"):
             return self._template_get(path, "/_index_template", cluster["index_templates"], "index_templates")
         if path.startswith("/_component_template"):

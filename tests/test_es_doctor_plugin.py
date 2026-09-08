@@ -198,6 +198,27 @@ class WriteGateTests(EsDoctorBase):
         self.assertIn("read-only", described)
 
 
+class NonJsonResponseTests(EsDoctorBase):
+    """A cluster answering something that is not JSON is an expected failure, not a bug.
+
+    ``es_request`` takes a path from the model, and several Elasticsearch endpoints answer
+    plain text: every ``/_cat/*`` without ``format=json``, and ``_nodes/hot_threads``. The
+    convention this codebase holds is that a tool reports an expected failure as a result and
+    only a bug raises, so the tool has to come back with something the model can act on.
+    """
+
+    def test_a_text_answer_is_an_error_result_not_a_raised_decode_error(self):
+        result = self.tool("es_request", method="GET", path="/_nodes/hot_threads")
+        self.assertTrue(result.is_error)
+        self.assertIn("did not answer JSON", result.content)
+
+    def test_the_refusal_names_the_endpoint_and_what_to_do_instead(self):
+        result = self.tool("es_request", method="GET", path="/_nodes/hot_threads")
+        self.assertIn("/_nodes/hot_threads", result.content)
+        self.assertIn("format=json", result.content)
+        self.assertIn("es_hot_threads", result.content)
+
+
 class ConfirmedWriteTests(EsDoctorBase):
     """``request_after_confirmation`` is the gate's one bypass, and its contract is narrow: a
     write the user was shown in full and agreed to.

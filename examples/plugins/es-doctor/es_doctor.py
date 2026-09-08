@@ -264,6 +264,31 @@ class IndicesTool(_ESTool):
         return result(ctx, text or "(no indices)")
 
 
+def _logs_body(args: dict) -> dict[str, Any]:
+    """The search this tool sends, separate from the rendering of what comes back.
+
+    Every filter the model can ask for is assembled here and nowhere else, which is what
+    makes "what did the tool actually query" answerable without reading the renderer:
+    ``level`` defaults to error and ``level="any"`` drops the clause entirely, free text goes
+    through ``simple_query_string`` with ``and`` so two words mean both, and the dataset
+    breakdown is always asked for because it is what tells a responder which shipper the
+    lines came from.
+    """
+    level = args.get("level", "error")
+    filters = time_filters(args.get("since"), args.get("until")) + entity_filters(args.get("host"), args.get("service"), args.get("container"))
+    if level and level.lower() != "any":
+        filters += level_filter(level)
+    if args.get("query"):
+        filters.append({"simple_query_string": {"query": args["query"], "default_operator": "and"}})
+    body: dict[str, Any] = {"size": int(args.get("size") or 40), "query": {"bool": {"filter": filters}},
+                            "sort": [{"@timestamp": {"order": "desc"}}],
+                            "_source": ["@timestamp", "log.level", "service.name", "host.name", "message", "error.message", "event.dataset"],
+                            "aggs": {"datasets": {"terms": {"field": "event.dataset", "size": 10}}}}
+    if args.get("histogram"):
+        body["aggs"]["timeline"] = {"date_histogram": {"field": "@timestamp", "fixed_interval": args.get("interval") or "5m"}}
+    return body
+
+
 class LogsTool(_ESTool):
     name = "es_logs"
     description = ("Search logs (Elastic Agent logs-*, filebeat-*). Filters: service, host, container, level "
@@ -278,19 +303,7 @@ class LogsTool(_ESTool):
         "index": {"type": "string"}, "histogram": {"type": "boolean"}, "interval": {"type": "string", "description": "e.g. 5m"}}}
 
     def run(self, args, ctx):
-        level = args.get("level", "error")
-        filters = time_filters(args.get("since"), args.get("until")) + entity_filters(args.get("host"), args.get("service"), args.get("container"))
-        if level and level.lower() != "any":
-            filters += level_filter(level)
-        if args.get("query"):
-            filters.append({"simple_query_string": {"query": args["query"], "default_operator": "and"}})
-        body: dict[str, Any] = {"size": int(args.get("size") or 40), "query": {"bool": {"filter": filters}},
-                                "sort": [{"@timestamp": {"order": "desc"}}],
-                                "_source": ["@timestamp", "log.level", "service.name", "host.name", "message", "error.message", "event.dataset"],
-                                "aggs": {"datasets": {"terms": {"field": "event.dataset", "size": 10}}}}
-        if args.get("histogram"):
-            body["aggs"]["timeline"] = {"date_histogram": {"field": "@timestamp", "fixed_interval": args.get("interval") or "5m"}}
-        data = self.es.search(args.get("index") or self.settings.logs_index, body)
+        data = self.es.search(args.get("index") or self.settings.logs_index, _logs_body(args))
 
         hits = list(reversed(data["hits"]["hits"]))
         total = data["hits"]["total"]["value"] if isinstance(data["hits"]["total"], dict) else data["hits"]["total"]
@@ -495,8 +508,10 @@ class RequestTool(_ESTool):
                   "required": ["method", "path"]}
 
     def run(self, args, ctx):
+        # Always JSON: the client answers a text body with an ESError naming the endpoints that
+        # do that and what to call instead, so there is no string case to render here.
         data = self.es.request(args["method"].upper(), args["path"], args.get("body"))
-        return result(ctx, json.dumps(data, indent=1) if not isinstance(data, str) else data)
+        return result(ctx, json.dumps(data, indent=1))
 
 
 # ------------------------------------------------------------------ registration

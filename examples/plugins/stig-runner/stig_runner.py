@@ -152,7 +152,8 @@ def _next_unreviewed(checklist: ckl.Checklist) -> ckl.Rule | None:
 # --------------------------------------------------------------------------- tools
 
 class _StigTool:
-    """Base for the seven tools: holds the session and turns a missing checklist into an error."""
+    """Base for the seven tools: holds the session, finds the rule a tool names, and turns a
+    missing checklist or an unknown rule into an error result rather than an exception."""
 
     def __init__(self, session: Session):
         self.session = session
@@ -167,6 +168,19 @@ class _StigTool:
 
     async def run(self, args: dict, ctx) -> ToolResult:      # pragma: no cover - overridden
         raise NotImplementedError
+
+    def rule_from(self, args: dict) -> ckl.Rule:
+        """The rule ``args["vuln_num"]`` names, from the loaded checklist.
+
+        Raises ``LookupError`` for both ways this fails - no checklist open, and no rule of that
+        name in the one that is - which :meth:`execute` above turns into an error result. Three
+        tools start this way and the model reads the difference between the two messages to pick
+        its next call, so they are worded once here rather than three times below.
+        """
+        rule = self.session.require().by_vuln(args["vuln_num"])
+        if rule is None:
+            raise LookupError(f"no rule matching {args['vuln_num']!r} in this checklist")
+        return rule
 
 
 class LoadTool(_StigTool):
@@ -242,10 +256,7 @@ class RuleTool(_StigTool):
         "required": ["vuln_num"]}
 
     async def run(self, args: dict, ctx) -> ToolResult:
-        checklist = self.session.require()
-        rule = checklist.by_vuln(args["vuln_num"])
-        if rule is None:
-            return result(ctx, f"no rule matching {args['vuln_num']!r} in this checklist", is_error=True)
+        rule = self.rule_from(args)
         probes = asd_probes.probes_for(rule.rule_ver)
         body = [
             f"{rule.vuln_num}  {rule.rule_ver}  {rule.rule_id}",
@@ -281,10 +292,7 @@ class EvidenceTool(_StigTool):
         "required": ["vuln_num"]}
 
     async def run(self, args: dict, ctx) -> ToolResult:
-        checklist = self.session.require()
-        rule = checklist.by_vuln(args["vuln_num"])
-        if rule is None:
-            return result(ctx, f"no rule matching {args['vuln_num']!r} in this checklist", is_error=True)
+        rule = self.rule_from(args)
         try:
             root = _resolve_repo(ctx, args.get("repo"))
         except (PathRefused, evidence.ContainmentError) as exc:
@@ -352,10 +360,7 @@ class SetTool(_StigTool):
         "required": ["vuln_num", "status"]}
 
     async def run(self, args: dict, ctx) -> ToolResult:
-        checklist = self.session.require()
-        rule = checklist.by_vuln(args["vuln_num"])
-        if rule is None:
-            return result(ctx, f"no rule matching {args['vuln_num']!r} in this checklist", is_error=True)
+        rule = self.rule_from(args)
 
         status = args["status"]
         details = args.get("finding_details") or ""
@@ -384,6 +389,7 @@ class SetTool(_StigTool):
                 if problem:
                     return result(ctx, f"{problem} (you chose {answer})", is_error=True)
 
+        checklist = self.session.require()
         checklist.set_status(rule.vuln_num, status, finding_details=details,
                              comments=args.get("comments"),
                              severity_override=override or None,
