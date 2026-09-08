@@ -72,8 +72,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import __version__
-from ..core.config import PROJECT_ENABLED_KEY
+from ..core.config import PROJECT_ENABLED_KEY, user_dir
 from ..core.loop import Runtime
+from . import pins
 from .api import PluginAPI
 from .manifest import Manifest, unmet_requirements
 
@@ -97,7 +98,23 @@ def is_git_spec(spec: str) -> bool:
 # ------------------------------------------------------------------------ provenance
 
 class PluginOwnershipError(RuntimeError):
-    """A spec from one config layer tried to write a checkout another layer owns."""
+    """The loader will not hand this spec back as a directory to install from.
+
+    Named for its first case and kept under that name deliberately: a spec from one config layer
+    trying to write a checkout another layer owns. ``cli.add_plugin`` catches it to print
+    *cannot install <spec>: <reason>*, which is the sentence every refusal at this seam wants,
+    so a second refusal here is a subclass rather than a sibling. See
+    :class:`PluginVerificationError`.
+    """
+
+
+class PluginVerificationError(PluginOwnershipError):
+    """The checkout arrived and does not match what the site pinned for it.
+
+    Separate from the ownership case because they answer different questions - *may this spec
+    write here* against *are these the bytes the publisher published* - and a caller that wants
+    only one of them should be able to say so. See :mod:`picoagent.plugins.pins`.
+    """
 
 
 class PluginProvenanceError(RuntimeError):
@@ -246,13 +263,91 @@ def resolve_source(spec: str, cfg: dict, project: bool = False) -> Path:
     repository chose. Neither is a claim a repository gets to make about a directory the user's
     plugin directory owns.
     """
+    rewrites = cfg.get("plugins", {}).get("rewrite") or {}
     if is_git_spec(spec):
-        rewrites = cfg.get("plugins", {}).get("rewrite") or {}
-        return _clone_or_update(spec, plugins_dir(cfg, project), rewrites,
+        root = _clone_or_update(spec, plugins_dir(cfg, project), rewrites,
                                 off_limits=plugins_dir(cfg) if project else None)
-    path = Path(spec).expanduser()
-    path = path if path.is_absolute() else Path(cfg["_cwd"]) / path
-    return _refuse_off_limits(path, plugins_dir(cfg) if project else None)
+    else:
+        path = Path(spec).expanduser()
+        path = path if path.is_absolute() else Path(cfg["_cwd"]) / path
+        root = _refuse_off_limits(path, plugins_dir(cfg) if project else None)
+    refuse_unverified(root, pins.Policy.load(cfg["_user_dir"]), spec=spec, rewrites=rewrites)
+    return root
+
+
+def plugin_identities(root: Path, spec: str = "", rewrites: dict[str, str] | None = None) -> list[str]:
+    """The names a pin may be written against for this plugin, most specific first.
+
+    Three of them, because three are in play and an administrator should not have to guess which
+    one picoagent will use. The url actually fetched from comes first; the url the spec named
+    before any ``[plugins].rewrite`` redirected it comes next, so pointing a site at an internal
+    mirror does not shed a pin written against the upstream address; the directory on disk comes
+    last, which is the only identity a hand-placed plugin has.
+
+    A checkout reached without a spec - ``picoagent plugin trust <dir>``, or a directory sitting
+    in the plugin folder - still gets its remote back out of git, so the same pin covers a plugin
+    however the user arrived at it. Without that, ``plugin trust`` on a cloned directory would be
+    a way to install by url and be judged as a path.
+    """
+    names: list[str] = []
+    if spec and is_git_spec(spec):
+        names.append(parse_spec(spec, rewrites)[0])
+        names.append(parse_spec(spec)[0])
+    else:
+        remote = git_output(root, "remote", "get-url", "origin", timeout=LOCAL_GIT_TIMEOUT)
+        if remote:
+            names.append(remote)
+    names.append(TrustStore.key(root))
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def refuse_unverified(root: Path, policy: "pins.Policy | None", *, spec: str = "",
+                      rewrites: dict[str, str] | None = None) -> None:
+    """Raise :class:`PluginVerificationError` unless this checkout satisfies the site's policy.
+
+    A no-op when ``policy`` is ``None`` - there is no ``plugin-pins.toml`` - which is the common
+    case and the reason this can sit on the resolve path at all: the fingerprint is only
+    computed once a site has asked for one.
+
+    The policy is passed in rather than loaded here because the two callers know different user
+    directories and must not be made to agree by accident. ``TrustStore`` was handed one when it
+    was built and reads its own; ``resolve_source`` has a config and reads that config's.
+
+    Called from those two places on purpose. :func:`resolve_source` covers ``plugin add`` and
+    every spec in ``[plugins].enabled``; :meth:`TrustStore.trust` covers the path that has no
+    spec at all, ``picoagent plugin trust <directory>``. A gate on only the first would be a
+    gate with a documented way round it - clone by hand, then approve.
+    """
+    if policy is None:
+        return
+    identities = plugin_identities(root, spec, rewrites)
+    refusal = policy.refusal(identities, root, pin_digest(root)) or _dependency_refusal(root, policy)
+    if refusal is None:
+        return
+    # Logged as well as raised: `plugin trust` has no catch for this, so the sentence would
+    # otherwise reach the user only as the last line of a traceback.
+    log.error("%s", refusal)
+    raise PluginVerificationError(refusal)
+
+
+def _dependency_refusal(root: Path, policy: "pins.Policy") -> str | None:
+    """What the site's ``python_deps`` rule says about the manifest sitting at ``root``.
+
+    Asked here, on the resolve path, and not only where pip is actually run. ``plugin add`` runs
+    :func:`install_deps` *after* the consent prompt and after the approval is recorded - which is
+    the right order for pip, because consent has to come before a source distribution executes
+    its build script - and it means a refusal raised there leaves a plugin approved and its
+    dependencies absent. Asking before consent turns that into an ordinary refusal with nothing
+    written anywhere.
+
+    A manifest that will not parse is not this function's complaint. ``plugin add`` reads it
+    immediately afterwards and says so far better than a verification error could.
+    """
+    try:
+        manifest = Manifest.load(root)
+    except Exception:  # noqa: BLE001 - the caller reads this manifest next and reports on it
+        return None
+    return policy.dependency_refusal(manifest.python_deps) if manifest.python_deps else None
 
 
 def parse_spec(spec: str, rewrites: dict[str, str] | None = None) -> tuple[str, str]:
@@ -365,10 +460,55 @@ def fast_forward(root: Path) -> None:
                    check=False)
 
 
-def install_deps(manifest: Manifest) -> None:
-    """pip-install a plugin's declared ``python_deps`` (no-op when empty)."""
-    if manifest.python_deps:
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *manifest.python_deps], check=False)
+def install_deps(manifest: Manifest, policy: "pins.Policy | None" = None) -> None:
+    """pip-install a plugin's declared ``python_deps`` (no-op when empty).
+
+    With no ``plugin-pins.toml`` this is the plain install it has always been: the names the
+    manifest wrote, resolved by pip at whatever versions the index offers today. A site that has
+    written that file gets pip's ``--require-hashes`` contract instead, and the deps go through a
+    requirements file because that is the only place pip accepts a ``--hash`` per requirement.
+
+    The refusal is raised, not warned, and it is raised before pip is invoked at all. A source
+    distribution runs its build script during install, so "install it and complain" would be
+    complaining about code that has already executed with the user's privileges.
+
+    ``policy`` is a parameter so a caller that has already loaded one is not made to read the
+    file twice; it is loaded here when absent because ``cli.add_plugin`` calls this with a
+    manifest and nothing else.
+    """
+    if not manifest.python_deps:
+        return
+    policy = pins.Policy.load(user_dir()) if policy is None else policy
+    if policy is not None:
+        refusal = policy.dependency_refusal(manifest.python_deps)
+        if refusal is not None:
+            log.error("%s", refusal)
+            raise PluginVerificationError(refusal)
+    if policy is None or policy.python_deps == "allow-unpinned":
+        _pip(manifest.python_deps, *manifest.python_deps)
+        return
+    with tempfile.TemporaryDirectory() as scratch:
+        requirements = Path(scratch) / "requirements.txt"
+        requirements.write_text("\n".join(manifest.python_deps) + "\n")
+        _pip(manifest.python_deps, "--require-hashes", "-r", str(requirements))
+
+
+def _pip(deps: list[str], *arguments: str) -> None:
+    """Run ``pip install`` and say so when it did not work.
+
+    ``check=False``, as it has always been: a dependency that will not install is a plugin that
+    will fail to import, and ``load_all`` reports that far better than a traceback out of
+    ``plugin add`` would - which would also leave the approval already written. What is new is
+    that the failure is said out loud. Silently ignoring pip's exit code means a
+    ``--require-hashes`` install whose artifact did not match its hash finishes with *trusted*
+    on screen and no other sign at all, which is the one outcome this whole path exists to make
+    visible.
+    """
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "-q", *arguments], check=False)
+    if result.returncode != 0:
+        log.error("pip install failed (exit %s) for %s; the plugin is approved but its "
+                  "dependencies are not installed and it will not import",
+                  result.returncode, ", ".join(deps))
 
 
 # ------------------------------------------------------------------------ trust
@@ -376,6 +516,80 @@ def install_deps(manifest: Manifest) -> None:
 #: Never part of a fingerprint: build artefacts and VCS metadata that a plugin ships without
 #: meaning to, and that change without the plugin changing.
 _UNTRUSTED_NOISE = {"__pycache__", ".git", ".hg", ".svn", ".mypy_cache", ".pytest_cache"}
+
+
+def directory_files(root: Path) -> list[Path]:
+    """Every file under ``root`` that a trust decision or a pin covers.
+
+    Takes a directory rather than a manifest because a pin is checked before there is a
+    manifest to take: ``resolve_source`` has a checkout and a spec and nothing else, and the
+    whole point of the check is to answer before anything in that directory has been read as
+    configuration. :func:`plugin_files` is the same walk asked the other way round.
+    """
+    files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if any(part in _UNTRUSTED_NOISE for part in path.relative_to(root).parts):
+            continue
+        if path.suffix in (".pyc", ".pyo"):
+            continue
+        files.append(path)
+    return files
+
+
+def directory_fingerprint(root: Path) -> str:
+    """sha256 over the contents of every file in ``root``, in path order.
+
+    What the trust store has always recorded, kept exactly as it was. Note what it is blind to:
+    the bytes are concatenated with nothing between them and the names are never hashed, so
+    moving a line from the end of ``a.py`` to the start of ``b.py`` produces the same digest,
+    and adding an empty file produces the same digest. That is enough for the question the trust
+    store asks - *did the bytes I approved change* - and it is not enough for a value an
+    administrator publishes as a pin, which is why :func:`pin_digest` exists rather than this
+    one being quietly redefined. Redefining it would send every approval on every machine back
+    to the trust prompt at once, including the ``required`` ones that stop a session.
+    """
+    digest = hashlib.sha256()
+    for path in directory_files(root):
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def pin_digest(root: Path) -> str:
+    """The value ``plugin-pins.toml`` is written against: sha256 over a list of file digests.
+
+    One line per file, ``"<sha256 of the file>  <path relative to root>"``, sorted by path,
+    newline-terminated, and the whole list hashed. Names and file boundaries are inside the
+    digest, so the three things :func:`directory_fingerprint` cannot see - a boundary moved
+    between two files, a file renamed, an empty file added - each change it.
+
+    Deliberately the shape ``sha256sum`` already prints, so a publisher or an administrator can
+    reproduce it with the tools already on the machine rather than having to trust this
+    function. The portable way::
+
+        python3 -m picoagent.plugins.loader <plugin directory>
+
+    and the way that needs no picoagent at all, which is the one that matters when the question
+    is whether to install picoagent's idea of this plugin::
+
+        cd <plugin> && find . -type f \\
+            -not -path '*/.git/*' -not -path '*/__pycache__/*' -not -path '*/.hg/*' \\
+            -not -path '*/.svn/*' -not -path '*/.mypy_cache/*' -not -path '*/.pytest_cache/*' \\
+            -not -name '*.pyc' -not -name '*.pyo' \\
+          | sed 's|^\\./||' | LC_ALL=C sort | tr '\\n' '\\0' | xargs -0 sha256sum | sha256sum
+
+    The exclusions are :data:`_UNTRUSTED_NOISE` and the compiled-Python suffixes, spelled out
+    because a recipe that quietly covers a different set of files than the code does is worse
+    than no recipe. ``LC_ALL=C`` is not decoration: a locale-aware sort orders the listing
+    differently and produces a different number.
+
+    A hash nobody can compute independently is not a hash anybody can check, and the rule this
+    serves (DISA V-222513) asks for one an administrator can verify before installing.
+    """
+    lines = [f"{hashlib.sha256(path.read_bytes()).hexdigest()}  "
+             f"{path.relative_to(root).as_posix()}\n" for path in directory_files(root)]
+    return hashlib.sha256("".join(lines).encode()).hexdigest()
 
 
 def plugin_files(manifest: Manifest) -> list[Path]:
@@ -391,24 +605,17 @@ def plugin_files(manifest: Manifest) -> list[Path]:
     that runs. A README is included for the same reason it is cheap to: the alternative is a
     rule about which files matter, and that rule is what failed the first time.
     """
-    files = []
-    for path in sorted(manifest.root.rglob("*")):
-        if not path.is_file():
-            continue
-        if any(part in _UNTRUSTED_NOISE for part in path.relative_to(manifest.root).parts):
-            continue
-        if path.suffix in (".pyc", ".pyo"):
-            continue
-        files.append(path)
-    return files
+    return directory_files(manifest.root)
 
 
 def plugin_fingerprint(manifest: Manifest) -> str:
-    """sha256 over the manifest and entry module - the thing the user actually approved."""
-    digest = hashlib.sha256()
-    for path in plugin_files(manifest):
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+    """sha256 over every file in the plugin directory - the thing the user actually approved.
+
+    The same number :func:`directory_fingerprint` computes, and deliberately the same one: what
+    a site pins and what an approval records have to agree, or a publisher's hash would be a
+    value the trust prompt never shows and the user could never check by hand.
+    """
+    return directory_fingerprint(manifest.root)
 
 
 def plugin_file_hashes(manifest: Manifest) -> dict[str, str]:
@@ -519,6 +726,11 @@ class TrustStore:
         #: distinction is only knowable here, at the read, so it is answered here instead of by
         #: each caller opening the file again and possibly disagreeing with this one.
         self.unreadable = False
+        #: The site's verification policy, read from the same directory this store lives in, or
+        #: ``None`` when the site has not written one. Held here because ``trust`` is the last
+        #: gate before code becomes loadable and it has no config to consult - see
+        #: :meth:`trust` and :func:`refuse_unverified`.
+        self.policy = pins.Policy.load(user_dir)
         raw = self._read()
         self.data: dict[str, dict] = {key: {"fingerprint": rec} if isinstance(rec, str) else rec
                                       for key, rec in raw.items()}
@@ -652,7 +864,15 @@ class TrustStore:
         after a rename leaves one record rather than two disagreeing ones. A rootless record
         filed under this name goes too: this one supersedes it, and leaving both would file two
         records for one approval.
+
+        Refuses outright when the site pinned this plugin and the code in front of it does not
+        match - :class:`PluginVerificationError`, and no record written. Approval is the act that
+        makes a plugin loadable, so it is the last place a verification policy can still mean
+        anything; ``plugin trust <directory>`` reaches here without going through
+        :func:`resolve_source`, and a policy that only bound the fetch would be one a user
+        walks past by cloning the repository themselves.
         """
+        refuse_unverified(manifest.root, self.policy)
         root = self.key(manifest.root)
         stale = [label for label, record in self.data.items()
                  if record.get("root") == root or (label == manifest.name and not record.get("root"))]
@@ -1399,3 +1619,27 @@ def _refusal(entry: Discovered, manifest: Manifest, status: str, owner: Path | N
     if entry.layer == PROJECT and owner is not None and owner != entry.root:
         return Skip(manifest.name, "shadowed", entry.root, entry.layer, manifest, owner)
     return Skip(manifest.name, status, entry.root, entry.layer, manifest)
+
+
+def _print_pin_digest(argv: list[str]) -> int:
+    """``python3 -m picoagent.plugins.loader <directory>`` - print what a pin must be written to.
+
+    Not a ``picoagent plugin`` verb, and that is a real limitation rather than a preference: the
+    people who most need this are a plugin's publisher computing the value for a release note
+    and an administrator checking a downloaded copy against it, and neither of them should have
+    to guess at the walk. A module entry point is the smallest thing that lets both of them run
+    it against a directory without a picoagent config, a project, or a trust store.
+    """
+    if len(argv) != 1:
+        print("usage: python3 -m picoagent.plugins.loader <plugin directory>", file=sys.stderr)
+        return 2
+    root = Path(argv[0]).expanduser()
+    if not root.is_dir():
+        print(f"{root} is not a directory", file=sys.stderr)
+        return 1
+    print(pin_digest(root))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_print_pin_digest(sys.argv[1:]))

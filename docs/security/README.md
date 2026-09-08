@@ -13,8 +13,11 @@ Not yet written. Listed so the gaps are visible rather than implied:
 
 * **Credential handling** - the full key lifecycle, and the findings from the credential-guard
   review with their resolutions.
-* **Supply chain** - plugin provenance, the trust fingerprint, and what an internal mirror
-  changes.
+* **Supply chain** - the full picture: what an internal mirror changes, and the provenance of
+  picoagent's own releases rather than only its plugins'. The plugin half is written:
+  [trust-boundaries.md](trust-boundaries.md#requiring-a-hash-or-a-signature-before-a-plugin-may-be-installed)
+  covers the trust fingerprint and the `plugin-pins.toml` verification policy, and threat-model
+  T9 records what that policy does and does not close.
 * **Deployment guidance** - running in an air-gapped or accredited environment: what reads the
   filesystem, what reaches the network, and how to constrain both.
 
@@ -33,3 +36,7 @@ These hold across the codebase and are worth stating once:
   which is both the leak path to defend and a prompt-injection surface to treat as data.
 * **Plugin code runs with the user's privileges.** There is no sandbox. The boundary is the
   trust decision at load time, not containment at run time.
+* **A site can require verified plugins, and none does by default.** Writing
+  `~/.picoagent/plugin-pins.toml` makes a published hash or an accepted signing key a
+  precondition of installing a plugin and hash-pins its `python_deps`; absent the file, nothing
+  changes. Off by default is a real gap, not a shipped control - see threat-model T9.

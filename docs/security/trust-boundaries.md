@@ -219,6 +219,96 @@ record nobody can see is a record nobody can withdraw.
 Withdrawing is not uninstalling. The plugin's files are untouched; it reverts to `UNTRUSTED` and
 does not load until it is approved again.
 
+### Requiring a hash or a signature before a plugin may be installed
+
+The fingerprint above answers *did this change since you approved it*. It cannot answer *is this
+what the publisher published*, because the value it compares against was computed from the bytes
+that arrived: a git host serving different code serves a different fingerprint with it, and the
+approval prompt reads exactly as it does on a good day.
+
+`~/.picoagent/plugin-pins.toml` is where a site writes the value the download cannot choose.
+
+```toml
+unpinned = "refuse"                 # or "allow". "refuse" is the default.
+python_deps = "require-hashes"      # or "allow-unpinned". "require-hashes" is the default.
+
+["https://github.com/opscontinuum/permission-gate"]
+sha256 = "33033e47..."              # what the publisher published for this release
+signed_by = ["A1B2C3D4E5F60718"]    # keys whose signature over the commit or tag is accepted
+```
+
+**Absent, it decides nothing** and installs behave as they always have. This is a capability a
+site turns on, not an obligation on everyone who has a plugin. **Present, its defaults are the
+strict ones**: a plugin with no entry is refused, and `python_deps` must be pinned with `==` and
+carry a `--hash`, which pip is then given behind `--require-hashes`. A file that states a policy
+whose default is "and anything unmentioned is fine" is the shape that has to be asked for.
+
+Where it is checked, and why in more than one place:
+
+| Path | Checked at |
+|---|---|
+| `picoagent plugin add <spec>` | `resolve_source`, after the clone and before the manifest is shown |
+| a spec in `[plugins].enabled` | `resolve_source`, at every session start; a refusal is logged and the plugin is not discovered |
+| `picoagent plugin trust <directory>` | `TrustStore.trust`, which never goes through `resolve_source` |
+
+The last row is the reason the gate is not only on the fetch. Approval is what makes a plugin
+loadable, so a policy binding only the clone would be one a user walks past by cloning the
+repository by hand and then approving the result.
+
+Three properties the file is worth having for:
+
+* **Only your copy is read.** A repository's `.picoagent/config.toml` is merged into the running
+  config before you have looked at anything in the clone. A policy that lived there would be a
+  policy the code it admits gets to write, so this file is read from the user directory and
+  nowhere else - there is no project-level spelling of it.
+* **A missing verifier refuses.** `signed_by` shells out to `git verify-commit` and
+  `git verify-tag`. No `git`, no GnuPG, a timeout, a bad signature, or a good signature from a
+  key the file does not name all produce a refusal. A signature check that passes when nothing
+  on the machine can check signatures reports a guarantee it never obtained.
+* **An unparseable file refuses everything.** The same direction the trust store takes with its
+  own damaged file, for the same reason: a control that fails open is one an attacker only has
+  to break rather than defeat.
+
+`sha256` is `pin_digest`: a `sha256sum`-style listing of every fingerprinted file, one
+`<digest>  <path>` line each in `LC_ALL=C` path order, and the sha256 of that listing. It is
+deliberately reproducible without picoagent, because a hash an administrator cannot compute is
+not a hash they can check:
+
+```sh
+python3 -m picoagent.plugins.loader <plugin directory>
+```
+
+```sh
+cd <plugin> && find . -type f \
+    -not -path '*/.git/*' -not -path '*/__pycache__/*' -not -path '*/.hg/*' \
+    -not -path '*/.svn/*' -not -path '*/.mypy_cache/*' -not -path '*/.pytest_cache/*' \
+    -not -name '*.pyc' -not -name '*.pyo' \
+  | sed 's|^\./||' | LC_ALL=C sort | tr '\n' '\0' | xargs -0 sha256sum | sha256sum
+```
+
+Note that this is **not** the number the trust store records. The trust fingerprint concatenates
+file contents and hashes nothing else; `pin_digest` hashes names and boundaries too, so it sees
+a rename, an added empty file, and a line moved from the end of one file to the start of the
+next, none of which the trust fingerprint can distinguish. The trust fingerprint is not being
+redefined to match, because doing so would invalidate every approval on every machine at once.
+
+What the policy does not do, stated so it is not assumed:
+
+* **It does not re-check what was already approved.** Writing the file today binds the next
+  install; a plugin approved before it existed keeps loading. A site adopting pins has to
+  `plugin untrust` and re-add what it already has.
+* **It is not a certificate check.** An OpenPGP key is not a certificate issued by an approved
+  CA, and the standard library has no public-key verification to build one with. What
+  `signed_by` gives is git-native signing against keys the site put in its own keyring.
+* **It does not cover `-e <path>`.** That flag loads a directory for one run, by explicit local
+  flag, and installs nothing: no clone, no approval record, and nothing loads from it next
+  session. It already bypasses the trust store and is documented as doing so.
+* **A hostile repository can still deny you the plugin.** It cannot get new code approved
+  against a pin, but serving something that fails the pin means the plugin does not install or
+  load - and for a plugin declared `required`, that stops the session rather than passing
+  quietly. Refusing is the intended direction; it is worth knowing it is reachable from
+  outside.
+
 ### `[plugins.<name>]` is layered, not merged
 
 `USER_ONLY` names whole settings, and for a while it named none of the `[plugins.<name>]`
