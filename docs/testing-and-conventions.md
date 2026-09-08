@@ -23,6 +23,7 @@ in `picoagent/testing/fakes.py`.
 | `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
 | `test_torn_state_files.py` | `trust.json` and the session log caught mid-write: the store is published by rename and reads as empty when it is damaged, a partial last line in the log is dropped and a hole in the middle is not |
 | `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
+| `test_command_injection.py` | that untrusted data reaches a subprocess as argv and never as shell text, and that only the two intended places hand a string to a shell |
 | `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run, and no test file calling `tempfile.mkdtemp` instead of the resolved `temp_dir()` |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
