@@ -83,6 +83,17 @@ log = logging.getLogger("picoagent.plugins")
 _GIT_SPEC = re.compile(r"^(?:git:|https?://|git@|ssh://|file://)")
 
 
+def is_git_spec(spec: str) -> bool:
+    """Does this ``[plugins].enabled`` entry name a git remote rather than a local path?
+
+    Asked here by everything that asks it. The schemes used to be written out twice, once as
+    this pattern and once as a tuple in ``upgrade``, and two lists that have to agree drift:
+    a scheme added to one names a plugin the other cannot see, so the same spec resolves at
+    load time and is invisible to ``picoagent upgrade``, or the reverse.
+    """
+    return bool(_GIT_SPEC.match(spec))
+
+
 # ------------------------------------------------------------------------ provenance
 
 class PluginOwnershipError(RuntimeError):
@@ -235,7 +246,7 @@ def resolve_source(spec: str, cfg: dict, project: bool = False) -> Path:
     repository chose. Neither is a claim a repository gets to make about a directory the user's
     plugin directory owns.
     """
-    if _GIT_SPEC.match(spec):
+    if is_git_spec(spec):
         rewrites = cfg.get("plugins", {}).get("rewrite") or {}
         return _clone_or_update(spec, plugins_dir(cfg, project), rewrites,
                                 off_limits=plugins_dir(cfg) if project else None)
@@ -406,20 +417,69 @@ def plugin_file_hashes(manifest: Manifest) -> dict[str, str]:
             for path in plugin_files(manifest)}
 
 
+#: Seconds a git command about a *local* checkout gets. These run while a session is starting,
+#: so the bound is there to stop a wedged git holding the session open rather than to let a slow
+#: one finish. Anything that talks to a remote states its own, wider, bound - see ``upgrade``.
+LOCAL_GIT_TIMEOUT: float = 5
+
+
+def _file_change_lines(approved: dict[str, str], current: dict[str, str]) -> list[str]:
+    """Which files differ between two sets of per-file digests, one line each.
+
+    An empty ``approved`` is a record written before per-file hashes were kept: it can say that
+    something changed and not what. Saying so is the honest answer, where an empty list would
+    read as "nothing changed" about a plugin that plainly did.
+    """
+    if not approved:
+        return ["approved before per-file records were kept - cannot say which file changed"]
+    lines = []
+    for name in sorted(set(approved) | set(current)):
+        if approved.get(name) == current.get(name):
+            continue
+        state = "added" if name not in approved else "removed" if name not in current else "modified"
+        lines.append(f"{name}: {state}")
+    return lines
+
+
+def _commit_change_lines(root: Path, approved: str | None) -> list[str]:
+    """The commit move since approval and the commits it brought in, or nothing to say.
+
+    Nothing to say covers three cases that are one case here: the plugin is not a checkout, the
+    record predates commits being stored, and the checkout has not moved.
+    """
+    current = plugin_commit(root)
+    if not (approved and current and approved != current):
+        return []
+    return ([f"commit {approved[:12]} -> {current[:12]}"]
+            + [f"  {line}" for line in commits_between(root, approved, current)])
+
+
 def plugin_commit(root: Path) -> str | None:
     """The checked-out commit of a git-sourced plugin, or ``None`` for a plain directory."""
-    return _git(root, "rev-parse", "HEAD")
+    return git_output(root, "rev-parse", "HEAD", timeout=LOCAL_GIT_TIMEOUT)
 
 
 def commits_between(root: Path, old: str, new: str, limit: int = 10) -> list[str]:
     """``git log --oneline old..new`` - what an upgrade is actually bringing in."""
-    output = _git(root, "log", "--oneline", f"{old}..{new}")
+    output = git_output(root, "log", "--oneline", f"{old}..{new}", timeout=LOCAL_GIT_TIMEOUT)
     return output.splitlines()[:limit] if output else []
 
 
-def _git(root: Path, *args: str) -> str | None:
+def git_output(root: Path | None, *args: str, timeout: float = 30) -> str | None:
+    """Run git and answer with its stdout, or ``None`` for any failure at all. Never raises.
+
+    One implementation for both modules that read a checkout. There were two, alike enough to
+    look interchangeable and not quite: only one of them could be pointed at something that is
+    not a checkout, so a change to how a failed git call is answered was a change only one
+    caller got. ``root`` is ``None`` for a command that names its own remote - ``ls-remote``.
+
+    The timeout is the caller's to state rather than a shared constant, because the two kinds of
+    call are not alike: reading a local checkout wants a short bound, and a command that crosses
+    the network needs a wide one to answer at all.
+    """
+    command = ["git", *(["-C", str(root)] if root is not None else []), *args]
     try:
-        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, timeout=5)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
@@ -576,23 +636,14 @@ class TrustStore:
         return "moved" if approved and current and approved != current else "edited"
 
     def describe_change(self, manifest: Manifest) -> list[str]:
-        """Lines describing what moved since approval, for a human deciding whether to accept."""
+        """Lines describing what moved since approval, for a human deciding whether to accept.
+
+        Two independent answers to two questions - which files differ, and which commits came
+        in - so each is worked out on its own and this reads as the order they are shown in.
+        """
         record = self.record(manifest)
-        lines: list[str] = []
-        approved, current = record.get("files") or {}, plugin_file_hashes(manifest)
-        if not approved:
-            lines.append("approved before per-file records were kept - cannot say which file changed")
-        else:
-            for name in sorted(set(approved) | set(current)):
-                if approved.get(name) == current.get(name):
-                    continue
-                state = "added" if name not in approved else "removed" if name not in current else "modified"
-                lines.append(f"{name}: {state}")
-        old, new = record.get("commit"), plugin_commit(manifest.root)
-        if old and new and old != new:
-            lines.append(f"commit {old[:12]} -> {new[:12]}")
-            lines += [f"  {line}" for line in commits_between(manifest.root, old, new)]
-        return lines
+        return (_file_change_lines(record.get("files") or {}, plugin_file_hashes(manifest))
+                + _commit_change_lines(manifest.root, record.get("commit")))
 
     def trust(self, manifest: Manifest) -> None:
         """Record this directory's current code as approved, replacing whatever covered it.
@@ -1105,15 +1156,27 @@ class Notice:
 class LoadReport:
     """What happened during startup, so the CLI can tell the user rather than only logging it.
 
-    ``skipped`` matters most: a plugin the user installed and expected to be running is now
-    silently absent, and "it changed since you approved it" needs a different response from
-    "you never approved it". ``notices`` carries the same events with the wording and the
-    urgency attached, because the case worth shouting about - an approved plugin that stopped
-    running without the user touching it - is not distinguishable from a reason string alone.
+    What did not load matters most: a plugin the user installed and expected to be running is
+    now silently absent, and "it changed since you approved it" needs a different response from
+    "you never approved it". ``notices`` is where those events are kept, with the wording and
+    the urgency attached, because the case worth shouting about - an approved plugin that
+    stopped running without the user touching it - is not distinguishable from a reason string
+    alone. ``skipped`` is the same events read as bare ``(name, reason, root)``.
     """
     loaded: list[Manifest] = field(default_factory=list)
-    skipped: list[tuple[str, str, Path]] = field(default_factory=list)   # (name, reason, root)
     notices: list[Notice] = field(default_factory=list)
+
+    @property
+    def skipped(self) -> list[tuple[str, str, Path]]:
+        """``(name, reason, root)`` for every plugin that did not load.
+
+        Derived, because it used to be kept: two lists appended to side by side in one function,
+        holding the same three fields, with nothing but the habit of writing both keeping them in
+        step. A skip that reached one list and not the other would be a plugin the report counts
+        and says nothing about, or says something about and does not count. The wording and the
+        urgency only ever live on the notice, so the notice is the record and this is a view.
+        """
+        return [(notice.name, notice.reason, notice.root) for notice in self.notices]
 
     def needs_review(self) -> list[tuple[str, str, Path]]:
         return [entry for entry in self.skipped if entry[1] == "changed"]
@@ -1148,13 +1211,22 @@ def _skip_notice(skip: Skip, trust: TrustStore) -> Notice:
     The three ``changed`` wordings are the point of this function. "You edited it", "something
     moved its checkout", and "this repository offers a version you have not approved" are three
     different situations, and a user who cannot tell them apart cannot act on any of them.
+
+    Which is why the branches stay side by side here rather than moving behind a table of
+    formatters keyed on the reason: what a reader of this function needs to compare is the six
+    sentences, and a table separates each sentence from the condition that produces it. Only the
+    wording and the urgency ever differ - the name, the reason and the directory are the skip's -
+    so ``worded`` fixes those three and each branch is a condition and the sentence it earns.
     """
     hint = f"  Review it and decide:  picoagent plugin trust {skip.root}"
     absent = "whatever it enforces is off for this session."
     off = f"and was NOT LOADED - {absent}"
+
+    def worded(text: str, *, urgent: bool = False) -> Notice:
+        return Notice(skip.name, skip.reason, skip.root, text, urgent)
+
     if skip.reason == "missing":
-        return Notice(skip.name, skip.reason, skip.root,
-                      f"plugin '{skip.name}' is one you approved as REQUIRED and nothing loaded "
+        return worded(f"plugin '{skip.name}' is one you approved as REQUIRED and nothing loaded "
                       f"from {skip.root} - {absent}\n"
                       f"  Put it back, or withdraw the approval:  picoagent plugin untrust "
                       f"{skip.name}", urgent=True)
@@ -1162,36 +1234,29 @@ def _skip_notice(skip: Skip, trust: TrustStore) -> Notice:
         if skip.manifest is not None and skip.manifest.required:
             # A first run is not fatal (see RequiredPluginUntrusted), but a plugin that says the
             # session should not run without it is not ordinary "not trusted yet" chatter either.
-            return Notice(skip.name, skip.reason, skip.root,
-                          f"plugin '{skip.name}' declares itself REQUIRED and you have not "
+            return worded(f"plugin '{skip.name}' declares itself REQUIRED and you have not "
                           f"approved it yet, so it was not loaded - {absent}\n{hint}", urgent=True)
-        return Notice(skip.name, skip.reason, skip.root,
-                      f"plugin '{skip.name}' is not trusted yet and was not loaded.\n{hint}")
+        return worded(f"plugin '{skip.name}' is not trusted yet and was not loaded.\n{hint}")
     if skip.reason == "shadowed":
-        return Notice(skip.name, skip.reason, skip.root,
-                      f"plugin '{skip.name}' offered by this repository was not loaded; your own "
+        return worded(f"plugin '{skip.name}' offered by this repository was not loaded; your own "
                       f"'{skip.name}' at {skip.shadowed_by} is the one running.\n"
                       f"  The repository's copy is at {skip.root}.\n{hint}")
     if skip.reason != "changed":
-        return Notice(skip.name, skip.reason, skip.root,
-                      f"plugin '{skip.name}' did not load ({skip.reason}); "
+        return worded(f"plugin '{skip.name}' did not load ({skip.reason}); "
                       f"run with --verbose for the detail.")
     if skip.layer == PROJECT:
-        return Notice(skip.name, skip.reason, skip.root,
-                      f"plugin '{skip.name}' offered by this repository is not the version you "
+        return worded(f"plugin '{skip.name}' offered by this repository is not the version you "
                       f"approved {off}\n  The repository's copy is at {skip.root}.\n{hint}",
                       urgent=True)
     if skip.manifest is not None and trust.change_kind(skip.manifest) == "moved":
         approved = (trust.approved_commit(skip.manifest) or "")[:12]
         current = (plugin_commit(skip.root) or "")[:12]
-        return Notice(skip.name, skip.reason, skip.root,
-                      f"plugin '{skip.name}' was MOVED to a revision you have not approved "
+        return worded(f"plugin '{skip.name}' was MOVED to a revision you have not approved "
                       f"({approved} -> {current}) {off}\n"
                       f"  You did not edit it: something moved its checkout. Check "
                       f"[plugins].enabled in your own config and in this repository's "
                       f".picoagent/config.toml.\n{hint}", urgent=True)
-    return Notice(skip.name, skip.reason, skip.root,
-                  f"plugin '{skip.name}' CHANGED since you approved it {off}\n{hint}", urgent=True)
+    return worded(f"plugin '{skip.name}' CHANGED since you approved it {off}\n{hint}", urgent=True)
 
 
 def _log_notice(notice: Notice, *, alone: bool) -> None:
@@ -1254,7 +1319,6 @@ def load_all(rt: Runtime, extra_paths: list[str] | None = None,
 
     def skip(entry: Skip) -> None:
         notice = _skip_notice(entry, trust)
-        report.skipped.append((entry.name, entry.reason, entry.root))
         report.notices.append(notice)
         _log_notice(notice, alone=rt.frontend is None)
 

@@ -5,23 +5,40 @@ Everything else — permissions, compaction, MCP, subagents, plan mode, TUI, hoo
 installed from a git repo or local path, and any core piece (tools, provider, frontend, prompt sections) can be
 overridden by a plugin registering the same name.
 
+There is nothing to install. Clone it and run it:
+
 ```
-python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e .                                      # no third-party deps to pull in
+git clone https://github.com/opscontinuum/picoagent && cd picoagent
 export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
 export PICOAGENT_API_KEY=...                           # optional
 export PICOAGENT_MODEL=qwen2.5-coder:32b
-picoagent                                  # REPL
-picoagent -p "explain this repo"           # one-shot
-picoagent -p "fix the failing test" --json # JSONL event stream
-picoagent -e examples/plugins/permission-gate -e examples/plugins/compaction
-picoagent plugin add git:github.com/you/some-plugin@v0.1.0
-picoagent plugin list
+python3 -m picoagent                                  # REPL
+python3 -m picoagent -p "explain this repo"           # one-shot
+python3 -m picoagent -p "fix the failing test" --json # JSONL event stream
+python3 -m picoagent -e examples/plugins/permission-gate -e examples/plugins/compaction
+python3 -m picoagent plugin add git:github.com/you/some-plugin@v0.1.0
+python3 -m picoagent plugin list
 ```
 
-The venv is not boilerplate: on Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python a bare `pip install -e .`
-fails with `externally-managed-environment` (PEP 668). [docs/getting-started.md](docs/getting-started.md#install)
-covers that error, the `pipx` route, and a missing `python3 -m venv`.
+Zero third-party dependencies means there is nothing for a package manager to resolve, so `python3 -m picoagent`
+works against a bare checkout with no virtualenv and no install step. From another directory, point at the
+checkout: `PYTHONPATH=/path/to/picoagent python3 -m picoagent`.
+
+Installing is optional and buys exactly one thing — a `picoagent` command on your `$PATH` instead of
+`python3 -m picoagent`:
+
+```
+python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -e .                                      # optional: registers the `picoagent` command
+```
+
+Use the venv if you install. On Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python a bare `pip install -e .`
+fails with `externally-managed-environment` (PEP 668) — but that error is a reason to skip the install, not a
+reason to fight it. [docs/getting-started.md](docs/getting-started.md) covers it, the `pipx` route, and a
+missing `python3 -m venv`.
+
+The examples below are written as `picoagent`, which is the installed spelling. Without the install, every one of
+them is `python3 -m picoagent` instead; nothing else about them changes.
 
 Config (`~/.picoagent/config.toml`, then `.picoagent/config.toml` in the project):
 

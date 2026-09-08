@@ -2,6 +2,10 @@
 
 Where the lines are, and what crosses them. This describes shipped behaviour, not intent.
 
+For who would attack these boundaries, what they would try, and what is still open, see
+[threat-model.md](threat-model.md). This document is where the boundaries are; that one ranks
+what pushes against them.
+
 ## The boundaries
 
 ```mermaid

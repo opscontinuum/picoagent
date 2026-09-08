@@ -201,6 +201,13 @@ class ReadTool:
         "limit": {"type": "integer", "description": "number of lines"}}, "required": ["path"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        """Resolve the path, then hand it to whichever of the two jobs this tool does.
+
+        One tool, two operations, because that is what a model reaching for ``read`` wants: it
+        does not know yet whether the path it copied out of an error message is a file or the
+        directory above it, and making it guess costs a wasted turn. They share the path
+        resolution and nothing else, so each has its own function below.
+        """
         try:
             path = resolve_path(ctx, args["path"])
         except PathRefused as exc:
@@ -208,8 +215,22 @@ class ReadTool:
         if not path.exists():
             return ToolResult(ctx.tool_call_id, f"File not found: {path}", is_error=True)
         if path.is_dir():
-            listing = sorted(f"{p.name}/" if p.is_dir() else p.name for p in path.iterdir())
-            return ToolResult(ctx.tool_call_id, "\n".join(listing) or "(empty directory)")
+            return self._listing(path, ctx)
+        return self._window(path, args, ctx)
+
+    @staticmethod
+    def _listing(path: Path, ctx: ToolContext) -> ToolResult:
+        """A directory: its entries by name, subdirectories marked with a trailing slash."""
+        listing = sorted(f"{p.name}/" if p.is_dir() else p.name for p in path.iterdir())
+        return ToolResult(ctx.tool_call_id, "\n".join(listing) or "(empty directory)")
+
+    @staticmethod
+    def _window(path: Path, args: dict, ctx: ToolContext) -> ToolResult:
+        """A file: the ``offset``/``limit`` window, numbered, cut to the output limits.
+
+        The line numbers count from the file's first line, not the window's, so a number the
+        model reads here is the one it can pass back as ``offset`` or quote in an ``edit``.
+        """
         try:
             lines = path.read_text(errors="replace").splitlines()
         except OSError as exc:

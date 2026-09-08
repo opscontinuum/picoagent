@@ -5,13 +5,12 @@ Security posture, boundaries, and review artifacts for picoagent.
 | Document | Covers |
 |---|---|
 | [trust-boundaries.md](trust-boundaries.md) | What picoagent trusts, what it doesn't, and where a secret can and cannot travel |
+| [threat-model.md](threat-model.md) | Assets, adversaries, and 25 ranked threats across six surfaces - each with the countermeasure taken, the mitigations available, and which was chosen. Section 8 lists what is still open |
 
 ## Planned
 
 Not yet written. Listed so the gaps are visible rather than implied:
 
-* **Threat model** - assets, adversaries, and attack surface, written against the boundaries
-  document below.
 * **Credential handling** - the full key lifecycle, and the findings from the credential-guard
   review with their resolutions.
 * **Supply chain** - plugin provenance, the trust fingerprint, and what an internal mirror

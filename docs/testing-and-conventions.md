@@ -43,6 +43,69 @@ macOS is everywhere (`/var` is a symlink to `/private/var`). `temp_dir()` resolv
 point the directory is made. `test_suite_shape.py` fails the run if a test file goes back to
 `mkdtemp`.
 
+## Coverage statistics
+
+```bash
+python3 tools/coverage_report.py                      # the whole suite: ~46s against ~36s plain
+python3 tools/coverage_report.py -p 'test_tools.py'   # one file, while you work on it
+```
+
+Runs the suite under the standard library's `trace` and prints, per module, how many of that
+module's executable lines the run reached. Three tables, because they answer different
+questions: `picoagent/` is the application, `examples/plugins/` is code the repository ships for
+people to load, and `picoagent/testing/` is the fake servers the suite runs against - averaging
+the fakes into the application's number would flatter it.
+
+**There is no threshold and no gate.** The suite is what fails a build; this reports a number.
+A threshold picked on a Tuesday becomes an obstacle on a Thursday, and the statistic's job is to
+show *which* modules a release exercised, not to be defended.
+
+**Why the standard library and not `coverage.py`.** `coverage.py` is the better tool and it is a
+development dependency, not a runtime one, so taking it would not have broken the promise in
+`pyproject.toml`. It would have broken a smaller one that matters more here: this number is
+evidence, and evidence that needs a package index to reproduce has a footnote on it on exactly
+the machines that ask for evidence - an air-gapped or accredited host has no index. `trace`
+ships with CPython, so a clone and a Python reproduce the figure. If you want branch coverage,
+or a diff-annotated HTML report, install `coverage.py` in your own environment and use it; just
+do not let it become something the tests need.
+
+### The statistic, per release
+
+Recorded here at each release rather than only in a terminal that scrolled away, so the trend
+is visible and a reader can see which modules a given release exercised. Add a row when you cut
+one; do not edit an old row, because it describes a release that shipped.
+
+| Release | Date | Suite | Application | Application + shipped plugins |
+|---|---|---|---|---|
+| 0.1.0 (development) | 2026-09-07 | 972 tests, `OK (skipped=5)` | 91.6% | 93.4% |
+
+The current breakdown:
+
+| | Covered / executable lines | |
+|---|---|---|
+| `picoagent/` - the application | 2475 / 2703 | **91.6%** |
+| `examples/plugins/` - shipped plugins | 5238 / 5558 | 94.2% |
+| `picoagent/testing/` - fake servers | 1154 / 1309 | 88.2% |
+| Application + shipped plugins | 7713 / 8261 | **93.4%** |
+
+Python 3.12.3; the five skips are the two opt-in live files. The least-covered modules, which
+is the part of the report worth reading:
+
+| Module | Coverage | Why |
+|---|---|---|
+| `picoagent/frontends/plain.py` | 51.8% | the interactive REPL: its read-and-dispatch loop needs a terminal, so most tests drive the loop directly instead |
+| `picoagent/cli.py` | 83.4% | argument handling and startup wiring, parts of which only run from a real command line |
+| `picoagent/frontends/base.py` | 0% | the `Frontend` protocol. Nothing imports it - it is a written contract, and the frontends satisfy it structurally |
+| `picoagent/__main__.py`, `picoagent/testing/fake_mcp.py` | 0% | both only ever run in a **child process**, which `trace` cannot follow. `fake_mcp` is exercised hard by `tests/test_mcp_plugin.py`, over a pipe |
+
+Read the numbers with three caveats. Line coverage is not branch coverage: a line that ran is
+not a line whose every outcome was tested. A child process is not counted, which is the
+`__main__.py` and `fake_mcp.py` row above. And the tool reports how often it lost the trace
+function and re-armed it - CPython removes a trace function that raises, and
+`test_config_refusals` deliberately recurses past the parser's stack, so a handful of lines
+around that point go uncounted. The script says how many times that happened rather than
+quietly rounding up.
+
 ## Running the live Ollama tests
 
 `tests/test_ollama_e2e.py` is the one file here that talks to a real model. Everything else drives

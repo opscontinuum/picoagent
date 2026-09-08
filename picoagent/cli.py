@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Iterator
 
 from .core.config import UNREADABLE_PROJECT_CONFIG_KEY, load_config
 from .core.loop import AgentLoop, Runtime
@@ -378,7 +379,46 @@ def upgrade_command(args: argparse.Namespace) -> int:
     """
     cfg = load_config(Path(args.cwd or ".").resolve())
     statuses = upgrade_mod.check_plugins(cfg)
+    report_app_version(cfg)
+    if not statuses:
+        print("no git-sourced plugins configured")
+        return 0
+    for status in statuses:
+        print(status.describe())
+    if args.ucmd == "check":
+        return 0
+    return upgrade_selected(statuses, args.ucmd)
 
+
+def upgrade_selected(statuses: list, ucmd: str | None) -> int:
+    """Upgrade what ``ucmd`` asks for: one named plugin, or every outdated one.
+
+    A name that matches no configured plugin is an error rather than a quiet "nothing to
+    upgrade". The two look the same from the outside and mean opposite things - one says the
+    plugin is current, the other says the name is wrong - and only the second is worth an exit
+    code, because it is the one where the user's command did not do what they think it did.
+    """
+    # `all` and no argument at all mean the same thing here, so both become "no name was given"
+    # once and the two decisions below read that instead of re-testing the raw argument.
+    named = None if ucmd in (None, "all") else ucmd
+    if named and not any(status.name == named for status in statuses):
+        print(f"no configured plugin named {named!r}")
+        return 1
+    targets = [s for s in statuses if s.outdated and (named is None or s.name == named)]
+    if not targets:
+        print("nothing to upgrade")
+        return 0
+    print()
+    return apply_upgrades(targets)
+
+
+def report_app_version(cfg: dict) -> None:
+    """Where picoagent itself stands, and how to move it - never moving it.
+
+    Nothing is checked at all unless ``[upgrade].app_repo`` says which repository to compare
+    against, and saying so is the third outcome: a user who configured nothing and a user whose
+    install is current would otherwise read the same silence.
+    """
     app = upgrade_mod.check_app(cfg)
     if app:
         print(app.describe())
@@ -387,24 +427,13 @@ def upgrade_command(args: argparse.Namespace) -> int:
     elif not cfg.get("upgrade", {}).get("app_repo"):
         print("picoagent: not checked (set [upgrade].app_repo in config.toml to enable)")
 
-    if not statuses:
-        print("no git-sourced plugins configured")
-        return 0
-    for status in statuses:
-        print(status.describe())
 
-    if args.ucmd == "check":
-        return 0
+def apply_upgrades(targets: list) -> int:
+    """Upgrade each of ``targets``, reporting every one; non-zero if any did not move.
 
-    targets = [s for s in statuses if s.outdated and (args.ucmd in (None, "all") or s.name == args.ucmd)]
-    if args.ucmd and args.ucmd not in (None, "all") and not any(s.name == args.ucmd for s in statuses):
-        print(f"no configured plugin named {args.ucmd!r}")
-        return 1
-    if not targets:
-        print("nothing to upgrade")
-        return 0
-
-    print()
+    One that did not move is reported and the rest are still attempted: these are separate
+    checkouts, and a fetch that failed for one says nothing about the next.
+    """
     failed = False
     for status in targets:
         changed, message = upgrade_mod.upgrade(status)
@@ -434,7 +463,21 @@ def report_available_upgrades(rt: Runtime) -> None:
 
 
 def plugin_command(args: argparse.Namespace) -> int:
-    """``picoagent plugin add|trust|untrust|list``."""
+    """``picoagent plugin add|trust|untrust|list`` - resolve the shared state, then dispatch.
+
+    The two things every verb needs are built once here: the config, and the trust store the
+    config's user directory names. Each verb then owns its own function, because what they do
+    with those two has nothing in common - `add` fetches and asks, `list` walks directories,
+    `untrust` edits the store.
+
+    Left as an ``if`` chain rather than a table of handlers. The four names are fixed by
+    argparse's ``choices``, which has already rejected anything else by the time this runs, and
+    they cannot grow from outside: the whole point of this entry point is that it builds a config
+    and a trust store and stops - no runtime, no ``load_all``, no plugin imported (see
+    :func:`untrust_command`), so no plugin can be present to register a fifth verb. A registry
+    here would add a lookup, a uniform signature the four do not share, and an extension point
+    nothing can reach, to replace four lines argparse already validated.
+    """
     cfg = load_config(Path(".").resolve())
     trust = loader.TrustStore(Path(cfg["_user_dir"]))
     if args.pcmd != "list" and not args.spec:
@@ -444,85 +487,120 @@ def plugin_command(args: argparse.Namespace) -> int:
               "or for `untrust` the name an approval was filed under (see `picoagent plugin list`)")
         return 2
     if args.pcmd == "add":
-        try:
-            root = loader.resolve_source(args.spec, cfg, project=args.project)
-        except subprocess.CalledProcessError:
-            print(f"could not fetch {args.spec} (unreachable, or the ref does not exist)")
-            return 1
-        except loader.PluginOwnershipError as exc:
-            # A refusal, not a crash. This fires for a `--project` spec of either spelling that
-            # would land inside the user's own plugin directory, and for a checkout name that
-            # would traverse out of the destination at all - which `checkout_path` raises with or
-            # without `--project`, so the catch cannot be conditional on the flag. Uncaught, both
-            # exited with a traceback: it reads as picoagent breaking rather than declining, and
-            # the loader's sentence, which is the only thing saying where a repository's plugins
-            # may live, is the part a traceback buries.
-            #
-            # 1, not a code of its own, and not one of 3/4/5. Those three are startup refusals
-            # about a *session* that is not going to run, which is a decision a wrapper takes
-            # differently; every way `plugin add` declines to install something already exits 1,
-            # and nothing downstream would act on a sixth code for this one.
-            print(f"cannot install {args.spec}: {safe_for_display(str(exc))}")
-            return 1
-        try:
-            manifest = loader.Manifest.load(root)
-        except ManifestError as exc:
-            # A repository that isn't a plugin is a normal mistake, not a crash. Say which
-            # file could not be read and where it was looked for. One exception type, because
-            # the ways a fetched manifest fails are chosen by whoever wrote it.
-            print(f"{root} is not a plugin: {safe_for_display(str(exc))}")
-            return 1
-        print(f"fetched {manifest.name} {manifest.version} -> {root}\n")
-        # Consent first, then pip. `python_deps` comes from a manifest nobody has read yet,
-        # and a source distribution runs its build script during install - so asking after
-        # installing asks about code that has already executed. The same consent path as
-        # `plugin trust`, because `add` on an already-installed plugin is an upgrade, and an
-        # upgrade is exactly when the user needs to see what changed.
-        if trust_command(manifest, trust, assume_yes=args.yes) != 0:
-            return 1
-        loader.install_deps(manifest)
-        config_file = (Path(".picoagent") if args.project else Path(cfg["_user_dir"])) / "config.toml"
-        print(f'\nEnable it by adding to {config_file}:\n[plugins]\nenabled = ["{args.spec}"]')
-    elif args.pcmd == "trust":
-        try:
-            manifest = loader.Manifest.load(Path(args.spec).expanduser().resolve())
-        except ManifestError as exc:
-            print(f"not a plugin directory: {safe_for_display(str(exc))}")
-            return 1
-        return trust_command(manifest, trust, assume_yes=args.yes)
-    elif args.pcmd == "untrust":
+        return add_plugin(args, cfg, trust)
+    if args.pcmd == "trust":
+        return trust_plugin_dir(args.spec, trust, assume_yes=args.yes)
+    if args.pcmd == "untrust":
         return untrust_command(args.spec, trust)
-    elif args.pcmd == "list":
-        listed_roots: set[str] = set()
-        listed_names: set[str] = set()
-        directories = (loader.plugins_dir(cfg), loader.plugins_dir(cfg, project=True))
-        for directory in directories:
-            for path in sorted(directory.iterdir()) if directory.is_dir() else []:
-                if (path / "plugin.toml").exists():
-                    try:
-                        manifest = loader.Manifest.load(path)
-                    except ManifestError as exc:
-                        # Listed rather than skipped, and skipped rather than fatal. The manifest
-                        # arrived with a clone, so one repository's unreadable file must not cost
-                        # the user the listing of every plugin they do have - which is how they
-                        # find the name to trust or untrust. Dropping it silently would be its own
-                        # answer to a different question: a directory absent from the listing
-                        # reads as a plugin that was never installed.
-                        listed_roots.add(loader.TrustStore.key(path))
-                        print(f"{path.name:20} {'-':8} {'UNREADABLE':10} {path}")
-                        print(f"{'':20} {safe_for_display(str(exc))}")
-                        continue
-                    status = {"trusted": "trusted", "changed": "CHANGED", "new": "UNTRUSTED"}[trust.status(manifest)]
-                    listed_roots.add(loader.TrustStore.key(path))
-                    listed_names.add(manifest.name)
-                    print(f"{manifest.name:20} {manifest.version:8} {status:10} {path}")
-        if not listed_roots:
-            # An empty listing used to print nothing at all, which reads like a command that
-            # failed. The directories are named because which ones were walked is the question
-            # a user with a plugin they thought was installed is actually asking.
-            print(f"no plugins in {directories[0]} or {directories[1]}")
-        print_unlisted_approvals(trust, listed_roots, listed_names)
+    return list_plugins(cfg, trust)
+
+
+def add_plugin(args: argparse.Namespace, cfg: dict, trust: loader.TrustStore) -> int:
+    """``picoagent plugin add <spec>`` - fetch it, get consent for the code, then install deps."""
+    try:
+        root = loader.resolve_source(args.spec, cfg, project=args.project)
+    except subprocess.CalledProcessError:
+        print(f"could not fetch {args.spec} (unreachable, or the ref does not exist)")
+        return 1
+    except loader.PluginOwnershipError as exc:
+        # A refusal, not a crash. This fires for a `--project` spec of either spelling that
+        # would land inside the user's own plugin directory, and for a checkout name that
+        # would traverse out of the destination at all - which `checkout_path` raises with or
+        # without `--project`, so the catch cannot be conditional on the flag. Uncaught, both
+        # exited with a traceback: it reads as picoagent breaking rather than declining, and
+        # the loader's sentence, which is the only thing saying where a repository's plugins
+        # may live, is the part a traceback buries.
+        #
+        # 1, not a code of its own, and not one of 3/4/5. Those three are startup refusals
+        # about a *session* that is not going to run, which is a decision a wrapper takes
+        # differently; every way `plugin add` declines to install something already exits 1,
+        # and nothing downstream would act on a sixth code for this one.
+        print(f"cannot install {args.spec}: {safe_for_display(str(exc))}")
+        return 1
+    try:
+        manifest = loader.Manifest.load(root)
+    except ManifestError as exc:
+        # A repository that isn't a plugin is a normal mistake, not a crash. Say which
+        # file could not be read and where it was looked for. One exception type, because
+        # the ways a fetched manifest fails are chosen by whoever wrote it.
+        print(f"{root} is not a plugin: {safe_for_display(str(exc))}")
+        return 1
+    print(f"fetched {manifest.name} {manifest.version} -> {root}\n")
+    # Consent first, then pip. `python_deps` comes from a manifest nobody has read yet,
+    # and a source distribution runs its build script during install - so asking after
+    # installing asks about code that has already executed. The same consent path as
+    # `plugin trust`, because `add` on an already-installed plugin is an upgrade, and an
+    # upgrade is exactly when the user needs to see what changed.
+    if trust_command(manifest, trust, assume_yes=args.yes) != 0:
+        return 1
+    loader.install_deps(manifest)
+    config_file = (Path(".picoagent") if args.project else Path(cfg["_user_dir"])) / "config.toml"
+    print(f'\nEnable it by adding to {config_file}:\n[plugins]\nenabled = ["{args.spec}"]')
     return 0
+
+
+def trust_plugin_dir(spec: str, trust: loader.TrustStore, assume_yes: bool = False) -> int:
+    """``picoagent plugin trust <directory>`` - read the manifest there, then ask.
+
+    Only the manifest read belongs to the verb; the consent itself is :func:`trust_command`,
+    which ``add`` reaches too, so the question a user answers is worded in one place.
+    """
+    try:
+        manifest = loader.Manifest.load(Path(spec).expanduser().resolve())
+    except ManifestError as exc:
+        print(f"not a plugin directory: {safe_for_display(str(exc))}")
+        return 1
+    return trust_command(manifest, trust, assume_yes=assume_yes)
+
+
+def list_plugins(cfg: dict, trust: loader.TrustStore) -> int:
+    """``picoagent plugin list`` - a row per installed plugin, then approvals with no row."""
+    directories = (loader.plugins_dir(cfg), loader.plugins_dir(cfg, project=True))
+    listed_roots: set[str] = set()
+    listed_names: set[str] = set()
+    for path in installed_plugin_dirs(directories):
+        # Recorded before the row is rendered, and for the unreadable manifest too: the set
+        # answers "did this directory get a row?", which is true either way, and it is what
+        # print_unlisted_approvals below uses to decide an approval has no directory left.
+        listed_roots.add(loader.TrustStore.key(path))
+        name = print_plugin_row(path, trust)
+        if name is not None:
+            listed_names.add(name)
+    if not listed_roots:
+        # An empty listing used to print nothing at all, which reads like a command that
+        # failed. The directories are named because which ones were walked is the question
+        # a user with a plugin they thought was installed is actually asking.
+        print(f"no plugins in {directories[0]} or {directories[1]}")
+    print_unlisted_approvals(trust, listed_roots, listed_names)
+    return 0
+
+
+def installed_plugin_dirs(directories: tuple[Path, ...]) -> Iterator[Path]:
+    """Every directory under ``directories`` holding a ``plugin.toml``, user dir first."""
+    for directory in directories:
+        for path in sorted(directory.iterdir()) if directory.is_dir() else []:
+            if (path / "plugin.toml").exists():
+                yield path
+
+
+def print_plugin_row(path: Path, trust: loader.TrustStore) -> str | None:
+    """One listing row for the plugin at ``path``; its manifest name, or ``None`` if unreadable.
+
+    Listed rather than skipped, and skipped rather than fatal. The manifest arrived with a
+    clone, so one repository's unreadable file must not cost the user the listing of every
+    plugin they do have - which is how they find the name to trust or untrust. Dropping it
+    silently would be its own answer to a different question: a directory absent from the
+    listing reads as a plugin that was never installed.
+    """
+    try:
+        manifest = loader.Manifest.load(path)
+    except ManifestError as exc:
+        print(f"{path.name:20} {'-':8} {'UNREADABLE':10} {path}")
+        print(f"{'':20} {safe_for_display(str(exc))}")
+        return None
+    status = {"trusted": "trusted", "changed": "CHANGED", "new": "UNTRUSTED"}[trust.status(manifest)]
+    print(f"{manifest.name:20} {manifest.version:8} {status:10} {path}")
+    return manifest.name
 
 
 def print_unlisted_approvals(trust: loader.TrustStore, roots: set[str], names: set[str]) -> None:
@@ -556,6 +634,47 @@ def print_unlisted_approvals(trust: loader.TrustStore, roots: set[str], names: s
         print(f"  {name:20} {state:12} {where}")
 
 
+def matching_approvals(spec: str, trust: loader.TrustStore) -> list[str]:
+    """Labels of the approvals ``spec`` names: by directory first, then by recorded name.
+
+    Matched against the *record*, not against a plugin on disk. ``trust`` resolves its argument by
+    reading ``plugin.toml``, which is the right thing for approving code and the wrong thing here:
+    the case that matters most is a record whose directory is gone, and there is no manifest left
+    to read. So a directory is compared as ``TrustStore.key`` writes it (resolved, so the same
+    directory spelled through a symlink still matches), and the name a record was filed under is
+    accepted too, because after a deletion the name is all the user still has.
+
+    Directory before name, and never both: a spec that resolves to a recorded directory has named
+    exactly one approval, and falling through to the name pass could only widen that to a second
+    checkout the user did not point at.
+    """
+    wanted = loader.TrustStore.key(Path(spec).expanduser())
+    by_directory = [label for label, record in trust.data.items() if record.get("root") == wanted]
+    return by_directory or [label for label, record in trust.data.items()
+                            if spec in (label, record.get("name"))]
+
+
+def report_no_approval_matched(spec: str, trust: loader.TrustStore) -> None:
+    """Say nothing was withdrawn, why the store had no match, and what it does hold.
+
+    Three states, not two. An empty store is either a first run or a file that could not be
+    parsed, and reporting both as "records nothing at all" is true of what was parsed and false
+    of the file - which is where the user goes next. The damaged case is the one with something
+    to do: every plugin is about to report as new, and the file is still on disk to restore or
+    delete. ``TrustStore`` knows which it was, so nothing is re-read here.
+    """
+    print(f"no approval matches {spec!r}, so nothing was withdrawn.")
+    if trust.unreadable:
+        print(f"{trust.path} could not be read, so no approval could be matched. It is still "
+              "on disk, unchanged; until it parses, every plugin reports as new.")
+    elif not trust.data:
+        print(f"{trust.path} records nothing at all.")
+    else:
+        print(f"Approvals in {trust.path} - pass a directory or a name from this list:")
+    for label, record in trust.data.items():
+        print(f"  {record.get('name') or label:20} {record.get('root') or '(no directory recorded)'}")
+
+
 def untrust_command(spec: str, trust: loader.TrustStore) -> int:
     """``picoagent plugin untrust <directory-or-name>`` - take back an approval.
 
@@ -570,37 +689,15 @@ def untrust_command(spec: str, trust: loader.TrustStore) -> int:
     a stop the user can undo rather than a wedge, so a future verb that needs a live runtime should
     get its own entry point rather than pulling one in here.
 
-    Matched against the *record*, not against a plugin on disk. ``trust`` resolves its argument by
-    reading ``plugin.toml``, which is the right thing for approving code and the wrong thing here:
-    the case that matters most is a record whose directory is gone, and there is no manifest left
-    to read. So a directory is compared as ``TrustStore.key`` writes it (resolved, so the same
-    directory spelled through a symlink still matches), and the name a record was filed under is
-    accepted too, because after a deletion the name is all the user still has.
+    What ``spec`` may name, and how it is matched, is :func:`matching_approvals`.
 
     A name covering two records is refused rather than resolved by guessing. Two checkouts can
     share a plugin name - the user's own and a repository's copy - and withdrawing the wrong one
     silently disarms an approval the user still wants.
     """
-    wanted = loader.TrustStore.key(Path(spec).expanduser())
-    labels = [label for label, record in trust.data.items() if record.get("root") == wanted]
+    labels = matching_approvals(spec, trust)
     if not labels:
-        labels = [label for label, record in trust.data.items() if spec in (label, record.get("name"))]
-    if not labels:
-        print(f"no approval matches {spec!r}, so nothing was withdrawn.")
-        # Three states, not two. An empty store is either a first run or a file that could not be
-        # parsed, and reporting both as "records nothing at all" is true of what was parsed and
-        # false of the file - which is where the user goes next. The damaged case is the one with
-        # something to do: every plugin is about to report as new, and the file is still on disk
-        # to restore or delete. `TrustStore` knows which it was, so nothing is re-read here.
-        if trust.unreadable:
-            print(f"{trust.path} could not be read, so no approval could be matched. It is still "
-                  "on disk, unchanged; until it parses, every plugin reports as new.")
-        elif not trust.data:
-            print(f"{trust.path} records nothing at all.")
-        else:
-            print(f"Approvals in {trust.path} - pass a directory or a name from this list:")
-        for label, record in trust.data.items():
-            print(f"  {record.get('name') or label:20} {record.get('root') or '(no directory recorded)'}")
+        report_no_approval_matched(spec, trust)
         return 1
     if len(labels) > 1:
         print(f"{spec!r} names {len(labels)} approvals, so nothing was withdrawn. "

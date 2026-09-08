@@ -7,7 +7,9 @@ and repeats; everything else attaches to that loop through events.
 
 Diagrams for everything below live in [engineering/](engineering/): module dependencies and
 the override model, the request lifecycle, the data model, and the plugin trust flow. Security
-boundaries are in [security/trust-boundaries.md](security/trust-boundaries.md).
+boundaries are in [security/trust-boundaries.md](security/trust-boundaries.md), and the threats
+against them, ranked, in [security/threat-model.md](security/threat-model.md) - whose component
+table is written against the module list below and has to keep matching it.
 
 ## The pieces
 

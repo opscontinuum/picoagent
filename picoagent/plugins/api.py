@@ -99,6 +99,37 @@ def minimal_env(extra: dict[str, str] | None = None, pass_env: Sequence[str] = (
 
 
 class PluginAPI:
+    """Everything a plugin may do, on one object, grouped by the banner comments below.
+
+    It is wide on purpose, and the width has been argued rather than left alone. Split into a
+    protocol per group - registration, runtime control, config, process execution - a plugin
+    that registers one tool would no longer carry methods it never calls, which is what
+    interface segregation asks for. It would also cost the two things this object is for.
+
+    The first is that nothing here is *implemented* by anybody else. Plugins are callers, not
+    implementers: there is one concrete class, the tests drive the real one over a real
+    ``Runtime``, and no fake exists to keep in step. The cost a wide interface usually imposes
+    falls on implementers, and there are none. What a caller depends on is the attribute it
+    names, so a plugin calling ``api.register_tool`` is not coupled to ``api.exec`` in any sense
+    that a split would relieve.
+
+    The second is that this is the documented surface for people writing plugins, and
+    ``docs/plugin-authoring.md`` teaches it as one object: everything you need is on ``api``.
+    Assembling four protocols before writing a five-line plugin is worse for them, and keeping
+    the flat spelling working *on top of* a split means a delegating facade - more code, an
+    extra hop for every call, and every shipped plugin rewritten to gain nothing measurable.
+
+    What the grouping is really about is reading, and that is what the banner comments answer.
+    The methods that would form the split are the methods that sit together.
+
+    What the object does earn, past being a pass-through: every registration is tagged with the
+    plugin's name without the plugin having to know its own, ``emit`` namespaces the event,
+    ``on`` warns about a name nobody publishes, ``send_message`` refuses an unknown delivery,
+    and ``exec`` supplies the minimal environment and the process-group cleanup. A plugin
+    reaching ``rt`` directly gets none of that, which is the argument for the facade existing
+    at all and is unrelated to how wide it is.
+    """
+
     def __init__(self, rt: Runtime, name: str, root: Path):
         self.rt, self.name, self.root = rt, name, root
         self.required_reason: str | None = None

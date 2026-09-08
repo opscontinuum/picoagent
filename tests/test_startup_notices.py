@@ -240,7 +240,6 @@ class SkipWordingTests(unittest.TestCase):
     def _stderr_for(self, *notices: loader.Notice) -> str:
         report = loader.LoadReport()
         report.notices = list(notices)
-        report.skipped = [(n.name, n.reason, n.root) for n in notices]
         err = io.StringIO()
         with redirect_stderr(err):
             cli._report_skipped(report)

@@ -276,10 +276,16 @@ class BaseUrlSchemeTests(unittest.TestCase):
         self.file_base = "file://" + self.tmp.as_posix()
 
     def test_list_models_refuses_a_file_url_instead_of_reading_the_disk(self):
+        """Matched on the refusal's own wording, not on the word ``file``.
+
+        Every way this can go wrong says "file" somewhere: the refusal names the URL, and so does
+        the ``No such file or directory`` a transport error would carry if the check were gone and
+        the read merely missed. Only ``base_url must be http or https`` says the check ran.
+        """
         provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
         with self.assertRaises(RuntimeError) as caught:
             asyncio.run(provider.list_models())
-        self.assertIn("file", str(caught.exception))
+        self.assertIn("base_url must be http or https", str(caught.exception))
         self.assertNotIn("leaked-from-disk", str(caught.exception))
 
     def test_stream_refuses_a_file_url_as_an_error_event_not_an_exception(self):
@@ -292,7 +298,7 @@ class BaseUrlSchemeTests(unittest.TestCase):
 
         events = asyncio.run(collect())
         self.assertEqual([event.type for event in events], ["error"])
-        self.assertIn("file", events[0].error)
+        self.assertIn("base_url must be http or https", events[0].error)
         self.assertNotIn("hi", events[0].error)
 
     def test_the_refusal_names_the_url_so_the_user_can_find_the_setting(self):
@@ -410,10 +416,18 @@ class RedirectTests(unittest.TestCase):
         self.assertEqual(self.elsewhere.received, [])
 
     def test_the_refusal_names_where_it_would_have_gone(self):
+        """The other half of the pair above: this one pins the *cross-origin* wording.
+
+        The target here is ``http:``, so the scheme branch cannot fire and only one refusal is
+        reachable - but the branch is named in the assertion anyway, so that the two tests fail
+        for different reasons rather than both resting on a URL that every refusal echoes.
+        """
         with self.assertRaises(RuntimeError) as caught:
             asyncio.run(self._provider(self.gateway.url).list_models())
         message = str(caught.exception)
         self.assertIn(self.elsewhere.url.split("//")[1], message)
+        self.assertIn("a host you did not configure", message)
+        self.assertNotIn("must be http or https", message)
         self.assertNotIn(self.key, message)
 
     def test_stream_reports_it_as_an_error_event_not_an_exception(self):
@@ -423,12 +437,23 @@ class RedirectTests(unittest.TestCase):
 
     def test_a_redirect_to_another_scheme_is_refused(self):
         """``urllib`` follows a redirect to ``ftp:`` happily; the scheme check has to cover the
-        URL actually fetched, not only the one the user configured."""
+        URL actually fetched, not only the one the user configured.
+
+        Asserted on the wording only the *scheme* branch produces, because an ``ftp:`` target is
+        refused twice over: it fails the scheme check, and it would fail the cross-origin check
+        below it too, since an origin carries its scheme and the configured one is always http or
+        https. Both refusals interpolate the URL, so matching on ``"ftp"`` - which is what this
+        test used to do - passes whichever branch fired, and stays green with the scheme check
+        deleted. The test names a specific control, so it has to fail when that control goes.
+        """
         gateway = _RedirectServer(routes={"/v1/models": "ftp://127.0.0.1:9/models"})
         self.addCleanup(gateway.close)
         with self.assertRaises(RuntimeError) as caught:
             asyncio.run(self._provider(gateway.url).list_models())
-        self.assertIn("ftp", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("a model endpoint must be http or https", message)
+        self.assertIn("its scheme is 'ftp'", message)
+        self.assertNotIn("a host you did not configure", message)
 
     def test_a_same_origin_redirect_is_still_followed_with_the_key(self):
         """The cost of the rule has to stay on the case that matters: a gateway moving a path
