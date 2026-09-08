@@ -97,6 +97,15 @@ appending creates a branch. Compaction is just another entry that says "when bui
 model context, replace everything before entry X with this summary". Nothing is ever
 deleted, so undo/rewind/tree UIs are plugin work on top of this file.
 
+A session that leaves by its own exit path appends one last `shutdown` entry, so a reader can
+tell a finished session from one that was killed - the killed one has no such entry, and that
+absence is the only signal there is. Readers select the kinds they care about, so an entry kind
+they do not know is skipped rather than fatal.
+
+The file is the whole conversation, so it is created `0600` inside `0700` directories on POSIX,
+by the `open` call that creates it rather than by a later `chmod`. Windows gets no protection
+from that - see T23 in [the threat model](security/threat-model.md).
+
 ## Providers
 
 `Provider.stream()` is an async generator of `StreamEvent`s: `text`, `thinking`,

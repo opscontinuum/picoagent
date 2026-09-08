@@ -28,7 +28,7 @@ from typing import Iterator
 from .core.config import UNREADABLE_PROJECT_CONFIG_KEY, load_config
 from .core.loop import AgentLoop, Runtime
 from .core.provider import OpenAICompatProvider
-from .core.session import Session
+from .core.session import Session, restrict_to_owner
 from .core.text import describe_exception, safe_for_display
 from .core.tools import BUILTIN_TOOLS
 from .frontends.plain import PlainFrontend
@@ -104,8 +104,10 @@ def open_session(cfg: dict, cwd: Path, resume: str | None) -> Session:
     """
     directory = session_dir(cfg, cwd)
     if resume is None:
+        harden_session_dir(directory)
         return Session(directory / f"{int(time.time())}.jsonl", cwd)
     if resume == "last":
+        harden_session_dir(directory)
         existing = Session.list(directory)
         path = existing[0] if existing else directory / f"{int(time.time())}.jsonl"
         return Session(path, cwd, resume=path.exists())
@@ -116,6 +118,36 @@ def open_session(cfg: dict, cwd: Path, resume: str | None) -> Session:
     if not path.exists() and path.suffix != ".jsonl":
         raise SystemExit(f"{path} does not exist and is not a .jsonl path; refusing to create it")
     return Session(path, cwd, resume=path.exists())
+
+
+def harden_session_dir(directory: Path) -> None:
+    """Take group and world access off the session directory picoagent already wrote.
+
+    New logs are owner-only from creation, but an install that ran before that was true has a
+    directory full of 0644 ones holding the same conversations, and leaving them is what would
+    make this change cosmetic: the finding is about the logs, not about the next log. So the
+    directory picoagent manages is narrowed once, as a session opens in it.
+
+    It is narrowed rather than left alone because the alternative is worse in the direction that
+    matters: a mode a user set by hand can be set again in one command, while a conversation
+    another account has already read cannot be taken back. It is also not done silently - the
+    line below is the user finding out that their own files changed, and why - and it removes
+    only group and world access, so nothing the owner could do with these files stops working.
+
+    Scope is deliberate: this directory, the ``sessions`` root above it - which is always
+    :func:`session_dir`'s parent, and whose entries are the project paths this user has run the
+    agent in - and ``.jsonl`` files directly in it. A ``-r`` path the user typed can name any
+    directory on the machine, so nothing here runs over one picoagent did not choose; that file
+    is narrowed on its own by :class:`~picoagent.core.session.Session`, which is appending a
+    conversation to it either way.
+    """
+    if not directory.is_dir():
+        return
+    narrowed = [path for path in [directory.parent, directory, *sorted(directory.glob("*.jsonl"))]
+                if restrict_to_owner(path)]
+    if narrowed:
+        print(f"picoagent: made {len(narrowed)} existing path(s) under {directory} readable only "
+              "by you; a session log holds the whole conversation", file=sys.stderr)
 
 
 def looks_like_session(path: Path) -> bool:
@@ -353,6 +385,13 @@ async def run_agent(args: argparse.Namespace) -> int:
     Only the one-shot path reports it. A REPL session runs many prompts, and the state of the last
     one is not a verdict on the session; somebody who watched an error scroll past and carried on
     working has not had a failed run.
+
+    All three ways out of here are a shutdown and all three are recorded: the one-shot prompt
+    returning, the REPL being left, and an exit an exception carried out - Ctrl-C during ``-p``,
+    or anything the frontend raised. They are not the same event, so the entry names which:
+    ``completed`` for the first two, ``interrupted`` for the third. What is *not* here is the
+    fourth way, a kill, which reaches no code at all; :meth:`Session.append_shutdown` says what
+    the missing entry means.
     """
     rt = build_runtime_or_refuse(args)
     agent = AgentLoop(rt)
@@ -360,15 +399,36 @@ async def run_agent(args: argparse.Namespace) -> int:
     await warn_about_ignored_project_keys(rt)
     await announce_load_report(rt)
     await rt.events.emit("session_start", {"resume": bool(args.resume)}, rt)
+    ending = "interrupted"      # replaced below unless the body leaves by an exception
     try:
         if args.prompt:
             prompt = sys.stdin.read() if args.prompt == "-" else args.prompt
             await agent.handle_input(prompt)
         else:
             await rt.frontend.run(agent)
+        ending = "completed"
     finally:
+        # The plugins' turn first, so anything they persist at session_end is inside the session
+        # the record then closes. The shutdown entry is meant to be the last line in the file.
         await rt.events.emit("session_end", {}, rt)
+        record_shutdown(rt.session, ending)
     return EXIT_MODEL_ERROR if args.prompt and rt.provider_error else 0
+
+
+def record_shutdown(session: Session, ending: str) -> None:
+    """Append the log's last entry, and never let that append change how the run ended.
+
+    This is the one write that happens in a ``finally``, which is also where a KeyboardInterrupt
+    or a failure is on its way out. An ``OSError`` raised here would replace that with itself:
+    the Ctrl-C the user typed, or the exception a calling program is waiting to see, would come
+    out as a traceback about the log instead. The record is worth an entry, not the exit status,
+    so a write that fails becomes a warning and whatever was ending goes on ending.
+    """
+    try:
+        session.append_shutdown(ending)
+    except OSError as exc:
+        logging.getLogger("picoagent").warning(
+            "could not record the shutdown in %s: %s", session.path, describe_exception(exc))
 
 
 def upgrade_command(args: argparse.Namespace) -> int:

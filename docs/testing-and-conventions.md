@@ -22,6 +22,8 @@ in `picoagent/testing/fakes.py`.
 | `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
 | `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
 | `test_torn_state_files.py` | `trust.json` and the session log caught mid-write: the store is published by rename and reads as empty when it is damaged, a partial last line in the log is dropped and a hole in the middle is not |
+| `test_session_log_permissions.py` | that the session log and the directories holding it are owner-only, read back off the filesystem with `stat` rather than by trusting a call, for a new session, a resumed one, logs written before the rule existed, and the path the CLI actually takes (skipped on Windows, where mode bits are not access control) |
+| `test_session_shutdown_record.py` | that a session which ends by its own exit path says so in its last entry, that an interrupted one is named apart from a completed one, and - the half that keeps the record honest - that a session which never reached that path leaves no entry at all |
 | `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
 | `test_command_injection.py` | that untrusted data reaches a subprocess as argv and never as shell text, and that only the two intended places hand a string to a shell |
 | `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run, and no test file calling `tempfile.mkdtemp` instead of the resolved `temp_dir()` |

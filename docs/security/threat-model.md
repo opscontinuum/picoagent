@@ -100,7 +100,7 @@ flowchart TB
     githost --> plug
     core <-->|"tools/list, tools/call"| mcp
     core -->|"every tool result, verbatim"| userdir
-    userdir -.->|"session log is 0644 today"| other
+    userdir -.->|"0600 on POSIX; mode bits are not<br/>access control on Windows"| other
 
     classDef open stroke-width:3px
     class other open
@@ -150,8 +150,8 @@ does today.
 | T6 | Code the user never approved, or approved and then changed, loads in-process | A5 | E1, E2 | High | Countered |
 | T2 | A cloned repository reads the credentials file into the system prompt | A1 | E1 | High | Countered |
 | T3 | A cloned repository moves or takes over a plugin checkout the user owns | A4, A5 | E1 | High | Countered |
-| T23 | Any local account reads the entire session log | A3 | E5 | Medium | **Open** (STIG V-222500, V-222587) |
-| T9 | Plugin code arrives with no provenance beyond the user's own review | A5 | E2, E4 | Medium | **Open** (STIG V-222513) |
+| T23 | Any local account reads the entire session log | A3 | E5 | Medium | Countered on POSIX (STIG V-222500, V-222587); open on Windows |
+| T9 | Plugin code arrives with no provenance beyond the user's own review | A5 | E2, E4 | Medium | Partly countered; opt-in (STIG V-222513, Open on the CA clause) |
 | T4 | A repository sets a plugin's own settings and takes a decision through it | A1, A5 | E1 | Medium | Countered |
 | T7 | A security plugin does not load, and nothing says so loudly enough | A5 | E1, E2 | Medium | Countered |
 | T15 | A redirect carries the `Authorization` header to a host the user never configured | A1 | E4 | Medium | Countered |
@@ -166,7 +166,7 @@ does today.
 | T18 | A hostile remote reply ends the session, or steers the model | A6, availability | E4 | Low | Countered |
 | T21 | A tool is pointed at the credentials file or at `config.toml` | A1 | E3 | Low | Countered when credential-guard is loaded |
 | T22 | Another local account reads the credentials file | A1 | E5 | Low | Countered to the limit of file permissions |
-| T24 | The record cannot distinguish a clean exit from a crash | A3 | accident | Low | **Open** (STIG V-222469) |
+| T24 | The record cannot distinguish a clean exit from a crash | A3 | accident | Low | Countered (STIG V-222469) |
 | T25 | A torn write loses the session record | A3 | accident | Low | Countered |
 | T10 | A plugin escapes its import namespace with `importlib.import_module` | A5 | E2 | Low | Documented limit |
 
@@ -296,6 +296,20 @@ review at load only.
 Sandboxing is out of scope and section 7 says why. The honest statement of what this buys: an
 approved plugin can do anything the user can, so this control is about *what code runs*, never
 about *what that code may do*.
+**Known limit in the fingerprint itself.** `directory_fingerprint` concatenates the contents of
+every file in path order and hashes nothing else - not the names, not the boundaries between
+them - so three materially different directories share one digest: a line moved from the end of
+one file to the start of the next, a file renamed with its contents intact, and an empty file
+added. `tests/test_plugin_pins.py::ThePinDigestSeesWhatTheTrustFingerprintCannot` demonstrates
+all three. A repository the user already approved can therefore reshape which module holds
+which code, and add files, without the plugin reporting `changed`. Turning the code back into
+something that both halves still parse as Python is fiddly, which is why this is a limit rather
+than a finding of its own, but text files carry no such constraint and skills are fingerprinted
+because they steer the model. It is not fixed by redefining the digest, because that would
+invalidate every approval on every machine at once - including the `required` ones, whose
+mismatch stops a session. `pin_digest`, the value T9's policy file is written against, hashes a
+listing of per-file digests and names and does see all three; closing this properly means
+migrating the trust store onto that digest with a path that does not lock users out.
 
 **T7 - A security plugin does not load, and the skip is missed.**
 *Vulnerability:* a plugin that quietly does not load looks exactly like one that loaded and
@@ -330,22 +344,42 @@ nothing loads until it is approved again - and it is also the direction that kee
 startable while the approvals are given back. Refusing to start makes a disk-full event into a
 lockout. `tests/test_torn_state_files.py` pins both halves.
 
-**T9 - Plugin code arrives with no provenance beyond the user's own review. OPEN.**
-*Vulnerability:* plugins are installed by `git clone` from whatever host the spec names.
-Nothing verifies a signature from a recognized authority at any point: git tag and commit
-signatures are never checked, and a plugin's `python_deps` are pip-installed without hash
-pinning.
-*Countermeasures taken:* the user is shown the manifest and asked; the SHA-256 fingerprint over
-every file is recorded at approval. That is genuine change *detection* after the fact.
-*Potential mitigations:* verify signed git tags or commits against organization-approved keys at
-`plugin add` and upgrade time; detached signatures over the fingerprint; `--require-hashes`
-semantics for dependency installs; an internal mirror as the only permitted host.
-*Selected, and why:* nothing yet, and this is a real gap rather than an accepted risk. The
-fingerprint attests that the user clicked yes on those bytes, not that any organization signed
-them. **Residual risk:** a compromised git host, or a maintainer account, serves code that the
-user approves because it looks like the plugin they wanted. Recorded as STIG V-222513. Until it
-is closed, the compensating control is deployment-side: install plugins only from a mirror the
-site controls, and review the diff `plugin trust` prints on every upgrade.
+**T9 - Plugin code arrives with no provenance beyond the user's own review. Partly countered;
+a site must turn the control on.**
+*Vulnerability:* plugins are installed by `git clone` from whatever host the spec names. The
+trust fingerprint is computed from the bytes that arrived, so it attests that the user clicked
+yes on those bytes and never that they are the bytes anyone published. A host that serves
+different code serves a different fingerprint with it, and the prompt reads exactly as it does
+on a good day. `python_deps` went to pip with no version pin and no hash.
+*Countermeasures taken:* the user is shown the manifest and asked, and the SHA-256 fingerprint
+over every file is recorded at approval - genuine change detection after the fact. On top of
+that, `~/.picoagent/plugin-pins.toml` lets the site state what a plugin must match *before* it
+is installed: a `sha256` the publisher published, obtained out of band, or a `signed_by` list of
+keys whose signature over the commit or tag `git verify-commit` / `git verify-tag` must confirm,
+or both. The pin is checked at `plugin add`, at every `[plugins].enabled` resolution, and again
+in `TrustStore.trust`, so cloning by hand and then approving is not a way round it. Absent the
+file nothing changes; present, its defaults are the strict ones - an unlisted plugin is refused,
+and `python_deps` must carry `==` and a `--hash` and go to pip behind `--require-hashes`.
+Missing tooling refuses: no `git`, no GnuPG, a timeout, or a good signature from a key the site
+did not name all produce a refusal, never a pass. A file that cannot be parsed refuses
+everything, the same direction the trust store takes with its own. `tests/test_plugin_pins.py`
+pins all of it, including the absent-verifier case.
+*Potential mitigations:* verification against a certificate from an approved CA; re-verifying
+plugins already approved before the policy was written; a signature over the pin file itself.
+*Selected, and why:* the pin file, defaulting to off. Two things it does not do, and neither is
+an oversight. First, an OpenPGP key is **not** a certificate from an approved CA, and the
+standard library has no public-key verification to build one with, so the rule's primary clause
+is not met by `signed_by`; what is met is the clause the rule offers in the same breath, a
+cryptographic hash an administrator can verify prior to installation, and `pin_digest` is
+reproducible with `find` and `sha256sum` alone so that "verify" means something a person can
+do. Second, writing the policy does not re-check plugins approved before it existed: a site
+adopting pins has to `plugin untrust` and re-add what it already has. **Residual risk:** with
+no policy file - the shipped default - a compromised git host or maintainer account serves code
+the user approves because it looks like the plugin they wanted. With one, an attacker who
+controls the repository can still change what is served and thereby *deny* the plugin (the pin
+refuses, and for a `required` plugin that stops the session); they cannot get the new code
+approved. `-e <path>` still loads a directory unverified for one run, by explicit local flag,
+and installs nothing. Recorded as STIG V-222513, which stays Open on the CA clause.
 
 **T10 - A plugin escapes its import namespace. Documented limit.**
 *Vulnerability:* everything a plugin imports with the `import` statement is loaded inside that
@@ -513,8 +547,10 @@ is scrubbed.
 `credential-guard` enabled and required; refuse to log tool results from `shell`.
 *Selected, and why:* today, none by default. **Residual risk:** on a machine where the user's
 shell exports credentials - which is the normal case - the first command the model runs can
-surface one into a file that is world-readable (T23) and into the next prompt. Recorded as STIG
-V-222444. The compensating control available now is to load `credential-guard`; the stated fix
+surface one into the session file and into the next prompt. That file is owner-only now (T23),
+so the exposure is to this user's own account and to anything running as them rather than to
+every account on the host, but a secret that should never have been in the log is still in the
+log. Recorded as STIG V-222444. The compensating control available now is to load `credential-guard`; the stated fix
 is to make the allowlist the built-in default, at which point this threat is countered in the
 shipped configuration rather than in an opt-in one.
 
@@ -548,31 +584,49 @@ that unlocks it runs as the same user.
 The session log is simultaneously the application's stored data and its only record of what
 happened.
 
-**T23 - Any local account reads the entire session log. OPEN.**
-*Vulnerability:* `~/.picoagent/sessions/` and the files in it are created under the default
+**T23 - Any local account reads the entire session log. COUNTERED on POSIX.**
+*Vulnerability:* `~/.picoagent/sessions/` and the files in it were created under the default
 umask - 0755 and 0644 on a standard install, verified by execution during the STIG assessment.
 The contents are the full conversation: repository content, every command executed, every tool
 result, and anything a command printed, including whatever T20 let through.
-*Countermeasures taken:* none in core today. The contrast is the point: this codebase creates
-the credentials file at `0600`, republishes the trust store owner-only, and spills truncated
-tool output to `0600` temp files.
-*Potential mitigations:* create the session directory and each session file owner-only, the way
-`trust.json` already is; harden `~/.picoagent/config.toml` the same way from core rather than
-from the opt-in plugin that does it today.
-*Selected, and why:* nothing yet. **Residual risk:** on any multi-user host, every local account
-can read every conversation. Recorded as STIG V-222500 (audit information read access) and
-V-222587 (confidentiality of stored information). Compensating control now: run on a
-single-account host, or restrict `~/.picoagent` by hand. This is the cheapest of the open items
-to close.
+*Countermeasures taken:* the session file is created `0600` by the `open` call that creates it,
+not narrowed afterwards, so there is no window in which it exists world-readable; every
+directory made to hold it is created `0700`, parents included, because the names in
+`sessions/` are the project paths this user has run the agent in. A log or directory written
+before this rule existed is narrowed when a session next opens over it - group and world bits
+cleared, the owner's own left alone - and the user is told on stderr that their existing files
+changed and why. That retrofit runs only on the directory picoagent chose; a `-r` path the user
+typed narrows that one file and nothing around it. `tests/test_session_log_permissions.py`
+reads the modes back off the filesystem.
+*Potential mitigations:* also harden `~/.picoagent/config.toml` from core rather than from the
+opt-in plugin that does it today; restrict the file with `icacls` on Windows the way
+credential-guard restricts the credentials file.
+*Selected, and why:* owner-only at creation, the same answer `trust.json` and the credentials
+file already give, and the same one the OS gives `~/.ssh`. **Residual risk:** Windows, where
+mode bits are not access control - NTFS uses ACLs and `chmod` there sets a read-only flag and
+nothing else - so a Windows install is still readable by any account with filesystem access to
+the profile; restrict `%USERPROFILE%\.picoagent` with `icacls` by hand until core does it.
+`~/.picoagent/config.toml`, a documented `api_key` location, is also still `0644` unless
+credential-guard is loaded. Recorded as STIG V-222500 (audit information read access) and
+V-222587 (confidentiality of stored information).
 
-**T24 - The record cannot distinguish a clean exit from a crash. OPEN.**
-*Vulnerability:* `session_end` is emitted to plugins and frontends but never persisted, so the
-file simply stops at the last appended entry.
-*Countermeasures taken:* none.
-*Potential mitigations:* append a session-end entry from the `session_end` emit point.
-*Selected, and why:* nothing yet. **Residual risk:** low - the single user initiated the
-shutdown - but the record the rule asks for does not exist, and an incident review cannot tell
-truncation from termination. Recorded as STIG V-222469.
+**T24 - The record cannot distinguish a clean exit from a crash. COUNTERED, with a limit worth
+reading.**
+*Vulnerability:* `session_end` was emitted to plugins and frontends but never persisted, so the
+file simply stopped at the last appended entry.
+*Countermeasures taken:* `run_agent` appends a `shutdown` entry after the `session_end` emit, so
+it is the last line in the file: an ordinary entry with an `id` and a `parent`, on the branch
+like everything else, carrying the time and a `reason` - `completed` for a `-p` prompt that
+finished or a REPL the user left, `interrupted` for an exit an exception carried out, Ctrl-C
+included. The append is wrapped so a failing write becomes a warning rather than replacing
+whatever was already ending.
+*Potential mitigations:* none outstanding for the recordable cases.
+*Selected, and why:* one entry, the shape the log already has. **Residual risk:** what the
+record proves is "this session ended cleanly", never "this session did not end". A `SIGKILL`, a
+power loss or a dead interpreter writes nothing by definition, and a session still running has
+not written it yet, so an absent entry means *one of those* and a reader cannot narrow it
+further from the file alone. Verified both ways: a killed process leaves a log with no shutdown
+entry (`tests/test_session_shutdown_record.py`). Recorded as STIG V-222469.
 
 **T25 - A torn write loses the session record.**
 *Vulnerability:* an append interrupted mid-line, or a hole in the middle of the file.
@@ -592,11 +646,12 @@ A short reader's map of section 5, in the order someone auditing the code would 
 | Surface | The control that stands there | What it does not cover |
 |---|---|---|
 | `USER_ONLY` config privilege | a fixed list of settings a repository may not set, plus a notice naming every refusal | settings that are only taste, which a repository may still set |
-| Plugin trust store and fingerprinting | approval per directory, SHA-256 over every file, per-file diffs, commit provenance, atomic write, fail-closed read | what approved code may then do, and who signed it (T9) |
+| Plugin trust store and fingerprinting | approval per directory, SHA-256 over every file, per-file diffs, commit provenance, atomic write, fail-closed read | what approved code may then do; a file boundary moved, a rename, or an added empty file, none of which the digest sees (T6) |
+| Plugin verification policy (`~/.picoagent/plugin-pins.toml`) | a publisher hash or an accepted signer required before install, checked at fetch and again at approval; hash-pinned `python_deps`; refuses when the verifier is missing or the file will not parse | anything, until a site writes the file - it is off by default; and a CA-issued certificate, which OpenPGP keys are not (T9) |
 | The tool/gate path seam | one resolution function for tools and guards, symlink-following, refusal as a value for guards and an exception for tools | paths reached through `shell`, which is not a path argument |
 | The `shell` tool | a timeout, a process-tree kill, output truncation | **authorization: there is none by default** (T11), and the environment it passes (T20) |
 | Credential travel | key held on the provider instance, never in a `Message`; same-origin redirect refusal; error scrubbing; inode-identity tool guard | the environment handed to subprocesses unless credential-guard is loaded |
-| The session log | append-only, torn-write recovery, replayed deliberately | its permissions (T23), and shutdown (T24) |
+| The session log | append-only, torn-write recovery, replayed deliberately, owner-only from creation, a shutdown entry last | Windows, where mode bits are not access control (T23); a kill, which records nothing (T24) |
 
 ## 7. Out of scope, and why
 
@@ -641,17 +696,17 @@ process-tree kills, probe caps) to keep the tool usable, not to enforce a quota.
 
 ## 8. Residual risk, in one place
 
-Five threats are not mitigated today. Each is a finding from the DISA ASD STIG V6R4 assessment
-of this artifact, and each names what would close it.
+The threats below are not fully mitigated today. Each is a finding from the DISA ASD STIG V6R4
+assessment of this artifact, and each names what would close it.
 
 | ID | Residual risk | STIG | Closes when |
 |---|---|---|---|
 | T11 | Injected content in a cloned repository can run commands as the user, out of the box | V-222604 (CAT I) | an execution authorization gate is the default and running open is a documented deviation |
-| T20 | Secrets in the environment reach model-run commands and the log | V-222444 (CAT II) | the environment allowlist is the built-in shell's default |
-| T23 | Every local account can read every conversation | V-222500, V-222587 (CAT II) | the session directory and files are created owner-only |
-| T9 | Plugin code has no provenance beyond the user's own review | V-222513 (CAT II) | signatures are verified at install and upgrade, and dependency installs are hash-pinned |
-| T24 | The record cannot distinguish a clean exit from a crash | V-222469 (CAT II) | a session-end entry is appended at shutdown |
+| T20 | Secrets in the environment reach model-run commands, and from there the log | V-222444 (CAT II) | the environment allowlist is the built-in shell's default |
+| T23 | On Windows the session log is still readable by any account that can reach the profile, because mode bits are not access control there; `config.toml` is hardened only by the opt-in plugin | V-222500, V-222587 (CAT II) | the log is ACL-restricted on Windows and core hardens `config.toml` |
+| T9 | Out of the box a plugin is still whatever the git host served; the verification policy exists but no site has it until it writes `plugin-pins.toml`, and the signature half rests on OpenPGP keys rather than a certificate from an approved CA | V-222513 (CAT II) | verification is against a CA-issued certificate, and picoagent's own releases are signed so the default can be strict |
 
-The first three share a shape: the control exists in the codebase and is reachable, and the
-default configuration does not use it. That is the single most useful thing an assessor can take
-from this document.
+T11 and T20 share a shape: the control exists in the codebase and is reachable, and the default
+configuration does not use it. That is the single most useful thing an assessor can take from
+this document. T23 is a different shape - the control is the default now, on a platform whose
+permission model this one does not have.

@@ -12,11 +12,19 @@ Entry kinds
 * ``custom``      - plugin state that must survive restarts but is *not* sent to the model
 * ``compaction``  - a summary that replaces everything before ``keep_from`` when
                     building the model context (the original entries stay on disk)
+* ``shutdown``    - written last when the process leaves by its own exit path; see
+                    :meth:`Session.append_shutdown` for what its *absence* means
+
+Unknown kinds are ignored by every reader here - ``messages()``, ``custom()`` and the
+compaction lookup all select the kind they want - so a log written by a newer version opens
+in an older one rather than breaking it.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -27,6 +35,83 @@ log = logging.getLogger("picoagent.session")
 
 FORMAT_VERSION = 1
 
+#: Session logs, and the directories made to hold them, are owner-only. The file is the entire
+#: conversation - every prompt, every command the model ran, every tool result, and whatever
+#: those results contained - and under the umask it was 0644 inside 0755 directories, which on
+#: any host with a second account means every account could read every session. The rest of this
+#: codebase already draws the line (credentials opened at 0600, the trust store republished with
+#: ``mkstemp``'s owner-only mode, spilled tool output at 0600); the log was the one missed.
+#: DISA ASD V6R4 records that as V-222500 and V-222587. It also records V-222444, sensitive data
+#: reaching the log at all, which this does not fix: a secret the shell tool hands a command is
+#: still written here, to a file only its owner can read.
+#:
+#: POSIX only. Mode bits are not access control on Windows - NTFS uses ACLs - so the calls below
+#: achieve nothing there and this module does not pretend otherwise: see T23 in
+#: ``docs/security/threat-model.md`` for the residual and what to do about it by hand.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+#: The bits :func:`restrict_to_owner` keeps. Group and world go; the owner's own bits are left
+#: exactly as they were, so a file somebody deliberately made read-only stays read-only.
+OWNER_BITS = 0o700
+
+
+def _owner_only(path: str, flags: int) -> int:
+    """``open`` opener that gives a new session file its mode in the call that creates it.
+
+    Creating under the umask and narrowing afterwards would leave a window - short, but the
+    header is written inside it - in which another account can open the file and keep that
+    descriptor across the ``chmod``. A mode passed to ``open`` has no window.
+    """
+    return os.open(path, flags, FILE_MODE)
+
+
+def make_owner_only_dir(directory: Path) -> None:
+    """``mkdir -p`` in which *every* directory created is owner-only, not just the last one.
+
+    ``Path.mkdir(parents=True, mode=...)`` applies ``mode`` to the leaf and lets the parents it
+    creates take the umask's, which would leave ``~/.picoagent/sessions`` at 0755 around an
+    owner-only project directory. The names in that directory are the project paths this user
+    has run the agent in, so the parent's mode is part of the same answer, not a detail.
+
+    Directories that already exist are left alone: this creates, it does not retrofit. Narrowing
+    a directory picoagent wrote earlier is a decision about a user's existing files, and it is
+    taken where the code knows the directory is picoagent's - :func:`picoagent.cli.harden_session_dir`.
+    """
+    missing: list[Path] = []
+    probe = directory
+    while not probe.exists() and probe.parent != probe:
+        missing.append(probe)
+        probe = probe.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=DIR_MODE, exist_ok=True)
+
+
+def restrict_to_owner(path: Path) -> bool:
+    """Take group and world access off an existing file or directory. True if that changed it.
+
+    A log written before this rule existed is still the file the next turn is appended to, so a
+    resume narrows it rather than going on writing the conversation into a world-readable file.
+
+    Only the group and other bits are cleared. Widening nothing and preserving the owner's own
+    bits keeps this from being a mode rewrite - it removes exactly the access the finding is
+    about and touches nothing else.
+
+    A path this user cannot ``chmod`` (someone else's file reached through ``-r``) is reported
+    rather than raised: refusing to open a session over a permissions error would be a worse
+    answer than saying which file could not be protected.
+    """
+    try:
+        current = stat.S_IMODE(path.stat().st_mode)
+        if current == current & OWNER_BITS:
+            return False
+        os.chmod(path, current & OWNER_BITS)
+    except OSError as exc:
+        log.warning("could not restrict %s to its owner (%s); other accounts may be able to "
+                    "read it", path, exc)
+        return False
+    return True
+
 
 class Session:
     def __init__(self, path: Path, cwd: Path, resume: bool = False):
@@ -35,7 +120,11 @@ class Session:
         self.entries: list[dict] = []
         self.leaf: str | None = None       # id of the newest entry on the active branch
         self.name: str | None = None
-        path.parent.mkdir(parents=True, exist_ok=True)
+        make_owner_only_dir(path.parent)
+        if path.exists():
+            # Before anything is read or appended: from here on this file grows a conversation,
+            # and one written under an older umask is still 0644 until something narrows it.
+            restrict_to_owner(path)
         if resume and path.exists():
             self._load()
         if not self.entries:
@@ -93,12 +182,16 @@ class Session:
 
     def _truncate_to(self, lines: list[str]) -> None:
         """Rewrite the file as ``lines``, so the next append starts on a line of its own."""
-        self.path.write_text("".join(f"{line}\n" for line in lines))
+        with open(self.path, "w", opener=_owner_only) as fh:
+            fh.write("".join(f"{line}\n" for line in lines))
 
     def _write(self, entry: dict) -> dict:
         """Append ``entry`` to memory and disk; advance ``leaf`` for non-header entries."""
         self.entries.append(entry)
-        with self.path.open("a") as fh:
+        # ``open`` rather than ``Path.open``: pathlib's does not take an opener, and the opener
+        # is what puts the mode on the file that creates it. Every append goes through here, so
+        # there is no second path that could create the log under the umask instead.
+        with open(self.path, "a", opener=_owner_only) as fh:
             fh.write(json.dumps(entry) + "\n")
         if entry["kind"] != "header":
             self.leaf = entry["id"]
@@ -114,6 +207,31 @@ class Session:
     def append_custom(self, custom_type: str, data: Any) -> dict:
         """Persist plugin state. Never reaches the model."""
         return self._entry("custom", custom_type=custom_type, data=data)
+
+    def append_shutdown(self, reason: str = "completed") -> dict:
+        """Record that the process left by its own exit path, and when.
+
+        **What this guarantees is narrower than it looks, and reading it as a guarantee gets
+        every crashed session wrong.** The entry is appended from ``run_agent``'s exit path, so
+        it says one thing: control reached that path and the write succeeded. A ``SIGKILL``, a
+        power loss, or an interpreter that died cannot write anything by definition, and a
+        session still running has not written it yet. So:
+
+        * entry present  -> the session ended, and ``reason`` says how *control left*, not
+          whether the work went well: ``completed`` for a prompt or a REPL that returned
+          normally - a run whose model call failed returned normally and says ``completed``,
+          because the exit code is where that verdict lives - and ``interrupted`` for an exit
+          an exception carried out, Ctrl-C included;
+        * entry absent   -> the session is still running, or it ended in a way that could not
+          be recorded. The record cannot tell those two apart, and neither can a reader.
+
+        That absence is the whole forensic value: before this entry existed, a clean exit and a
+        kill left identical files. Resuming changes nothing about how a session opens - entries
+        are appended after this one either way - but it does leave the difference visible in the
+        record, because conversation after a shutdown entry is a session that was reopened and
+        conversation with no shutdown entry behind it is one that never got to write one.
+        """
+        return self._entry("shutdown", reason=reason, ended=time.time())
 
     def append_compaction(self, summary: str, keep_from: str | None, tokens_before: int = 0) -> dict:
         """Record a summary; :meth:`messages` will use it in place of entries before ``keep_from``."""
