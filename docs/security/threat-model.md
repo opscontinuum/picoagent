@@ -739,7 +739,14 @@ assessment of this artifact, and each names what would close it.
 
 T11 is the one left with that shape: the control exists in the codebase and is reachable, and
 the default configuration does not use it. That is the single most useful thing an assessor can
-take from this document. T20 used to sit beside it and no longer does - the allowlist it names
+take from this document.
+
+The full ASD determination record - all 286 rules, none unreviewed - lives in
+[docs/security/assessment/](assessment/), with three process findings
+(V-222571 FIPS host-dependence, V-222645 release hashing, V-222673 training records) that
+carry no threat entry here because they are process debts rather than attack surfaces.
+`tests/test_stig_assessment_record.py` holds this table and that checklist consistent on
+every run of the suite. T20 used to sit beside it and no longer does - the allowlist it names
 is what the built-in shell applies with nothing installed and nothing configured, and the
 opt-out is a line the user writes in their own config. T23 is a different shape again: the
 control is the default now, on a platform whose permission model this one does not have.
