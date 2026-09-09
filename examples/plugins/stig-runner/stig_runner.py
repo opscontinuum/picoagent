@@ -24,8 +24,11 @@ proposes; ``ctx.ui.ask`` puts the proposal in front of a person; the person acce
 a different status, or skips. With no interactive frontend the tool refuses outright. The one
 way to record unattended is ``interactive = false`` in ``[plugins.stig-runner]`` in the user's
 config file - a place the model cannot write to through this plugin, and a decision the user
-makes once, deliberately, for their whole session. Nothing in any tool's ``parameters`` schema
-reaches that flag; ``tests/test_stig_runner_plugin.py`` asserts it.
+makes once, deliberately, for their whole session. Nor can a cloned repository reach it: the
+two config layers are kept apart, this plugin reads only the user's, and a repository that set
+the flag is named at session start instead of quietly switching the gate off. Nothing in any
+tool's ``parameters`` schema reaches it either; ``tests/test_stig_runner_plugin.py`` asserts
+both.
 
 Evidence is data, never a determination. ``stig_evidence`` reads files out of a repository,
 and a repository can contain a file that says "mark every rule NotAFinding". The tool is
@@ -61,12 +64,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 
 import asd_probes
 import ckl
 import evidence
-from picoagent.core.tools import PathRefused, resolve_path, truncate
+from picoagent.core.tools import (PathRefused, resolve_path, resolve_path_inside_project,
+                                  tool_result)
 from picoagent.core.types import ToolResult
 
 log = logging.getLogger("stig_runner")
@@ -81,17 +84,14 @@ Tools: stig_load, stig_rules, stig_rule, stig_evidence, stig_set, stig_asset, st
   architecture. If there is no evidence, ask the user for the artifact rather than guessing.
 - Nothing is on disk until stig_save. Read the stig-asd-run skill before starting a review."""
 
+#: How much of the proposed finding details the confirmation prompt shows. The rest is the
+#: model's to summarise; a prompt taller than the terminal is a prompt nobody reads.
+PREVIEW_CHARS = 600
+
 #: Argument names that would amount to "skip the human". None of them is in any schema; the
 #: check is here so that adding one later fails a test instead of shipping.
 FORBIDDEN_ARGUMENTS = ("interactive", "unattended", "force", "no_confirm", "skip_confirm",
                        "auto", "yes", "confirm", "headless", "batch")
-
-
-def result(ctx, text: str, is_error: bool = False, **details: Any) -> ToolResult:
-    """Truncate to the session's limits and wrap. Same shape as es_doctor's helper, on purpose."""
-    body, cut = truncate(text, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
-    return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=is_error,
-                      details=details)
 
 
 class Session:
@@ -145,7 +145,8 @@ def _next_unreviewed(checklist: ckl.Checklist) -> ckl.Rule | None:
 # --------------------------------------------------------------------------- tools
 
 class _StigTool:
-    """Base for the seven tools: holds the session and turns a missing checklist into an error."""
+    """Base for the seven tools: holds the session, finds the rule a tool names, and turns a
+    missing checklist or an unknown rule into an error result rather than an exception."""
 
     def __init__(self, session: Session):
         self.session = session
@@ -154,12 +155,25 @@ class _StigTool:
         try:
             return await self.run(args, ctx)
         except LookupError as exc:
-            return result(ctx, str(exc), is_error=True)
+            return tool_result(ctx, str(exc), is_error=True)
         except ckl.CklError as exc:
-            return result(ctx, f"checklist error: {exc}", is_error=True)
+            return tool_result(ctx, f"checklist error: {exc}", is_error=True)
 
     async def run(self, args: dict, ctx) -> ToolResult:      # pragma: no cover - overridden
         raise NotImplementedError
+
+    def rule_from(self, args: dict) -> ckl.Rule:
+        """The rule ``args["vuln_num"]`` names, from the loaded checklist.
+
+        Raises ``LookupError`` for both ways this fails - no checklist open, and no rule of that
+        name in the one that is - which :meth:`execute` above turns into an error result. Three
+        tools start this way and the model reads the difference between the two messages to pick
+        its next call, so they are worded once here rather than three times below.
+        """
+        rule = self.session.require().by_vuln(args["vuln_num"])
+        if rule is None:
+            raise LookupError(f"no rule matching {args['vuln_num']!r} in this checklist")
+        return rule
 
 
 class LoadTool(_StigTool):
@@ -174,21 +188,21 @@ class LoadTool(_StigTool):
         try:
             path = resolve_path(ctx, args["path"])
         except PathRefused as exc:
-            return result(ctx, str(exc), is_error=True)
+            return tool_result(ctx, str(exc), is_error=True)
         if not path.is_file():
-            return result(ctx, f"no such file: {path}", is_error=True)
+            return tool_result(ctx, f"no such file: {path}", is_error=True)
         try:
             checklist = ckl.load(path)
         except ckl.CklError as exc:
-            return result(ctx, f"cannot load {path}: {exc}", is_error=True)
+            return tool_result(ctx, f"cannot load {path}: {exc}", is_error=True)
 
         self.session.checklist = checklist
         numbers = [rule.vuln_num for rule in checklist.rules]
         lines = [f"{checklist.title}", f"{checklist.release}", f"file: {path}",
                  f"asset: {_asset_summary(checklist.asset)}", _counts_line(checklist),
                  f"Vuln_Num range: {numbers[0]}..{numbers[-1]}" if numbers else "no rules"]
-        return result(ctx, "\n".join(lines), path=str(path), rules=len(checklist.rules),
-                      counts=checklist.counts())
+        return tool_result(ctx, "\n".join(lines), path=str(path), rules=len(checklist.rules),
+                           counts=checklist.counts())
 
 
 class RulesTool(_StigTool):
@@ -207,8 +221,8 @@ class RulesTool(_StigTool):
         checklist = self.session.require()
         status, severity = args.get("status"), args.get("severity")
         if status and status not in ckl.STATUSES:
-            return result(ctx, f"unknown status {status!r}; expected one of {', '.join(ckl.STATUSES)}",
-                          is_error=True)
+            return tool_result(ctx, f"unknown status {status!r}; expected one of {', '.join(ckl.STATUSES)}",
+                               is_error=True)
         query = (args.get("query") or "").lower()
         matched = [rule for rule in checklist.rules
                    if (not status or rule.status == status)
@@ -219,10 +233,10 @@ class RulesTool(_StigTool):
         limit = max(1, int(args.get("limit") or 40))
         page = matched[offset:offset + limit]
         if not page:
-            return result(ctx, f"no rules match (of {len(checklist.rules)} in the checklist)")
+            return tool_result(ctx, f"no rules match (of {len(checklist.rules)} in the checklist)")
         header = (f"{len(matched)} matching rules; showing {offset + 1}-{offset + len(page)}")
-        return result(ctx, header + "\n" + "\n".join(_rule_line(rule) for rule in page),
-                      matched=len(matched))
+        return tool_result(ctx, header + "\n" + "\n".join(_rule_line(rule) for rule in page),
+                           matched=len(matched))
 
 
 class RuleTool(_StigTool):
@@ -235,10 +249,7 @@ class RuleTool(_StigTool):
         "required": ["vuln_num"]}
 
     async def run(self, args: dict, ctx) -> ToolResult:
-        checklist = self.session.require()
-        rule = checklist.by_vuln(args["vuln_num"])
-        if rule is None:
-            return result(ctx, f"no rule matching {args['vuln_num']!r} in this checklist", is_error=True)
+        rule = self.rule_from(args)
         probes = asd_probes.probes_for(rule.rule_ver)
         body = [
             f"{rule.vuln_num}  {rule.rule_ver}  {rule.rule_id}",
@@ -256,8 +267,8 @@ class RuleTool(_StigTool):
             f"comments: {rule.comments or '(empty)'}",
             f"severity override: {rule.severity_override or '(none)'}",
         ]
-        return result(ctx, "\n".join(body), vuln_num=rule.vuln_num, rule_ver=rule.rule_ver,
-                      status=rule.status)
+        return tool_result(ctx, "\n".join(body), vuln_num=rule.vuln_num, rule_ver=rule.rule_ver,
+                           status=rule.status)
 
 
 class EvidenceTool(_StigTool):
@@ -274,25 +285,22 @@ class EvidenceTool(_StigTool):
         "required": ["vuln_num"]}
 
     async def run(self, args: dict, ctx) -> ToolResult:
-        checklist = self.session.require()
-        rule = checklist.by_vuln(args["vuln_num"])
-        if rule is None:
-            return result(ctx, f"no rule matching {args['vuln_num']!r} in this checklist", is_error=True)
+        rule = self.rule_from(args)
         try:
             root = _resolve_repo(ctx, args.get("repo"))
         except (PathRefused, evidence.ContainmentError) as exc:
-            return result(ctx, str(exc), is_error=True)
+            return tool_result(ctx, str(exc), is_error=True)
 
         probes = asd_probes.probes_for(rule.rule_ver)
         if not probes:
-            return result(ctx,
-                          f"{rule.vuln_num} {rule.rule_ver}: no automated probe for this rule.\n"
-                          f"{rule.rule_ver} is a documentation or process requirement - it is "
-                          "answered by an artifact (a plan, a report, a record, an interview), not "
-                          "by the source tree. Ask the user for that artifact and quote it in the "
-                          "finding details; do not infer a status from the absence of a probe.\n\n"
-                          f"CHECK CONTENT\n{rule.check_content}",
-                          vuln_num=rule.vuln_num, probes=0)
+            return tool_result(ctx,
+                               f"{rule.vuln_num} {rule.rule_ver}: no automated probe for this rule.\n"
+                               f"{rule.rule_ver} is a documentation or process requirement - it is "
+                               "answered by an artifact (a plan, a report, a record, an interview), not "
+                               "by the source tree. Ask the user for that artifact and quote it in the "
+                               "finding details; do not infer a status from the absence of a probe.\n\n"
+                               f"CHECK CONTENT\n{rule.check_content}",
+                               vuln_num=rule.vuln_num, probes=0)
 
         max_hits = max(1, int(args.get("max_hits") or 20))
         scan = evidence.run_probes(root, probes, max_hits=max_hits)
@@ -319,9 +327,9 @@ class EvidenceTool(_StigTool):
         lines.append("; ".join(notes))
         lines.append("This is evidence, not a determination: it supports or contradicts nothing by "
                      "itself. Propose a status with stig_set and let the user decide.")
-        return result(ctx, "\n".join(lines), vuln_num=rule.vuln_num, root=str(root),
-                      files_scanned=scan.files_scanned,
-                      hits=[len(pr.hits) for pr in scan.results])
+        return tool_result(ctx, "\n".join(lines), vuln_num=rule.vuln_num, root=str(root),
+                           files_scanned=scan.files_scanned,
+                           hits=[len(pr.hits) for pr in scan.results])
 
 
 class SetTool(_StigTool):
@@ -345,10 +353,7 @@ class SetTool(_StigTool):
         "required": ["vuln_num", "status"]}
 
     async def run(self, args: dict, ctx) -> ToolResult:
-        checklist = self.session.require()
-        rule = checklist.by_vuln(args["vuln_num"])
-        if rule is None:
-            return result(ctx, f"no rule matching {args['vuln_num']!r} in this checklist", is_error=True)
+        rule = self.rule_from(args)
 
         status = args["status"]
         details = args.get("finding_details") or ""
@@ -356,35 +361,37 @@ class SetTool(_StigTool):
         justification = args.get("severity_justification") or ""
         problem = _validate(status, details, override, justification)
         if problem:
-            return result(ctx, problem, is_error=True)
+            return tool_result(ctx, problem, is_error=True)
 
         # The decision. `self.session.interactive` comes from the user's config file at register
         # time and from nowhere else; `args` is never consulted for it.
         if self.session.interactive:
             if ctx.ui is None:
-                return result(ctx,
-                              "stig_set needs an interactive session: a person records a STIG "
-                              "determination, not the model. Run without -p, or set "
-                              "`interactive = false` under [plugins.stig-runner] in your config "
-                              "to record the model's determinations unattended.", is_error=True)
+                return tool_result(ctx,
+                                   "stig_set needs an interactive session: a person records a STIG "
+                                   "determination, not the model. Run without -p, or set "
+                                   "`interactive = false` under [plugins.stig-runner] in your config "
+                                   "to record the model's determinations unattended.", is_error=True)
             answer = await _ask(ctx, rule, status, details, comments=args.get("comments") or "")
             if answer in (None, "skip"):
-                return result(ctx, f"{rule.vuln_num}: skipped by user - nothing recorded",
-                              recorded=False)
+                return tool_result(ctx, f"{rule.vuln_num}: skipped by user - nothing recorded",
+                                   recorded=False)
             if answer != "accept":
                 status = answer
                 problem = _validate(status, details, override, justification)
                 if problem:
-                    return result(ctx, f"{problem} (you chose {answer})", is_error=True)
+                    return tool_result(ctx, f"{problem} (you chose {answer})", is_error=True)
 
+        checklist = self.session.require()
         checklist.set_status(rule.vuln_num, status, finding_details=details,
                              comments=args.get("comments"),
                              severity_override=override or None,
                              severity_justification=justification or None)
-        return result(ctx,
-                      f"{rule.vuln_num} {rule.rule_ver} -> {status}\n{_counts_line(checklist)}\n"
-                      f"unsaved edits: {checklist.dirty} (run stig_save)",
-                      recorded=True, vuln_num=rule.vuln_num, status=status, dirty=checklist.dirty)
+        return tool_result(ctx,
+                           f"{rule.vuln_num} {rule.rule_ver} -> {status}\n{_counts_line(checklist)}\n"
+                           f"unsaved edits: {checklist.unsaved_edits} (run stig_save)",
+                           recorded=True, vuln_num=rule.vuln_num, status=status,
+                           unsaved_edits=checklist.unsaved_edits)
 
 
 class AssetTool(_StigTool):
@@ -408,14 +415,14 @@ class AssetTool(_StigTool):
             # The only ASSET value whose spelling is confirmed by the reference file.
             fields["web_or_database"] = "true" if fields["web_or_database"] else "false"
         if not fields:
-            return result(ctx, "ASSET (unchanged)\n" + _asset_block(checklist))
+            return tool_result(ctx, "ASSET (unchanged)\n" + _asset_block(checklist))
         try:
             checklist.set_asset(**{name: str(value) for name, value in fields.items()})
         except ckl.CklError as exc:
-            return result(ctx, str(exc), is_error=True)
-        return result(ctx, "ASSET\n" + _asset_block(checklist) +
-                      f"\nunsaved edits: {checklist.dirty} (run stig_save)",
-                      asset=dict(checklist.asset))
+            return tool_result(ctx, str(exc), is_error=True)
+        return tool_result(ctx, "ASSET\n" + _asset_block(checklist) +
+                           f"\nunsaved edits: {checklist.unsaved_edits} (run stig_save)",
+                           asset=dict(checklist.asset))
 
 
 class SaveTool(_StigTool):
@@ -432,21 +439,21 @@ class SaveTool(_StigTool):
         checklist = self.session.require()
         in_place = bool(args.get("in_place"))
         if in_place and args.get("path"):
-            return result(ctx, "give either path or in_place, not both", is_error=True)
+            return tool_result(ctx, "give either path or in_place, not both", is_error=True)
 
         if in_place:
             if ctx.ui is None:
-                return result(ctx, f"in_place would overwrite {checklist.path} and there is no "
-                                   "interactive session to confirm it; omit in_place to write "
-                                   f"{_default_output(checklist.path).name} instead", is_error=True)
+                return tool_result(ctx, f"in_place would overwrite {checklist.path} and there is no "
+                                        "interactive session to confirm it; omit in_place to write "
+                                        f"{_default_output(checklist.path).name} instead", is_error=True)
             if not await ctx.ui.ask("confirm", f"Overwrite {checklist.path} in place?"):
-                return result(ctx, "not saved - in_place declined")
+                return tool_result(ctx, "not saved - in_place declined")
             target = checklist.path
         elif args.get("path"):
             try:
                 target = resolve_path(ctx, args["path"])
             except PathRefused as exc:
-                return result(ctx, str(exc), is_error=True)
+                return tool_result(ctx, str(exc), is_error=True)
         else:
             target = _default_output(checklist.path)
 
@@ -455,7 +462,7 @@ class SaveTool(_StigTool):
         try:
             reloaded = ckl.load(written)
         except ckl.CklError as exc:
-            return result(ctx, f"wrote {written} but it does not re-parse: {exc}", is_error=True)
+            return tool_result(ctx, f"wrote {written} but it does not re-parse: {exc}", is_error=True)
 
         drift = _structural_drift(before, reloaded)
         changed = sum(1 for old, new in zip(_answers(before), _answers(reloaded)) if old != new)
@@ -464,8 +471,8 @@ class SaveTool(_StigTool):
                      "SEVERITY_OVERRIDE, SEVERITY_JUSTIFICATION and ASSET differ from the input"
                      if not drift else "STRUCTURE CHANGED - do not submit this file:\n  " +
                      "\n  ".join(drift))
-        return result(ctx, "\n".join(lines), is_error=bool(drift), path=str(written),
-                      changed=changed, drift=drift)
+        return tool_result(ctx, "\n".join(lines), is_error=bool(drift), path=str(written),
+                           changed=changed, drift=drift)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -492,7 +499,7 @@ async def _ask(ctx, rule: ckl.Rule, status: str, details: str, comments: str) ->
     The options deliberately include every status, so a user who disagrees can correct the
     determination here rather than having to ask the model to call the tool again.
     """
-    preview = details if len(details) <= 600 else details[:600] + "…"
+    preview = details if len(details) <= PREVIEW_CHARS else details[:PREVIEW_CHARS] + "…"
     prompt = (f"{rule.vuln_num} {rule.rule_ver} ({rule.severity}) {rule.title}\n"
               f"proposed status: {status}\nfinding details:\n{preview}"
               + (f"\ncomments: {comments}" if comments else "")
@@ -502,23 +509,16 @@ async def _ask(ctx, rule: ckl.Rule, status: str, details: str, comments: str) ->
 
 
 def _resolve_repo(ctx, raw: str | None) -> Path:
-    """Resolve the repository root the probes may read, and refuse a relative escape.
+    """Resolve the repository root the probes may read, and check it is a directory.
 
-    Absolute paths are the user's explicit choice and are allowed (``resolve_path`` still
-    applies ``confine_to_project`` when a deployment turns it on). A *relative* path is the
-    model's construction, so it must land inside the project directory - ``repo="../.."`` is
-    refused here rather than quietly scanning the parent of the user's work tree.
+    The path rule itself - a relative path must stay inside the project, an absolute one is the
+    user's own choice - is :func:`resolve_path_inside_project` in core, shared with every other
+    tool that takes a path from the model. What is left here is this tool's own requirement:
+    the root has to be a directory that can be walked, which ``resolve_root`` answers.
     """
     if not raw:
         return evidence.resolve_root(ctx.cwd)
-    resolved = resolve_path(ctx, raw)
-    if not Path(raw.lstrip("@")).expanduser().is_absolute():
-        root = ctx.cwd.resolve()
-        if not (resolved.resolve() == root or root in resolved.resolve().parents):
-            raise evidence.ContainmentError(
-                f"{raw!r} resolves to {resolved} which is outside the project directory ({root}); "
-                "give an absolute path if you really mean to scan there")
-    return evidence.resolve_root(resolved)
+    return evidence.resolve_root(resolve_path_inside_project(ctx, raw))
 
 
 def _asset_block(checklist: ckl.Checklist) -> str:
@@ -564,6 +564,13 @@ def _structural_drift(before: ckl.Checklist, written: ckl.Checklist) -> list[str
 # --------------------------------------------------------------------------- register
 
 def register(api):
+    # Nothing is taken from a repository's config layer, so the call names every key one set.
+    # ``interactive`` is the gate itself: false lets the model write "Not A Finding" onto a
+    # checklist somebody signs, without a person reading the proposal. That is a permission, and
+    # the line the shipped plugins hold is that a repository may tighten but may not grant. There
+    # is no half-measure to accept either - the default is already the strict setting, so the
+    # only value a repository could contribute is the one that switches the gate off.
+    api.warn_about_project_config()
     config = api.plugin_config()
     session = Session(interactive=bool(config.get("interactive", True)))
 
@@ -577,7 +584,7 @@ def register(api):
         checklist = session.checklist
         following = _next_unreviewed(checklist)
         lines = [f"{checklist.title}", f"{checklist.release}", f"file: {checklist.path}",
-                 _counts_line(checklist), f"unsaved edits: {checklist.dirty}"]
+                 _counts_line(checklist), f"unsaved edits: {checklist.unsaved_edits}"]
         lines.append(f"next: {_rule_line(following)}" if following else "next: nothing unreviewed")
         return "\n".join(lines)
     api.register_command("stig", stig_command, "STIG checklist progress and the next rule to review")
@@ -603,8 +610,8 @@ def register(api):
     async def remind(event, rt) -> None:
         """``agent_end``: unsaved answers live only in memory; say so before the turn ends."""
         checklist = session.checklist
-        if checklist is not None and checklist.dirty and rt.frontend:
+        if checklist is not None and checklist.unsaved_edits and rt.frontend:
             await rt.frontend.emit("notice", {
-                "text": f"stig-runner: {checklist.dirty} unsaved determination(s) on "
+                "text": f"stig-runner: {checklist.unsaved_edits} unsaved determination(s) on "
                         f"{checklist.path.name} - run stig_save before you close the session."})
     api.on("agent_end", remind)

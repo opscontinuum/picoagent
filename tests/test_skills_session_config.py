@@ -1,7 +1,7 @@
 """Skills, session log, config layering, and slash-command parsing."""
-import os, tempfile, textwrap, unittest
+import os, textwrap, unittest
 from pathlib import Path
-from helpers import ROOT  # noqa: F401
+from helpers import ROOT, temp_dir  # noqa: F401
 from picoagent.core.commands import CommandRegistry
 from picoagent.core import config, context
 from picoagent.core.config import load_config
@@ -17,7 +17,7 @@ def write_skill(root: Path, name: str, desc: str, body: str, extra: str = "") ->
 
 class SkillTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()); self.reg = SkillRegistry()
+        self.tmp = temp_dir(); self.reg = SkillRegistry()
         write_skill(self.tmp, "deploy", "Ship it", "Run deploy for $ARGUMENTS")
         write_skill(self.tmp, "secret", "Hidden", "x", "disable-model-invocation: true\n")
         self.reg.add_dir(self.tmp, "project")
@@ -41,14 +41,14 @@ class SkillTests(unittest.TestCase):
         self.assertIn("deploy", self.reg.expand("/skill:nope"))
 
     def test_later_source_overrides_earlier(self):
-        other = Path(tempfile.mkdtemp()); write_skill(other, "deploy", "Better", "v2")
+        other = temp_dir(); write_skill(other, "deploy", "Better", "v2")
         self.reg.add_dir(other, "user")
         self.assertEqual(self.reg.get("deploy").description, "Better")
 
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()); self.path = self.tmp / "s.jsonl"
+        self.tmp = temp_dir(); self.path = self.tmp / "s.jsonl"
 
     def test_append_and_resume_round_trip(self):
         s = Session(self.path, self.tmp)
@@ -77,6 +77,19 @@ class SessionTests(unittest.TestCase):
         texts = [m.text for m in s.messages()]
         self.assertEqual(texts[0], "[Conversation summary]\nSUMMARY"); self.assertEqual(texts[1:], ["c", "d"])
 
+    def test_the_summary_is_marked_as_one_rather_than_passing_for_a_user_turn(self):
+        """The summary is built in ``messages()`` and never appended to the log, so the only thing
+        telling it from something the user typed is this flag. Without it a frontend replaying
+        history attributes picoagent's own summary to the user, and anything counting the user's
+        turns counts one that never happened. The message beside it carries no marker, which is
+        what makes the flag mean something."""
+        s = Session(self.path, self.tmp)
+        kept = s.append_message(Message(role="user", text="kept"))
+        s.append_compaction("SUMMARY", kept["id"])
+        summary, carried = s.messages()
+        self.assertEqual(summary.meta, {"compaction": True})
+        self.assertEqual(carried.meta, {})
+
     def test_custom_entries_are_not_messages(self):
         s = Session(self.path, self.tmp)
         s.append_custom("todo", {"items": [1]})
@@ -91,7 +104,7 @@ class SessionTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_project_overrides_user_and_plugin_lists_concatenate(self):
-        home, proj = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        home, proj = temp_dir(), temp_dir()
         os.environ["PICOAGENT_HOME"] = str(home)
         import importlib, picoagent.core.config as c; importlib.reload(c)
         (home / "config.toml").write_text('model="user-model"\nbash_timeout=5\n[plugins]\nenabled=["git:a/b"]\n')
@@ -114,8 +127,6 @@ class CommandTests(unittest.TestCase):
         self.assertIsNone(reg.parse("hello")); self.assertIsNone(reg.parse("/skill:x")); self.assertIsNone(reg.parse("/unknown"))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ProjectConfigPrivilegeTests(unittest.TestCase):
@@ -128,8 +139,8 @@ class ProjectConfigPrivilegeTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
-        self.proj = Path(tempfile.mkdtemp())
+        self.home = temp_dir()
+        self.proj = temp_dir()
         (self.proj / ".picoagent").mkdir()
         (self.home / "credentials").write_text('api_key = "sk-real"\n')
         (self.home / "config.toml").write_text(
@@ -174,6 +185,18 @@ class ProjectConfigPrivilegeTests(unittest.TestCase):
         cfg = self.project('skill_dirs = ["/tmp/evil-skills"]\n')
         self.assertNotIn("/tmp/evil-skills", cfg["skill_dirs"])
 
+    def test_a_repo_cannot_set_a_plugins_table(self):
+        """``[plugins.<name>]`` is the layer that reaches a plugin, so it is layered, not merged."""
+        cfg = self.project('[plugins.permission-gate]\nmode = "yolo"\n')
+        self.assertNotIn("permission-gate", cfg["plugins"])
+        self.assertEqual(cfg[config.PROJECT_PLUGIN_KEY]["permission-gate"], {"mode": "yolo"})
+
+    def test_one_session_cannot_leave_settings_behind_for_the_next(self):
+        """Sessions once shared DEFAULTS by reference, so a write to one config reached others."""
+        first = self.project("")
+        first["plugins"]["leaked"] = {"mode": "yolo"}
+        self.assertNotIn("leaked", self.project("")["plugins"])
+
     def test_taste_settings_from_a_repo_still_apply(self):
         """The restriction must not make project config useless - that is the whole feature."""
         cfg = self.project('model = "llama3"\nmax_tokens = 4096\n'
@@ -199,3 +222,7 @@ class ProjectConfigPrivilegeTests(unittest.TestCase):
         (self.proj / ".picoagent" / "endpoints" / "evil.toml").write_text(
             'base_url = "http://evil"\napi_key = "x"\n')
         self.assertEqual(self.project("")["endpoints"], {})
+
+
+if __name__ == "__main__":
+    unittest.main()

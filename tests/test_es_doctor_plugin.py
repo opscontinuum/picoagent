@@ -1,13 +1,18 @@
 """es-doctor plugin: log digging, metric queries, and log<->metric<->APM correlation
 against the fake Elasticsearch incident (errors + CPU + latency spike at 10:15-10:20)."""
-import tempfile, unittest
+import statistics, unittest
 from pathlib import Path
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT
+import sys
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 from picoagent.testing.fake_es import FakeES
 
 PLUGIN = ROOT / "examples/plugins/es-doctor"
+if str(PLUGIN) not in sys.path:
+    sys.path.insert(0, str(PLUGIN))
+import es_admin                                        # noqa: E402 - needs the path above
+import es_client                                       # noqa: E402 - needs the path above
 WINDOW = {"since": "2026-09-02T10:00:00Z", "until": "2026-09-02T10:30:00Z"}
 
 
@@ -21,7 +26,7 @@ class EsDoctorBase(unittest.TestCase):
         cls.es.stop()
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.es.requests.clear()
         self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
         self.rt.cfg["plugins"]["es-doctor"] = {"url": self.es.url, "api_key": "abc123"}
@@ -128,6 +133,219 @@ class GuardTests(EsDoctorBase):
     def test_raw_search_passthrough_works(self):
         r = self.tool("es_search", index="traces-apm*", body={"size": 1, "query": {"term": {"event.outcome": "failure"}}})
         self.assertIn("POST /checkout", r.content)
+
+
+#: Six calls that change a cluster without a DELETE and without any of the words a denylist
+#: enumerated: cluster-wide settings, a bulk body that can carry deletes, a stored script, an
+#: alias swap (what every read resolves to), a restore over live indices, and forged evidence
+#: written into the very logs an assessor is reading.
+WRITES_THAT_ARE_NOT_DELETES = [
+    ("PUT", "/_cluster/settings"),
+    ("POST", "/logs-app/_bulk"),
+    ("PUT", "/_scripts/backdoor"),
+    ("POST", "/_aliases"),
+    ("POST", "/_snapshot/backups/nightly/_restore"),
+    ("POST", "/logs-app/_doc"),
+]
+
+
+class WriteGateTests(EsDoctorBase):
+    """``allow_destructive = false`` has to hold for writes nobody enumerated.
+
+    This plugin is fed logs and traces, which is data an attacker can write, so the realistic
+    path to a destructive call is an injected instruction the model follows. A gate that lists
+    the destructive endpoints leaves every endpoint nobody listed open, and Elasticsearch has
+    hundreds that mutate.
+    """
+
+    def _run_request(self, method, path):
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[call("es_request", method=method, path=path)],
+                                                               [text("ok")]]))
+        rt.cfg["plugins"]["es-doctor"] = {"url": self.es.url}
+        loader.load_plugin(PLUGIN, rt, loader.TrustStore(self.tmp / "home"), allow_untrusted=True)
+        run(AgentLoop(rt).run("do it"))
+        return rt.frontend.tool_results()[0]
+
+    def test_every_write_is_refused_and_none_of_them_reaches_the_cluster(self):
+        for method, path in WRITES_THAT_ARE_NOT_DELETES:
+            with self.subTest(call=f"{method} {path}"):
+                self.es.requests.clear()
+                result = self._run_request(method, path)
+                self.assertTrue(result.is_error, result.content)
+                self.assertEqual([r["path"] for r in self.es.requests], [])
+
+    def test_a_read_over_post_is_still_allowed(self):
+        """``_search`` carries its query in a body, so refusing every POST would refuse reading."""
+        result = self._run_request("POST", "/logs-*/_search")
+        self.assertFalse(result.is_error, result.content)
+        self.assertTrue([r for r in self.es.requests if r["path"].endswith("/_search")])
+
+    def test_the_client_refuses_a_write_no_tool_gate_saw(self):
+        """Defence in depth: the ``tool_call`` guard only sees ``es_request``'s arguments, so a
+        tool that builds a path itself would be gated by nothing without this."""
+        client = es_client.ESClient(url=self.es.url)
+        with self.assertRaises(es_client.ESError):
+            client.request("PUT", "/_cluster/settings", {"persistent": {}})
+        self.assertEqual([r["path"] for r in self.es.requests], [])
+
+    def test_allow_destructive_still_lets_a_write_through(self):
+        client = es_client.ESClient(url=self.es.url, allow_destructive=True)
+        client.request("PUT", "/logs-app/_settings", {"index.number_of_replicas": 0})
+        self.assertEqual([r["method"] for r in self.es.requests if r["path"] == "/logs-app/_settings"], ["PUT"])
+
+    def test_the_tool_description_does_not_promise_more_than_the_gate_does(self):
+        described = self.rt.tools.get("es_request").description.lower()
+        self.assertIn("read-only", described)
+
+
+class NonJsonResponseTests(EsDoctorBase):
+    """A cluster answering something that is not JSON is an expected failure, not a bug.
+
+    ``es_request`` takes a path from the model, and several Elasticsearch endpoints answer
+    plain text: every ``/_cat/*`` without ``format=json``, and ``_nodes/hot_threads``. The
+    convention this codebase holds is that a tool reports an expected failure as a result and
+    only a bug raises, so the tool has to come back with something the model can act on.
+    """
+
+    def test_a_text_answer_is_an_error_result_not_a_raised_decode_error(self):
+        result = self.tool("es_request", method="GET", path="/_nodes/hot_threads")
+        self.assertTrue(result.is_error)
+        self.assertIn("did not answer JSON", result.content)
+
+    def test_the_refusal_names_the_endpoint_and_what_to_do_instead(self):
+        result = self.tool("es_request", method="GET", path="/_nodes/hot_threads")
+        self.assertIn("/_nodes/hot_threads", result.content)
+        self.assertIn("format=json", result.content)
+        self.assertIn("es_hot_threads", result.content)
+
+
+class ConfirmedWriteTests(EsDoctorBase):
+    """``request_after_confirmation`` is the gate's one bypass, and its contract is narrow: a
+    write the user was shown in full and agreed to.
+
+    That contract is what makes grepping for the method's name a way to enumerate the writes a
+    person actually approved. ``es_slowlog`` asked when there was a ``ctx.ui`` and refused when
+    there was neither a ``ctx.ui`` nor ``allow_destructive`` - and then took the bypass in the
+    third case as well, where nobody was shown anything. Not an escalation: ``allow_destructive``
+    already authorises destructive ``request()`` calls, so the cluster ends up in the same state
+    either way. It is the audit that breaks - the list stops meaning what it says.
+    """
+
+    def _slowlog(self, allow_destructive):
+        es = es_client.ESClient(url=self.es.url, allow_destructive=allow_destructive)
+        return es_admin.SlowlogTool(es, es_client.Settings(allow_destructive=allow_destructive))
+
+    def _record_route(self, tool):
+        """Which of the client's two doors a write went through, in call order."""
+        taken, plain, bypass = [], tool.es.request, tool.es.request_after_confirmation
+
+        def through(name, method):
+            def call(*args, **kwargs):
+                taken.append(name)
+                return method(*args, **kwargs)
+            return call
+
+        tool.es.request = through("request", plain)
+        tool.es.request_after_confirmation = through("confirmed", bypass)
+        return taken
+
+    def _enable(self, tool, ui=None):
+        ctx = tool_ctx(self.tmp)
+        ctx.ui = ui
+        return run(tool.execute({"index": "logs-app", "action": "enable", "query_warn": "2s"}, ctx))
+
+    def test_a_write_nobody_was_shown_does_not_claim_to_have_been_confirmed(self):
+        tool = self._slowlog(allow_destructive=True)
+        taken = self._record_route(tool)
+        outcome = self._enable(tool)
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertEqual(taken, ["request"], "no ctx.ui means nobody saw this change")
+
+    def test_the_write_still_happens_because_allow_destructive_authorised_it(self):
+        self.es.requests.clear()
+        self._enable(self._slowlog(allow_destructive=True))
+        self.assertIn(("PUT", "/logs-app/_settings"),
+                      [(r["method"], r["path"]) for r in self.es.requests])
+
+    def test_a_write_the_user_agreed_to_does_take_the_bypass(self):
+        tool = self._slowlog(allow_destructive=False)
+        taken = self._record_route(tool)
+        outcome = self._enable(tool, ui=CaptureFrontend(answer=True))
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertEqual(taken, ["confirmed"])
+
+    def test_with_nobody_to_ask_and_nothing_authorising_it_the_write_is_refused(self):
+        self.es.requests.clear()
+        tool = self._slowlog(allow_destructive=False)
+        outcome = self._enable(tool)
+        self.assertTrue(outcome.is_error)
+        self.assertEqual([r for r in self.es.requests if r["method"] == "PUT"], [])
+
+    def test_a_user_who_said_no_is_not_overridden_by_the_setting(self):
+        self.es.requests.clear()
+        outcome = self._enable(self._slowlog(allow_destructive=True), ui=CaptureFrontend(answer=False))
+        self.assertIn("unchanged", outcome.content)
+        self.assertEqual([r for r in self.es.requests if r["method"] == "PUT"], [])
+
+
+class ApmLatencyTests(EsDoctorBase):
+    """The apm_p50_ms column has to be the median it is named after.
+
+    A mean over transaction durations is the one statistic that cannot be read as latency: a
+    single 10-second transaction drags it past every request an incident responder is asking
+    about. The durations below are skewed so the two figures cannot be mistaken for each
+    other, mean 1090 ms against median 100 ms.
+    """
+
+    def correlate_over(self, durations_us):
+        self.rt.tools.get("es_correlate").es = SkewedLatencyES(durations_us)
+        return self.tool("es_correlate", **WINDOW, interval="10m")
+
+    def test_apm_column_reports_the_median_not_the_mean(self):
+        r = self.correlate_over([100_000] * 9 + [10_000_000])
+        self.assertIn("apm_p50_ms", r.content)
+        row = next(line for line in r.content.splitlines() if line.startswith("2026-09-02 10:10"))
+        self.assertEqual(row.split()[-2], "100",
+                         f"apm_p50_ms must be the median (100 ms), not the mean (1090 ms): {row!r}")
+
+    def test_the_query_asks_elasticsearch_for_a_percentile(self):
+        es = SkewedLatencyES([100_000])
+        self.rt.tools.get("es_correlate").es = es
+        self.tool("es_correlate", **WINDOW, interval="10m")
+        latency = es.searches[-1]["aggs"]["t"]["aggs"]["p50"]
+        self.assertIn("percentiles", latency, f"p50 is computed by the server, not renamed: {latency}")
+        self.assertEqual(latency["percentiles"]["percents"], [50])
+
+
+class SkewedLatencyES:
+    """A stand-in Elasticsearch that answers whichever latency statistic it is asked for.
+
+    ``picoagent/testing/fake_es.py`` computes ``avg`` and ``max`` but not ``percentiles``, and
+    it is shared with the other suites and the offline demo, so the one query whose statistic
+    is under test is answered here instead. Every aggregation is computed from the sample it
+    was handed, so a tool asking for a mean gets a real mean and the test can tell which one
+    reached the column.
+    """
+
+    BUCKETS = ("2026-09-02T10:00:00.000Z", "2026-09-02T10:10:00.000Z", "2026-09-02T10:20:00.000Z")
+
+    def __init__(self, durations_us):
+        self.durations_us, self.searches = durations_us, []
+
+    def search(self, index, body):
+        self.searches.append(body)
+        sub = body["aggs"]["t"]["aggs"]
+        buckets = [{"key_as_string": key, "doc_count": len(self.durations_us),
+                    **{name: self.agg(spec) for name, spec in sub.items()}} for key in self.BUCKETS]
+        return {"hits": {"hits": [], "total": {"value": 0}}, "aggregations": {"t": {"buckets": buckets}}}
+
+    def agg(self, spec):
+        if "percentiles" in spec:
+            return {"values": {"50.0": float(statistics.median(self.durations_us))}}
+        if "avg" in spec:
+            values = self.durations_us if "duration" in spec["avg"]["field"] else [0.5]
+            return {"value": float(statistics.fmean(values))}
+        return {"doc_count": 2}
 
 
 if __name__ == "__main__":

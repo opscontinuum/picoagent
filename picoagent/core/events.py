@@ -45,6 +45,31 @@ CORE_EVENTS = frozenset({
 })
 
 
+def warn_if_unpublished(event: str, owner: str) -> None:
+    """Say something when a subscription names an event nothing will ever publish.
+
+    A misspelled event name is the one plugin mistake with no symptom. ``api.on("tool_calls",
+    handler)`` registers cleanly, the plugin loads, the loader reports it as running, and the
+    handler is never called - so the author is debugging their handler's body when the fault is
+    in the string above it. Every other way a plugin can be wrong announces itself: a handler
+    that raises is logged with its owner, a tool that fails becomes a tool result, a plugin
+    whose code changed is a notice at startup.
+
+    A warning rather than a refusal, and this is the important half. The core does not have the
+    standing to decide a plugin is wrong about a name: an event may come from another plugin,
+    and a plugin written against a newer picoagent may name an event this one has not got yet.
+    So the handler is still subscribed and the session still starts; what changes is that
+    stderr says why nothing is happening. Namespaced names - anything with a colon, which is
+    what :meth:`~picoagent.plugins.api.PluginAPI.emit` publishes under - are somebody else's to
+    validate and are passed over in silence.
+    """
+    if event in CORE_EVENTS or ":" in event:
+        return
+    log.warning("plugin '%s' subscribed to '%s', which is not a core event and is not a "
+                "namespaced '<plugin>:<event>' one. Nothing publishes it, so this handler will "
+                "never run. Core events: %s", owner, event, ", ".join(sorted(CORE_EVENTS)))
+
+
 class EventBus:
     """Ordered, fault-tolerant publish/subscribe with payload patching."""
 

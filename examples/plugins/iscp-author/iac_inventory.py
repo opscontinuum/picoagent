@@ -271,40 +271,67 @@ def _mask(source: str) -> tuple[str, list[str]]:
 
     Returns the masked text (same length as ``source``, newlines preserved so line numbers
     still work) and a list of warnings for constructs that never terminated.
+
+    This is the scanner loop and nothing else: recognise which of the four things starts at
+    ``index``, hand ``out`` to the function that blanks it, and take back the index just past
+    it. Each of those functions owns one construct's rules - where it ends, what it leaves
+    behind, and whether not ending is worth a warning - so the loop stays readable as the
+    grammar it implements, and a bug in heredocs is a bug in one named place.
     """
     out = list(source)
     warnings: list[str] = []
     index, length = 0, len(source)
     while index < length:
-        char = source[index]
-        if char == "#" or source.startswith("//", index):
-            while index < length and source[index] != "\n":
-                out[index] = " "
-                index += 1
+        if source[index] == "#" or source.startswith("//", index):
+            index = _mask_line_comment(source, out, index)
         elif source.startswith("/*", index):
-            end = source.find("*/", index + 2)
-            end = length if end == -1 else end + 2
-            if end == length:
-                warnings.append(f"unterminated block comment at offset {index}")
-            for position in range(index, end):
-                if source[position] != "\n":
-                    out[position] = " "
-            index = end
-        elif char == '"':
-            index += 1
-            while index < length and source[index] != '"':
-                if source[index] == "\\":
-                    out[index] = _MASK
-                    index += 1
-                if index < length:
-                    out[index] = _MASK if source[index] != "\n" else "\n"
-                    index += 1
-            index += 1
+            index = _mask_block_comment(source, out, index, warnings)
+        elif source[index] == '"':
+            index = _mask_string(source, out, index)
         elif source.startswith("<<", index):
             index = _mask_heredoc(source, out, index, warnings)
         else:
             index += 1
     return "".join(out), warnings
+
+
+def _mask_line_comment(source: str, out: list[str], index: int) -> int:
+    """Mask a ``#`` or ``//`` comment up to the newline. Returns the index of that newline."""
+    while index < len(source) and source[index] != "\n":
+        out[index] = " "
+        index += 1
+    return index
+
+
+def _mask_block_comment(source: str, out: list[str], index: int, warnings: list[str]) -> int:
+    """Mask a ``/* ... */`` comment. Returns the index just past it, or the end of the text."""
+    end = source.find("*/", index + 2)
+    end = len(source) if end == -1 else end + 2
+    if end == len(source):
+        warnings.append(f"unterminated block comment at offset {index}")
+    for position in range(index, end):
+        if source[position] != "\n":
+            out[position] = " "
+    return end
+
+
+def _mask_string(source: str, out: list[str], index: int) -> int:
+    """Mask the interior of a ``"..."`` literal, honouring backslash escapes.
+
+    The quotes themselves are left alone: they are what tells the caller a string was here.
+    An unterminated literal runs to the end of the file and is not warned about, because in
+    HCL that is a syntax error the parse below will report in terms the author can act on.
+    """
+    length = len(source)
+    index += 1
+    while index < length and source[index] != '"':
+        if source[index] == "\\":
+            out[index] = _MASK
+            index += 1
+        if index < length:
+            out[index] = _MASK if source[index] != "\n" else "\n"
+            index += 1
+    return index + 1
 
 
 def _mask_heredoc(source: str, out: list[str], index: int, warnings: list[str]) -> int:
@@ -581,11 +608,7 @@ def scan_terraform_dir(root: Path) -> Inventory:
     for path, resources in per_file:
         for block in resources:
             inventory.cis.extend(_block_to_cis(block, path, root, aliases, local_maps))
-    for ci in inventory.cis:
-        if ci.category == "other":
-            inventory.unrecognised[ci.resource_type] = inventory.unrecognised.get(ci.resource_type, 0) + 1
-    _assign_ids(inventory.cis)
-    return inventory
+    return _finish(inventory)
 
 
 def _block_to_cis(block: _Block, path: Path, root: Path, aliases: dict, local_maps: dict) -> list[CI]:
@@ -652,33 +675,42 @@ def read_terraform_show_json(path: Path) -> Inventory:
         return inventory
     root_module = (document.get("values") or {}).get("root_module") or {}
     _walk_modules(root_module, path.name, inventory)
-    for ci in inventory.cis:
-        if ci.category == "other":
-            inventory.unrecognised[ci.resource_type] = inventory.unrecognised.get(ci.resource_type, 0) + 1
-    _assign_ids(inventory.cis)
-    return inventory
+    return _finish(inventory)
 
 
 def _walk_modules(module: dict, source_name: str, inventory: Inventory) -> None:
-    for resource in module.get("resources") or []:
-        if resource.get("mode") not in (None, "managed"):
-            continue
-        resource_type = resource.get("type") or ""
-        values = resource.get("values") or {}
-        nested = {key: value[0] for key, value in values.items()
-                  if isinstance(value, list) and value and isinstance(value[0], dict)}
-        flat = {key: value for key, value in values.items() if not isinstance(value, (dict, list))}
-        replication = _replication_of(resource_type, values, nested)
-        inventory.cis.append(CI(
-            ci_id="", name=values.get("display_name") or values.get("name") or resource.get("name") or "",
-            address=resource.get("address") or f"{resource_type}.{resource.get('name')}",
-            resource_type=resource_type, category=categorise(resource_type),
-            cloud=cloud_of(resource_type),
-            region=next((values.get(k) for k in _REGION_KEYS if isinstance(values.get(k), str)), None),
-            attributes=flat, source=source_name, depends_on=list(resource.get("depends_on") or []),
-            replication=replication))
+    """Collect every managed resource in this module and, recursively, its children.
+
+    A data source (``mode: "data"``) is something the plan *read*, not something the system
+    is made of, so it is not a Configuration Item.
+    """
+    inventory.cis.extend(_json_resource_to_ci(resource, source_name)
+                         for resource in module.get("resources") or []
+                         if resource.get("mode") in (None, "managed"))
     for child in module.get("child_modules") or []:
         _walk_modules(child, source_name, inventory)
+
+
+def _json_resource_to_ci(resource: dict, source_name: str) -> CI:
+    """One ``terraform show -json`` resource as a CI. Values here are already resolved.
+
+    Nested blocks arrive as one-element lists of objects, which is where the replication
+    settings live (``replication_configuration``, ``versioning``); the flat values are what a
+    reader of the inventory can actually read, so only those become attributes.
+    """
+    resource_type = resource.get("type") or ""
+    values = resource.get("values") or {}
+    nested = {key: value[0] for key, value in values.items()
+              if isinstance(value, list) and value and isinstance(value[0], dict)}
+    flat = {key: value for key, value in values.items() if not isinstance(value, (dict, list))}
+    return CI(
+        ci_id="", name=values.get("display_name") or values.get("name") or resource.get("name") or "",
+        address=resource.get("address") or f"{resource_type}.{resource.get('name')}",
+        resource_type=resource_type, category=categorise(resource_type),
+        cloud=cloud_of(resource_type),
+        region=next((values.get(key) for key in _REGION_KEYS if isinstance(values.get(key), str)), None),
+        attributes=flat, source=source_name, depends_on=list(resource.get("depends_on") or []),
+        replication=_replication_of(resource_type, values, nested))
 
 
 # ----------------------------------------------------------------- CloudFormation (JSON)
@@ -707,11 +739,7 @@ def read_cloudformation_json(path: Path) -> Inventory:
             cloud=cloud_of(resource_type), attributes=properties, source=path.name,
             depends_on=_cfn_dependencies(resource),
             replication=_replication_of(resource_type, properties, {})))
-    for ci in inventory.cis:
-        if ci.category == "other":
-            inventory.unrecognised[ci.resource_type] = inventory.unrecognised.get(ci.resource_type, 0) + 1
-    _assign_ids(inventory.cis)
-    return inventory
+    return _finish(inventory)
 
 
 def _cfn_dependencies(resource: dict) -> list[str]:
@@ -720,6 +748,21 @@ def _cfn_dependencies(resource: dict) -> list[str]:
 
 
 # --------------------------------------------------------------------------- CI identity
+
+def _finish(inventory: Inventory) -> Inventory:
+    """The last step every reader takes: tally what could not be categorised, then number the CIs.
+
+    Shared rather than repeated at the end of each reader, because a reader that forgot the
+    tally would report "0 unrecognised resource types" about a scan that recognised nothing,
+    and one that forgot the numbering would hand back CIs with an empty ``ci_id`` that the
+    renderer prints as a blank first column.
+    """
+    for ci in inventory.cis:
+        if ci.category == "other":
+            inventory.unrecognised[ci.resource_type] = inventory.unrecognised.get(ci.resource_type, 0) + 1
+    _assign_ids(inventory.cis)
+    return inventory
+
 
 def _assign_ids(cis: list[CI]) -> None:
     """``CI-0001`` upwards, ordered by address so a re-import of the same sources is stable."""

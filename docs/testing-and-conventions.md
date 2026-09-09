@@ -18,15 +18,96 @@ in `picoagent/testing/fakes.py`.
 | `test_tools.py` | read/write/edit/bash, truncation, the per-file lock |
 | `test_skills_session_config.py` | SKILL.md parsing, session tree + compaction, config layering, command parsing |
 | `test_loop_and_plugins.py` | the loop end-to-end with a scripted model; plugin loading and trust |
-| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers |
+| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, and where a redirect may take a credentialed request |
+| `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
+| `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
+| `test_torn_state_files.py` | `trust.json` and the session log caught mid-write: the store is published by rename and reads as empty when it is damaged, a partial last line in the log is dropped and a hole in the middle is not |
+| `test_session_log_permissions.py` | that the session log and the directories holding it are owner-only, read back off the filesystem with `stat` rather than by trusting a call, for a new session, a resumed one, logs written before the rule existed, and the path the CLI actually takes (skipped on Windows, where mode bits are not access control) |
+| `test_session_shutdown_record.py` | that a session which ends by its own exit path says so in its last entry, that an interrupted one is named apart from a completed one, and - the half that keeps the record honest - that a session which never reached that path leaves no entry at all |
+| `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
+| `test_command_injection.py` | that untrusted data reaches a subprocess as argv and never as shell text, and that only the two intended places hand a string to a shell |
+| `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run, and no test file calling `tempfile.mkdtemp` instead of the resolved `temp_dir()` |
 | `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
 | `test_example_plugins.py` | permission-gate and compaction behaviour |
-| `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident) |
+| `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |
+| `test_es_doctor_plugin.py` | the Elasticsearch plugin against `picoagent/testing/fake_es.py` (canned Beats/APM incident), including the read-only gate `allow_destructive` opens |
+| `test_headless_run.py` | what a program driving `-p` reads: the exit code of a run whose model call failed, and which project's sessions `-r last` resumes |
 | `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
 | `test_mcp_live.py` | live end-to-end against a real MCP server in a container (opt-in, skipped by default) |
 
 `tests/helpers.py` has the fixtures: `make_runtime`, `ScriptedProvider`, `CaptureFrontend`,
-and the `text()` / `call()` shorthands for scripting model turns.
+the `text()` / `call()` shorthands for scripting model turns, and `temp_dir()`.
+
+**Use `temp_dir()`, never `tempfile.mkdtemp()` directly.** `mkdtemp` returns the path the way
+`TMPDIR` spells it, symlinks and all; picoagent resolves the paths it reports, so an assertion
+comparing a reported path against a raw `mkdtemp` string compares two spellings of one
+directory. It passes wherever `TMPDIR` has no link in it and fails wherever it does, which on
+macOS is everywhere (`/var` is a symlink to `/private/var`). `temp_dir()` resolves once, at the
+point the directory is made. `test_suite_shape.py` fails the run if a test file goes back to
+`mkdtemp`.
+
+## Coverage statistics
+
+```bash
+python3 tools/coverage_report.py                      # the whole suite: ~46s against ~36s plain
+python3 tools/coverage_report.py -p 'test_tools.py'   # one file, while you work on it
+```
+
+Runs the suite under the standard library's `trace` and prints, per module, how many of that
+module's executable lines the run reached. Three tables, because they answer different
+questions: `picoagent/` is the application, `examples/plugins/` is code the repository ships for
+people to load, and `picoagent/testing/` is the fake servers the suite runs against - averaging
+the fakes into the application's number would flatter it.
+
+**There is no threshold and no gate.** The suite is what fails a build; this reports a number.
+A threshold picked on a Tuesday becomes an obstacle on a Thursday, and the statistic's job is to
+show *which* modules a release exercised, not to be defended.
+
+**Why the standard library and not `coverage.py`.** `coverage.py` is the better tool and it is a
+development dependency, not a runtime one, so taking it would not have broken the promise in
+`pyproject.toml`. It would have broken a smaller one that matters more here: this number is
+evidence, and evidence that needs a package index to reproduce has a footnote on it on exactly
+the machines that ask for evidence - an air-gapped or accredited host has no index. `trace`
+ships with CPython, so a clone and a Python reproduce the figure. If you want branch coverage,
+or a diff-annotated HTML report, install `coverage.py` in your own environment and use it; just
+do not let it become something the tests need.
+
+### The statistic, per release
+
+Recorded here at each release rather than only in a terminal that scrolled away, so the trend
+is visible and a reader can see which modules a given release exercised. Add a row when you cut
+one; do not edit an old row, because it describes a release that shipped.
+
+| Release | Date | Suite | Application | Application + shipped plugins |
+|---|---|---|---|---|
+| 0.1.0 (development) | 2026-09-07 | 972 tests, `OK (skipped=5)` | 91.6% | 93.4% |
+
+The current breakdown:
+
+| | Covered / executable lines | |
+|---|---|---|
+| `picoagent/` - the application | 2475 / 2703 | **91.6%** |
+| `examples/plugins/` - shipped plugins | 5238 / 5558 | 94.2% |
+| `picoagent/testing/` - fake servers | 1154 / 1309 | 88.2% |
+| Application + shipped plugins | 7713 / 8261 | **93.4%** |
+
+Python 3.12.3; the five skips are the two opt-in live files. The least-covered modules, which
+is the part of the report worth reading:
+
+| Module | Coverage | Why |
+|---|---|---|
+| `picoagent/frontends/plain.py` | 51.8% | the interactive REPL: its read-and-dispatch loop needs a terminal, so most tests drive the loop directly instead |
+| `picoagent/cli.py` | 83.4% | argument handling and startup wiring, parts of which only run from a real command line |
+| `picoagent/frontends/base.py` | 0% | the `Frontend` protocol. Nothing imports it - it is a written contract, and the frontends satisfy it structurally |
+| `picoagent/__main__.py`, `picoagent/testing/fake_mcp.py` | 0% | both only ever run in a **child process**, which `trace` cannot follow. `fake_mcp` is exercised hard by `tests/test_mcp_plugin.py`, over a pipe |
+
+Read the numbers with three caveats. Line coverage is not branch coverage: a line that ran is
+not a line whose every outcome was tested. A child process is not counted, which is the
+`__main__.py` and `fake_mcp.py` row above. And the tool reports how often it lost the trace
+function and re-armed it - CPython removes a trace function that raises, and
+`test_config_refusals` deliberately recurses past the parser's stack, so a handful of lines
+around that point go uncounted. The script says how many times that happened rather than
+quietly rounding up.
 
 ## Running the live Ollama tests
 

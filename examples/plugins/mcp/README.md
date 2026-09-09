@@ -56,7 +56,8 @@ startup_timeout = 20                # seconds for the handshake and tools/list
 [plugins.mcp.servers.notes]
 command = "python3"
 args = ["-m", "my_notes_server"]
-env = { NOTES_DIR = "/srv/notes" }  # merged over the agent's environment
+env = { NOTES_DIR = "/srv/notes" }  # set here, on top of the minimal environment below
+# pass_env = ["NOTES_TOKEN"]        # carry these over from your own environment, by name
 # cwd = "/srv/notes"                # default: the project directory
 # timeout = 60
 # protocol_version = "2024-11-05"
@@ -76,6 +77,43 @@ args = ["-m", "my_notes_server"]
 ```
 
 ## Environment
+
+A server does **not** inherit your environment. It starts with the set in
+`picoagent/plugins/api.py` (`MINIMAL_ENV_NAMES`): `PATH`, `HOME`, the locale and timezone
+variables, a temp directory, and the Windows names a child cannot start without, `SystemRoot`
+among them, because Winsock loads its provider DLLs through it and a server that opens a socket
+without it fails naming a DLL. That is what a program needs to run. It is not what a program
+needs to spend your cloud account.
+
+The difference matters here more than anywhere else in picoagent. A server is long-lived, it
+starts before your first prompt, and the arguments it executes come from the model. Inheriting
+`os.environ` handed every one of them `AWS_SECRET_ACCESS_KEY`, `GH_TOKEN` and
+`PICOAGENT_API_KEY` at startup, with nothing to read in the session that said so.
+
+Two channels add to that set, both per server, both in your own config:
+
+| Key | Use it for |
+|---|---|
+| `env` | a value you are stating: `NOTES_DIR = "/srv/notes"` |
+| `pass_env` | a variable of yours the server needs by name: `pass_env = ["NOTES_TOKEN"]` |
+
+```toml
+[plugins.mcp.servers.tickets]
+command = "/usr/local/bin/ticket-mcp"
+args = ["--stdio"]
+pass_env = ["TICKET_API_TOKEN"]     # this server, this variable, nothing else
+```
+
+Both live inside a `servers` entry, and `servers` is read from your config only, never from a
+repository's `.picoagent/config.toml`. So a repository can no more widen what a server sees than
+it can choose what a server is. A repository that tries says so at session start, in the same
+notice that names every other key of its this plugin refused.
+
+If a server starts on your machine and not under picoagent, a missing variable is the first
+thing to check: `/mcp` reports the failure with the child's stderr, and a runtime complaining
+about a home directory or a locale is telling you which name to add. Containerised servers are
+the common case for `DOCKER_HOST`: rootless Docker, Colima and Podman all put the socket
+somewhere the default does not cover, and that name goes in `pass_env` like any other.
 
 `command` is run as a child process with a pipe, so anything that starts a server works. Prefer a
 container when you have the choice:
@@ -152,8 +190,12 @@ transport prescribes: close stdin, wait, then terminate, then kill.
 
 ## Trust
 
-An MCP server is a program that runs as you, and its tool descriptions go into your model's
-prompt, where they steer it. Reviewing it is not different from reviewing this plugin, which
+An MCP server is a program that runs as you, with the environment described above and no
+containment beyond it, and its tool descriptions go into your model's prompt, where they steer it.
+The minimal environment is worth what it is worth and no more: it stops a server being *handed*
+your keys at startup, and it does nothing to stop one that goes looking, since `HOME` is in the
+set and `~/.aws/credentials` is a file you can read. Run a server you have not reviewed in a
+container, which the `docker run -i` form above already shows. Reviewing it is not different from reviewing this plugin, which
 picoagent already makes you trust by fingerprint before it will load. The `permission-gate`
 plugin's confirmations apply to these tools as well, since they are ordinary registered tools.
 

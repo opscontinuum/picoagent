@@ -38,18 +38,29 @@ So trust follows **location, not configuration**:
   defensible direction: the run is unattended, and the entire value of the gate is a
   human reading the text before it reaches the model.
 
-``[plugins.rules]`` is not itself in ``USER_ONLY``, so a repository's ``config.toml`` can
-set ``dirs``. That is why configured directories are project-sourced whatever they point
-at. Treating a configured directory as user-level would hand the repository the one key
-it must not hold, and the ``USER_ONLY`` list would have been re-opened through a plugin.
+A repository's ``config.toml`` can name a directory in ``[plugins.rules].dirs``. That is
+why configured directories are project-sourced whatever they point at. Treating a
+configured directory as user-level would hand the repository the one key it must not
+hold, and the ``USER_ONLY`` list would have been re-opened through a plugin.
+
+``[plugins.<name>]`` tables no longer merge across the two config layers, so a
+repository's ``dirs`` reaches this plugin only because :func:`RuleEngine._discover` asks
+for it by name through ``from_project``. Asking is safe here in a way it is not for a
+plugin that takes an endpoint or a command from a repository, because naming a directory
+buys nothing on its own: every file found in it is fingerprinted, previewed and approved
+by a person before a byte of it reaches the model, and refused outright with no frontend
+to ask. The one thing a repository must not do is choose how much of the user's context
+window a turn spends, so ``max_rules_per_turn`` stays in the user layer and a repository
+that sets it is told at session start that it did nothing.
 
 The approval record lives in ``~/.picoagent/rules-trust.json``, next to ``trust.json``
 and for the same reason: a store the project can write is a store the project can forge.
 
 Configuration (``[plugins.rules]`` in config.toml)::
 
-    dirs = ["docs/rules"]     # extra directories, always gated as project-supplied
-    max_rules_per_turn = 4    # cap on how much guidance one turn may deliver
+    dirs = ["docs/rules"]     # extra directories, always gated as project-supplied;
+                              # a repository may add to this list, the user's own or not
+    max_rules_per_turn = 4    # cap on how much guidance one turn may deliver; user layer only
 """
 from __future__ import annotations
 
@@ -63,6 +74,7 @@ from pathlib import Path
 from typing import Any
 
 from picoagent.core.skills import parse_frontmatter
+from picoagent.core.tools import resolve_tool_path
 
 #: Rules the user wrote, relative to ``_user_dir``. The only ungated location there is.
 USER_RULES_DIR = "rules"
@@ -82,7 +94,11 @@ PATH_ARG_KEYS = ("path", "file", "file_path", "filename", "paths", "files")
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SHELL_SPLIT = re.compile(r"[\s;|&()<>\"']+")
-_LOOKS_LIKE_PATH = re.compile(r"^[\w.@+-]*(?:/[\w.@+-]*)+$|^[\w@+-][\w.@+-]*\.\w{1,8}$")
+#: ``~`` is in the first alternative because a token like ``~/notes.md`` is a path a person
+#: writes and :func:`resolve_tool_path` expands; dropping it here would keep it from ever
+#: reaching the seam. Only there: ``~`` leading a bare filename with no ``/`` is not a home
+#: reference, so the second alternative stays as it is.
+_LOOKS_LIKE_PATH = re.compile(r"^[\w.@~+-]*(?:/[\w.@~+-]*)+$|^[\w@+-][\w.@+-]*\.\w{1,8}$")
 _MAX_SHELL_TOKENS = 40
 
 INTRO = ("The following guidance applies to files touched in this turn. It is reference material "
@@ -255,11 +271,22 @@ class RuleEngine:
         self.declined: set[str] = set()      # rule keys refused this session; asked at most once
         self.pending: list[tuple[Rule, str]] = []
 
-    def _discover(self, settings: dict) -> list[Rule]:
-        """User rules first, then every project directory, deduplicated by resolved path."""
+    def _discover(self, settings: Any) -> list[Rule]:
+        """User rules first, then every project directory, deduplicated by resolved path.
+
+        ``dirs`` is read from both config layers, the user's own by dict access and the
+        repository's by name through ``from_project``. Naming it is what keeps a repository able
+        to say "our rules live in docs/rules", which this plugin was built to allow: a directory
+        is a place to look, not a decision, and the only decision, whether any of the text found
+        there enters the prompt, is still taken one file at a time by the person at the keyboard.
+
+        ``[]`` is the shape the repository's value must have, so ``dirs = "docs/rules"`` written
+        as a bare string is refused and reported rather than iterated character by character into
+        a list of one-letter paths.
+        """
         rules = load_rules(Path(self.api.config["_user_dir"]) / USER_RULES_DIR, "user")
         directories = [self.cwd / PROJECT_RULES_DIR]
-        for entry in settings.get("dirs", []) or []:
+        for entry in list(settings.get("dirs", []) or []) + settings.from_project("dirs", []):
             candidate = Path(entry).expanduser()
             directories.append(candidate if candidate.is_absolute() else self.cwd / candidate)
         seen: set[Path] = set()
@@ -286,7 +313,26 @@ class RuleEngine:
         should not be, because the model is mid-batch. Delivery therefore waits for
         :meth:`on_turn_end`. This handler always returns ``None``: a rules plugin that could
         block a tool call would be a permission system wearing the wrong name.
+
+        A ``delegated`` call is skipped, and that check has to be the first thing here. The
+        agents plugin runs a child agent in-process and re-emits the child's ``tool_call`` on the
+        parent's bus so the parent's gates still see it; this handler is on that bus but is not a
+        gate. Its half of the plugin writes ``self.pending`` and the other half runs at the
+        *parent's* ``turn_end``, so a child reading a file would spend the parent's
+        once-per-session delivery on it and inject the body into the parent's conversation, for a
+        file the parent never touched. The parent then reads that file itself and gets nothing,
+        because the rule is already marked delivered.
+
+        Skipping, not deferring: a rule is guidance for the conversation that touched the file,
+        and the child's conversation is not this one. The child gets no rule either, and that is
+        the honest state of things rather than a second bug - only ``tool_call`` is forwarded, so
+        this plugin has no channel into the child's stream at all. A child is given its whole task
+        in one prompt by the parent and cannot ask a follow-up, so guidance arriving mid-run has
+        far less to change there. If that stops being true, the fix is a rules engine of the
+        child's own on the child's bus, not this handler reaching across.
         """
+        if event.get("delegated"):
+            return None
         for relpath in self._paths_in(event.get("name", ""), event.get("args") or {}):
             for rule in self.rules:
                 if rule.key in self.delivered or rule.key in self.declined:
@@ -298,7 +344,7 @@ class RuleEngine:
                 current = self._current(rule)
                 if current is None or not current.matches(relpath):
                     continue
-                if await self._approved(current):
+                if await self._record_approval(current):
                     self.pending.append((current, relpath))
         return None
 
@@ -336,8 +382,15 @@ class RuleEngine:
         await self._notice(f"rules applied: {applied}")
 
     # ------------------------------------------------------------------ gate
-    async def _approved(self, rule: Rule) -> bool:
-        """Whether ``rule`` may be injected. The only place that answers yes for a project rule.
+    async def _record_approval(self, rule: Rule) -> bool:
+        """Settle whether ``rule`` may be injected, writing down the answer. Returns the answer.
+
+        Named for the writing rather than the answering. Reaching a decision here is what
+        *creates* the record: a yes calls :meth:`RuleTrust.trust`, which persists an approval to
+        ``rules-trust.json`` that outlives the session, and a no adds the rule to ``declined``,
+        which silences the prompt for the rest of it. A caller who read this as a question and
+        put it in a condition twice would have approved a rule on disk while believing they had
+        only asked about one.
 
         User rules are the user's own text and need no ceremony. Project rules need a live
         answer: trusted-and-unchanged passes, anything else asks, and a missing or
@@ -430,15 +483,22 @@ class RuleEngine:
         Keeping outside-the-project files rather than dropping them lets a user rule with a
         glob like ``*.py`` still fire on a sibling repository, while a project rule scoped to
         ``picoagent/**`` correctly does not.
+
+        Through :func:`resolve_tool_path`, which is what the tool about to run will use, rather
+        than resolving here. This did its own resolving and drifted from that seam exactly the
+        way the gates did: no ``@`` stripped, no ``~`` expanded, so ``@src/main.py`` stayed
+        ``@src/main.py`` and matched ``src/*.py`` against nothing while ``read`` opened the file
+        regardless. Nothing is bypassed by the difference - this handler blocks no call - but a
+        rule that silently does not fire is indistinguishable from a rule that did not apply.
+
+        ``refusal`` is ignored on purpose. It says the *tool* will not open the path, which is
+        the tool's decision to make and announce; a rule is guidance, and whether it matched is
+        a separate question from whether the read goes ahead. ``path`` is filled in either way.
         """
         text = candidate.strip().strip("'\"")
         if not text:
             return None
-        try:
-            path = Path(text)
-            absolute = (path if path.is_absolute() else self.cwd / path).resolve()
-        except (OSError, RuntimeError, ValueError):
-            return None
+        absolute = resolve_tool_path(text, self.api.config, self.cwd).path
         try:
             return absolute.relative_to(self.cwd).as_posix()
         except ValueError:
@@ -472,7 +532,7 @@ class RuleEngine:
         if rule is None:
             return f"'{name}' could not be read from disk"
         self.declined.discard(rule.key)
-        return f"'{name}' approved" if await self._approved(rule) else f"'{name}' not approved"
+        return f"'{name}' approved" if await self._record_approval(rule) else f"'{name}' not approved"
 
     # ------------------------------------------------------------------ helpers
     def _envelope(self, rule: Rule, relpath: str) -> str:
@@ -511,6 +571,7 @@ def _attr(text: str) -> str:
 
 
 def register(api: Any) -> None:
+    api.warn_about_project_config("dirs")
     engine = RuleEngine(api)
     api.on("tool_call", engine.on_tool_call)
     api.on("turn_end", engine.on_turn_end)

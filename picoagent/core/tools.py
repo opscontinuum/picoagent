@@ -20,6 +20,7 @@ import os
 import platform
 import signal
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -81,6 +82,29 @@ def truncate(text: str, max_bytes: int, max_lines: int, keep: str = "head") -> t
     return out, True
 
 
+def tool_result(ctx: ToolContext, text: str, is_error: bool = False, **details: Any) -> ToolResult:
+    """A tool's last line: cut ``text`` to the session's limits, say when it cut, and wrap it.
+
+    Reach for this at the end of every ``execute`` that returns text whose length something
+    other than the tool decides - a cluster's answer, a document, a search result. Unbounded
+    output is the fastest way to break a session, and the limits live in the config so a
+    deployment sets them once for every tool rather than each tool inventing a cap.
+
+    It takes ``ctx`` rather than the two limits because the result also carries
+    ``ctx.tool_call_id``: the id and the limits are the whole of what this needs, and they
+    arrive together. Keyword arguments become ``ToolResult.details``, which UIs and plugins
+    read and the model never sees, so structured facts about the call go there (``path=``,
+    ``exit_code=``) and ``text`` stays what the model is meant to read.
+
+    It keeps the *head*, which is right for a document or a listing. A tool whose output
+    matters at the end - a command's - calls :func:`truncate` with ``keep="tail"`` itself, the
+    way :class:`ShellTool` does, because it has a footer to add after the cut.
+    """
+    body, cut = truncate(text, ctx.config["tool_output_max_bytes"], ctx.config["tool_output_max_lines"])
+    return ToolResult(ctx.tool_call_id, body + ("\n[truncated]" if cut else ""), is_error=is_error,
+                      details=details)
+
+
 def spill_to_tempfile(text: str) -> str:
     """Write ``text`` to a temp file and return its path (so the model can grep the full output)."""
     with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="picoagent-", delete=False) as fh:
@@ -92,10 +116,89 @@ class PathRefused(Exception):
     """A model-supplied path fell outside the project while confinement was on."""
 
 
-def resolve_path(ctx: ToolContext, raw: str) -> Path:
-    """Turn a model-supplied path into an absolute one.
+@dataclass(frozen=True)
+class ResolvedPath:
+    """Which file a model-supplied path names, and whether a tool will open it.
 
-    Strips a leading ``@`` (some models copy it from ``@file`` mentions) and expands ``~``.
+    ``path`` is always absolute and always symlink-resolved: it is the file the OS reaches if
+    the call goes ahead, and it is filled in even when ``refusal`` says the tool will not make
+    that call. A guard asking "which file is this?" must never be handed ``None``, because
+    ``None`` reads as *no file here* - the same answer an unrelated argument gives - and a guard
+    that reads it that way lets the call through to a tool that then opens something.
+    """
+    path: Path
+    refusal: str | None = None
+
+
+def _project_root(config: dict, cwd: Path | None) -> Path:
+    """The directory a relative path is resolved against: the session's, not the process's.
+
+    They differ under ``-C``, and every path decision has to be taken against the same one, so
+    the fallback for a config nobody built with ``load_config`` is written once here.
+    """
+    return Path(cwd) if cwd is not None else Path(config.get("_cwd") or Path.cwd())
+
+
+def _model_path(raw: str) -> Path:
+    """What a model-supplied string names before it is joined to anything.
+
+    A leading ``@`` is stripped (models copy it from ``@file`` mentions) and ``~`` expanded.
+    Anything deciding *about* such a string - is it absolute? - has to ask here rather than of
+    the raw text, or it decides about a path nothing will open: ``@../..`` is not relative to
+    the tool that opens it, whatever ``Path("@../..").is_absolute()`` says.
+    """
+    return Path(os.path.expanduser(raw.lstrip("@")))
+
+
+def resolve_tool_path(raw: str, config: dict, cwd: Path | None = None) -> ResolvedPath:
+    """Where a model-supplied path lands: the seam a tool and a guard must both resolve through.
+
+    A ``tool_call`` guard decides about a path *before* the tool touches it, and the only way
+    that decision can be about the same file is for both to compute it here. Every guard that
+    resolved a path itself drifted from this function and the drift was a bypass: an unstripped
+    ``@`` prefix, a relative path resolved against the process directory rather than the
+    session's (they differ under ``-C``), a symlink nobody followed. See
+    docs/plugin-authoring.md, "Gating a path argument".
+
+    Guards have a runtime, not a :class:`ToolContext` - that is built per call inside the loop,
+    after the guards have already answered - so this takes the two things a runtime carries:
+    ``rt.cfg`` (the same dictionary the tool receives as ``ctx.config``) and, optionally, the
+    session directory. ``cwd`` defaults to the ``_cwd`` that ``load_config`` records, so
+    ``resolve_tool_path(raw, rt.cfg)`` is the whole call from a guard. It falls back to the
+    process directory only for a config nobody built with ``load_config``.
+
+    An expected failure is a value here, not an exception: guards outnumber tools and a guard
+    that has to wrap this in ``try`` is a guard that will one day catch the wrong thing, or
+    nothing. Tools keep the exception through :func:`resolve_path`.
+
+    Refused, for this function, means *the tool will not open this*: outside the project while
+    ``confine_to_project`` is on, or a path the OS cannot resolve at all (a symlink loop).
+    """
+    root = _project_root(config, cwd)
+    path = _model_path(raw)
+    absolute = path if path.is_absolute() else root / path
+    try:
+        # Non-strict resolve() follows every symlink component that exists and appends the rest,
+        # so a file that does not exist yet still names the real directory it would be created
+        # in. The textual normpath this replaced could not see a link, which is how a write
+        # through `repo-symlink/new-file` landed outside a project confinement was holding.
+        real, project = absolute.resolve(), root.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        # A symlink loop (RuntimeError on CPython, ELOOP elsewhere) or a path the OS will not
+        # parse. Nothing can be opened through it, so it is refused - and the caller still gets
+        # the best name available rather than a None it would read as "no file".
+        return ResolvedPath(Path(os.path.normpath(absolute)), f"{absolute} cannot be resolved: {exc}")
+    if config.get("confine_to_project") and real != project and project not in real.parents:
+        return ResolvedPath(real, f"{real} is outside the project ({project}) "
+                                  "and confine_to_project is on")
+    return ResolvedPath(real)
+
+
+def resolve_path(ctx: ToolContext, raw: str) -> Path:
+    """Turn a model-supplied path into the absolute path this tool will open.
+
+    Strips a leading ``@`` (some models copy it from ``@file`` mentions), expands ``~``, and
+    resolves symlinks, so what comes back is the file the OS actually reaches.
 
     By default any path resolves, including absolute ones and ``..`` traversal. That is not an
     oversight: a coding agent legitimately edits sibling repositories, ``~/.config``, and files
@@ -106,16 +209,63 @@ def resolve_path(ctx: ToolContext, raw: str) -> Path:
     Deployments that need the harder rule can set ``confine_to_project = true``, which refuses
     anything resolving outside ``ctx.cwd``. Off by default because turning it on breaks real
     workflows; available because some environments must have it.
+
+    This is :func:`resolve_tool_path` with the refusal raised instead of returned, because a
+    tool that forgets to check gets an exception the loop turns into an error result, while a
+    guard that forgets to check would silently allow. Same decision, taken in one place.
     """
-    path = Path(os.path.expanduser(raw.lstrip("@")))
-    resolved = (path if path.is_absolute() else ctx.cwd / path)
-    if not ctx.config.get("confine_to_project"):
+    resolved = resolve_tool_path(raw, ctx.config, ctx.cwd)
+    if resolved.refusal:
+        raise PathRefused(resolved.refusal)
+    return resolved.path
+
+
+def resolve_tool_path_inside_project(raw: str, config: dict, cwd: Path | None = None) -> ResolvedPath:
+    """:func:`resolve_tool_path`, with one more rule: a *relative* path must land in the project.
+
+    Two different rules, easily read as one:
+
+    * ``confine_to_project`` is the security boundary. It is off by default, it applies to every
+      spelling of a path, and :func:`resolve_tool_path` enforces it.
+    * This adds a **usability** rule on top, for a tool whose path argument is normally the
+      model's own construction: a relative path that climbs out of the project (``../..``, or a
+      symlink that leads there) is refused, while an absolute one is allowed. An absolute path
+      is a place someone named on purpose - the sibling repository, the terraform tree next
+      door - and a tool that refused it would be unusable for the work it exists for.
+
+    It is not a security boundary and must not be sold as one: anything that can write ``../..``
+    can write ``/etc``, so this stops a mistake, not an attacker. What stops an attacker is
+    ``confine_to_project``, and that is still the rule underneath.
+
+    The escape is judged on the *resolved* path, after ``@`` stripping, ``~`` expansion and
+    symlink following, because those are what decide which file gets opened. One of the two
+    plugin copies this replaces judged it on the text instead, and was wrong twice for it:
+    ``@../..`` passed where ``../..`` did not, and a symlink inside the project pointing out of
+    it passed as a child of it.
+    """
+    resolved = resolve_tool_path(raw, config, cwd)
+    if resolved.refusal or _model_path(raw).is_absolute():
         return resolved
-    root = ctx.cwd.resolve()
-    candidate = resolved.resolve() if resolved.exists() else Path(os.path.normpath(resolved))
-    if candidate != root and root not in candidate.parents:
-        raise PathRefused(f"{candidate} is outside the project ({root}) and confine_to_project is on")
-    return candidate
+    root = _project_root(config, cwd).resolve()
+    if resolved.path == root or root in resolved.path.parents:
+        return resolved
+    return ResolvedPath(resolved.path,
+                        f"{raw!r} resolves to {resolved.path}, which is outside the project "
+                        f"directory ({root}); pass an absolute path if you meant to go there")
+
+
+def resolve_path_inside_project(ctx: ToolContext, raw: str) -> Path:
+    """:func:`resolve_tool_path_inside_project` with the refusal raised instead of returned.
+
+    The same split as :func:`resolve_path` and for the same reason: a tool that forgets to check
+    gets an exception the loop turns into an error result, while a guard that forgets to check
+    would silently allow. Catch :class:`PathRefused` at the call site and return it as an error
+    result - a refused path is an expected failure, not a bug.
+    """
+    resolved = resolve_tool_path_inside_project(raw, ctx.config, ctx.cwd)
+    if resolved.refusal:
+        raise PathRefused(resolved.refusal)
+    return resolved.path
 
 
 _file_locks: dict[str, asyncio.Lock] = {}
@@ -143,6 +293,13 @@ class ReadTool:
         "limit": {"type": "integer", "description": "number of lines"}}, "required": ["path"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        """Resolve the path, then hand it to whichever of the two jobs this tool does.
+
+        One tool, two operations, because that is what a model reaching for ``read`` wants: it
+        does not know yet whether the path it copied out of an error message is a file or the
+        directory above it, and making it guess costs a wasted turn. They share the path
+        resolution and nothing else, so each has its own function below.
+        """
         try:
             path = resolve_path(ctx, args["path"])
         except PathRefused as exc:
@@ -150,8 +307,22 @@ class ReadTool:
         if not path.exists():
             return ToolResult(ctx.tool_call_id, f"File not found: {path}", is_error=True)
         if path.is_dir():
-            listing = sorted(f"{p.name}/" if p.is_dir() else p.name for p in path.iterdir())
-            return ToolResult(ctx.tool_call_id, "\n".join(listing) or "(empty directory)")
+            return self._listing(path, ctx)
+        return self._window(path, args, ctx)
+
+    @staticmethod
+    def _listing(path: Path, ctx: ToolContext) -> ToolResult:
+        """A directory: its entries by name, subdirectories marked with a trailing slash."""
+        listing = sorted(f"{p.name}/" if p.is_dir() else p.name for p in path.iterdir())
+        return ToolResult(ctx.tool_call_id, "\n".join(listing) or "(empty directory)")
+
+    @staticmethod
+    def _window(path: Path, args: dict, ctx: ToolContext) -> ToolResult:
+        """A file: the ``offset``/``limit`` window, numbered, cut to the output limits.
+
+        The line numbers count from the file's first line, not the window's, so a number the
+        model reads here is the one it can pass back as ``offset`` or quote in an ``edit``.
+        """
         try:
             lines = path.read_text(errors="replace").splitlines()
         except OSError as exc:
@@ -219,6 +390,102 @@ def is_windows() -> bool:
     return platform.system() == "Windows"
 
 
+def own_process_group() -> dict[str, Any]:
+    """The spawn keyword that makes a child lead a process group of its own, per platform.
+
+    Every child :func:`kill_process_tree` may be asked to end must be spawned with this. The
+    kill signals the *group*, which is how it reaches the grandchildren a shell started; a
+    child left in picoagent's own group would make ``os.killpg`` signal picoagent instead,
+    and the terminal it was started from with it.
+    """
+    if is_windows():
+        import subprocess  # local: CREATE_NEW_PROCESS_GROUP only exists on the Windows build
+        # getattr, not a direct attribute access: the constant is only defined by the subprocess
+        # module when the *real* interpreter is Windows, independent of the is_windows() check
+        # above - this keeps the branch exercisable by mocking is_windows() in tests on any OS.
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+#: Environment variables a model-composed command is allowed to see.
+#:
+#: The built-in shell used to hand every command ``{**os.environ, "PICOAGENT": "1"}``, so ``env``
+#: - one of the first things a model runs when it wants to know where it is - returned the user's
+#: API keys as a tool result. Every tool result is appended to the session log and replayed to the
+#: model on the next turn, so one such command wrote a credential to a file on disk and put it in
+#: the next prompt. DISA ASD V6R4 records that as V-222444 (sensitive data in the application
+#: logs); making the log owner-only answered who may read it, not what is in it.
+#:
+#: An allowlist rather than a denylist of secret-shaped names, because a denylist can never be
+#: complete: ``OPENROUTER_KEY``, ``GH_PAT``, ``PRIVATE_KEY``, ``AWS_ACCESS_KEY_ID`` and
+#: ``DATABASE_URL`` all sail through one, and the site that invented the name is the site whose
+#: key leaks. Everything here is a path, a locale, a terminal setting or an identity the command
+#: could ask the operating system for anyway - nothing here carries a secret, which is the
+#: property to preserve when adding to it.
+#:
+#: The list is what an ordinary build needs and no wider: ``npm test``, ``cargo build``,
+#: ``pytest`` and ``git`` all want ``PATH`` and ``HOME``, and each toolchain wants the variable
+#: saying where it was installed. Deliberately absent, each because the value is a credential or
+#: carries one: ``PICOAGENT_API_KEY`` and ``OPENAI_API_KEY`` (the documented way to supply the
+#: model key - see ``provider.py``), ``SSH_AUTH_SOCK`` (a live agent socket), ``HTTP_PROXY`` and
+#: ``HTTPS_PROXY`` (routinely ``http://user:pass@proxy``), and every ``AWS_``/``GH_``/
+#: ``GITHUB_``/``NPM_`` variable. A site that needs one of those in a command names it in
+#: ``shell_env_allow``, which is a decision with somebody's name on it.
+SHELL_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    # POSIX: where things are, who you are, and how to print
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
+    "TMPDIR", "PWD", "DISPLAY",
+    # Windows: the equivalents, plus what its shell needs to resolve a command at all
+    "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA",
+    "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "SYSTEMDRIVE",
+    "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE", "USERNAME", "COMPUTERNAME",
+    # The interpreter's own variables: these decide which Python runs and what it imports, and
+    # picoagent is a Python harness whose commands run `python` and `pip` constantly. Stripping
+    # them makes the tool's interpreter quietly disagree with the user's terminal.
+    "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV",
+})
+# An entry earns its place by being *needed* - by this interpreter, or for a default install of
+# a toolchain to run at all - not by being harmless. "It is only a path" is a denylist judgment
+# in allowlist clothing: it re-opens per-name secret-or-not classification, which is the failure
+# an allowlist exists to end. GOPATH, CARGO_HOME, JAVA_HOME, NVM_DIR and the rest were here once
+# on that argument; every one is only load-bearing for a relocated toolchain, whose owner names
+# it in `shell_env_allow` (USER_ONLY) and gets exactly what they asked for.
+
+#: The one value of ``shell_env`` that passes the whole environment through. Only this exact
+#: string opens the door, so a typo, a value of the wrong type, and a value that arrived from
+#: somewhere unexpected all fail closed onto the allowlist.
+SHELL_ENV_INHERIT = "inherit"
+
+
+def shell_env(base_env: Mapping[str, str], config: Mapping[str, Any]) -> dict[str, str]:
+    """The environment a model-composed command runs with, plus the ``PICOAGENT`` marker.
+
+    ``config["shell_env"]`` is ``"allowlist"`` - the default, and the answer for any value this
+    does not recognise - or ``"inherit"``, which passes the whole environment through for the
+    user who genuinely wants that. A config that has never heard of the setting gets the safe
+    one, so an embedder assembling a config dict by hand is covered too.
+
+    ``config["shell_env_allow"]`` adds names to :data:`SHELL_ENV_ALLOWLIST`, matched
+    case-insensitively like the list itself. Its shape is checked here rather than trusted: this
+    runs on whatever the config layering produced, and a ``TypeError`` raised inside a tool is a
+    failure the model is told about and the user is not. A value that is not a list of strings
+    names no variable, so it adds none.
+
+    Both settings are in :data:`picoagent.core.config.USER_ONLY`. A cloned repository naming
+    ``DATABASE_URL`` here would put it in the environment of the first command the model ran,
+    which is the hole ``[plugins.credential-guard] extra_allow_env`` was closed for.
+    """
+    if config.get("shell_env") == SHELL_ENV_INHERIT:
+        return {**base_env, "PICOAGENT": "1"}
+    extra = config.get("shell_env_allow")
+    named = ({name.upper() for name in extra if isinstance(name, str)}
+             if isinstance(extra, list) else set())
+    allowed = SHELL_ENV_ALLOWLIST | named
+    env = {name: value for name, value in base_env.items() if name.upper() in allowed}
+    env["PICOAGENT"] = "1"
+    return env
+
+
 async def spawn_shell(command: str, cwd: Path, env: dict) -> asyncio.subprocess.Process:
     """Start ``command`` in the platform's real shell: PowerShell on Windows, ``/bin/sh``
     elsewhere. ``cmd.exe`` (the default for ``create_subprocess_shell`` on Windows) doesn't
@@ -226,29 +493,67 @@ async def spawn_shell(command: str, cwd: Path, env: dict) -> asyncio.subprocess.
     explicit PowerShell invocation rather than the plain cross-platform shell call.
     """
     if is_windows():
-        import subprocess  # local: CREATE_NEW_PROCESS_GROUP only exists on the Windows build
-        # getattr, not a direct attribute access: the constant is only defined by the subprocess
-        # module when the *real* interpreter is Windows, independent of the is_windows() check
-        # above - this keeps the branch exercisable by mocking is_windows() in tests on any OS.
-        creation_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         return await asyncio.create_subprocess_exec(
             "powershell", "-NoProfile", "-NonInteractive", "-Command", command, cwd=cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env,
-            creationflags=creation_flags,  # lets kill_process_tree reach the whole tree
+            **own_process_group(),
         )
     return await asyncio.create_subprocess_shell(
         command, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        env=env, start_new_session=True,  # own process group so we can kill children on timeout
+        env=env, **own_process_group(),
     )
 
 
-async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
-    """Kill the whole process tree and reap it, so a timed-out command can't leak children.
+#: How long a killed tree gets to actually go, before it is left un-reaped and reported. Only a
+#: process the kernel cannot interrupt reaches this, and the caller still has to answer somebody.
+_REAP_TIMEOUT = 5.0
 
-    POSIX: SIGKILL the process group ``start_new_session`` made ``proc`` the leader of.
-    Windows: process groups work differently and there's no ``os.killpg`` at all, so this
+
+def _signal_group(proc: asyncio.subprocess.Process, sig: int) -> bool:
+    """Send ``sig`` to the group ``proc`` leads; ``False`` if the group is already gone.
+
+    The answer is what tells an escalation apart from a pointless second signal: a tree that
+    has left needs no SIGKILL, and asking again would only race a reused pid.
+    """
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _exited(proc: asyncio.subprocess.Process, seconds: float) -> bool:
+    """Wait up to ``seconds`` for ``proc`` to exit *and be reaped*; ``False`` if it is still there."""
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
+async def kill_process_tree(proc: asyncio.subprocess.Process, grace: float = 0.0) -> None:
+    """End the whole process tree and reap it, so a timed-out command can't leak children.
+
+    ``proc`` must have been spawned with :func:`own_process_group`, because the signals go to
+    the group: killing the direct child alone reparents its own children to init, where nothing
+    in this session can see or stop them.
+
+    POSIX: signal the process group ``start_new_session`` made ``proc`` the leader of - SIGKILL,
+    or SIGTERM first when ``grace`` asks for it. Windows: process groups work differently and there's no ``os.killpg`` at all, so this
     shells out to ``taskkill /T`` (kill the tree) instead - the standard way to do this from
     pure stdlib on Windows.
+
+    ``grace`` seconds, on POSIX, buys the tree a SIGTERM first, and SIGKILL follows only if it
+    is still there afterwards: a child holding a lock or half a written file gets its chance to
+    undo that, and a child that ignores SIGTERM still does not survive. Windows is offered no
+    such choice because it has none to make - ``TerminateProcess`` is what both ``terminate()``
+    and ``kill()`` call there, and ``taskkill`` without ``/F`` posts ``WM_CLOSE``, which a
+    console child has no message loop to receive.
+
+    The reap is bounded by :data:`_REAP_TIMEOUT` rather than awaited forever. A process wedged in
+    an uninterruptible kernel wait outlives SIGKILL itself, and the caller - a tool result, a
+    plugin's ``api.exec`` - has to answer somebody. One warned-about un-reaped child beats a
+    session that never returns.
     """
     if is_windows():
         killer = await asyncio.create_subprocess_exec(
@@ -256,14 +561,11 @@ async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await killer.wait()
     else:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except asyncio.TimeoutError:
-        log.warning("timed-out command did not exit after being killed")
+        asked = grace > 0 and _signal_group(proc, signal.SIGTERM)
+        if not (asked and await _exited(proc, grace)):
+            _signal_group(proc, signal.SIGKILL)
+    if proc.returncode is None and not await _exited(proc, _REAP_TIMEOUT):
+        log.warning("process %s did not exit after being killed; leaving it un-reaped", proc.pid)
 
 
 class ShellTool:
@@ -273,19 +575,27 @@ class ShellTool:
     Windows (auto-detected via ``platform.system()``) - not the same dialect everywhere, so
     the model should write commands appropriate to what it's told the platform is (see the
     ``env`` system-prompt section).
+
+    The command sees :func:`shell_env`, not the user's whole environment. The description says
+    so, because a variable that is simply absent looks to a model like a variable set to the
+    empty string, and it will otherwise report the build as broken rather than say what it
+    could not see.
     """
     name = "shell"
     description = ("Run a shell command in the project directory (bash/sh on Linux and macOS, "
                    "PowerShell on Windows - detected automatically, not the same dialect on both). "
                    "Returns stdout+stderr and exit code. Use timeout (seconds) for long commands. "
                    "Output is truncated at 50KB / 2000 lines (the full output is saved to a temp "
-                   "file whose path is reported).")
+                   "file whose path is reported). The environment is an allowlist - PATH, HOME, "
+                   "locale and the Python toolchain paths - so API keys, tokens and other credentials the "
+                   "user exported are not visible to the command, by design. If one is genuinely "
+                   "needed, say which variable it is instead of trying to read it.")
     parameters = {"type": "object", "properties": {"command": {"type": "string"},
                   "timeout": {"type": "integer"}}, "required": ["command"]}
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         timeout = int(args.get("timeout") or ctx.config["shell_timeout"])
-        proc = await spawn_shell(args["command"], ctx.cwd, {**os.environ, "PICOAGENT": "1"})
+        proc = await spawn_shell(args["command"], ctx.cwd, shell_env(os.environ, ctx.config))
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:

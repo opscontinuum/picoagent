@@ -7,7 +7,9 @@ and repeats; everything else attaches to that loop through events.
 
 Diagrams for everything below live in [engineering/](engineering/): module dependencies and
 the override model, the request lifecycle, the data model, and the plugin trust flow. Security
-boundaries are in [security/trust-boundaries.md](security/trust-boundaries.md).
+boundaries are in [security/trust-boundaries.md](security/trust-boundaries.md), and the threats
+against them, ranked, in [security/threat-model.md](security/threat-model.md) - whose component
+table is written against the module list below and has to keep matching it.
 
 ## The pieces
 
@@ -24,6 +26,7 @@ picoagent/
     commands.py          slash-command registry
     events.py            the event bus
     config.py            layered TOML config
+    text.py              untrusted text made safe to show a person
     types.py             dataclasses shared by everything
   plugins/
     api.py               PluginAPI - the only thing plugins import
@@ -93,6 +96,15 @@ Each JSONL entry has an `id` and a `parent`. `Session.leaf` points at the newest
 appending creates a branch. Compaction is just another entry that says "when building the
 model context, replace everything before entry X with this summary". Nothing is ever
 deleted, so undo/rewind/tree UIs are plugin work on top of this file.
+
+A session that leaves by its own exit path appends one last `shutdown` entry, so a reader can
+tell a finished session from one that was killed - the killed one has no such entry, and that
+absence is the only signal there is. Readers select the kinds they care about, so an entry kind
+they do not know is skipped rather than fatal.
+
+The file is the whole conversation, so it is created `0600` inside `0700` directories on POSIX,
+by the `open` call that creates it rather than by a later `chmod`. Windows gets no protection
+from that - see T23 in [the threat model](security/threat-model.md).
 
 ## Providers
 

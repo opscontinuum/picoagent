@@ -19,11 +19,10 @@ incoming commits before accepting. Upgrading and trusting are separate acts.
 """
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .loader import checkout_name, parse_spec, plugins_dir
+from .loader import checkout_name, git_output, is_git_spec, parse_spec, plugins_dir
 
 
 @dataclass
@@ -53,23 +52,13 @@ class Status:
         return f"{self.name}: {count} ({self.local[:8]} -> {self.remote[:8]})"
 
 
-def _git(root: Path | None, *args: str, timeout: int = 30) -> str | None:
-    """Run git, returning stdout or ``None`` on any failure. Never raises."""
-    command = ["git"] + (["-C", str(root)] if root else []) + list(args)
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() if result.returncode == 0 else None
-
-
 def remote_commit(url: str, ref: str = "") -> str | None:
     """The commit a remote ref points at, via ``git ls-remote``. Works on any git host.
 
     With no ref this asks for HEAD, which is the remote's default branch - so a spec that
     doesn't pin a branch still gets a meaningful answer.
     """
-    output = _git(None, "ls-remote", url, ref or "HEAD")
+    output = git_output(None, "ls-remote", url, ref or "HEAD")
     if not output:
         return None
     # ls-remote can return several matching refs (a tag and its ^{} peel, say); the first
@@ -78,7 +67,7 @@ def remote_commit(url: str, ref: str = "") -> str | None:
 
 
 def local_commit(root: Path) -> str | None:
-    return _git(root, "rev-parse", "HEAD")
+    return git_output(root, "rev-parse", "HEAD")
 
 
 def commits_behind(root: Path, remote: str) -> int:
@@ -87,7 +76,7 @@ def commits_behind(root: Path, remote: str) -> int:
     The remote commit has to be present in the object store to be counted, which it is after
     a fetch and is not before one. An uncountable answer is reported as 0 rather than guessed.
     """
-    output = _git(root, "rev-list", "--count", f"HEAD..{remote}")
+    output = git_output(root, "rev-list", "--count", f"HEAD..{remote}")
     return int(output) if output and output.isdigit() else 0
 
 
@@ -109,7 +98,7 @@ def check_plugins(cfg: dict) -> list[Status]:
     rewrites = cfg.get("plugins", {}).get("rewrite") or {}
     results = []
     for spec in cfg["plugins"]["enabled"]:
-        if not spec.startswith(("git:", "http://", "https://", "git@", "ssh://", "file://")):
+        if not is_git_spec(spec):
             continue                      # a local path; nothing to compare it against
         url, ref = parse_spec(spec, rewrites)
         name = checkout_name(url)
@@ -159,13 +148,13 @@ def upgrade(status: Status) -> tuple[bool, str]:
     if not status.outdated:
         return False, f"{status.name} is already up to date"
 
-    dirty = _git(status.root, "status", "--porcelain")
+    dirty = git_output(status.root, "status", "--porcelain")
     if dirty:
         return False, f"{status.name} has uncommitted changes; not touching it"
 
-    if _git(status.root, "fetch", "--tags", "-q") is None:
+    if git_output(status.root, "fetch", "--tags", "-q") is None:
         return False, f"{status.name}: fetch failed"
-    if _git(status.root, "merge", "--ff-only", status.remote) is None:
+    if git_output(status.root, "merge", "--ff-only", status.remote) is None:
         return False, (f"{status.name}: cannot fast-forward (the checkout has diverged from "
                        f"the remote); resolve it by hand")
     return True, (f"{status.name}: {status.local[:8]} -> {status.remote[:8]}. It will load as "

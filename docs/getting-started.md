@@ -11,18 +11,37 @@ behaviour comes from plugins you choose.
   a local Ollama / vLLM / llama.cpp / LM Studio, OpenRouter, or a company gateway.
   (Gemini on Vertex AI and xAI Grok are covered by the example plugins.)
 
-## Install
+## Run it
+
+There is no install step. Clone the repository and run the module:
 
 ```bash
 git clone <your fork> picoagent && cd picoagent
+python3 -m picoagent
+```
+
+That is the whole thing. Zero third-party dependencies means nothing has to be resolved,
+downloaded or built, so there is no virtualenv to create and no package manager to satisfy -
+and nothing that a locked-down machine can refuse. From any other directory, point Python at
+the checkout:
+
+```bash
+PYTHONPATH=/path/to/picoagent python3 -m picoagent
+```
+
+## Installing, if you want the shorter command
+
+Installing buys one thing: a `picoagent` command on your `$PATH` instead of
+`python3 -m picoagent`. It changes nothing about how the agent behaves. If you want it:
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .            # registers the `picoagent` command
 ```
 
-With the venv active, `picoagent` is on your PATH. Without activating it, run
-`.venv/bin/picoagent` instead. There is nothing to download here: the package has no
-third-party dependencies, so the venv stays small and the install finishes in a second.
+With the venv active, `picoagent` is on your PATH; without activating it, run
+`.venv/bin/picoagent`.
 
 ### If pip says `externally-managed-environment`
 
@@ -33,12 +52,15 @@ externally managed (PEP 668), so pip refuses to install into it:
 error: externally-managed-environment
 ```
 
-The venv above is the fix, and it is why these instructions start with one.
+The venv above is one answer. The better one, if you hit this, is to skip installing
+altogether and use `python3 -m picoagent` - the error is telling you the machine does not
+want packages written into its Python, and this package does not need to be.
 
 ### If `python3 -m venv` fails
 
-On Debian and Ubuntu the venv module ships in a separate package, so creating the venv
-can fail before you ever get to pip:
+Same answer as above: `python3 -m picoagent` needs no venv at all. If you want one anyway,
+on Debian and Ubuntu the venv module ships in a separate package, so creating it can fail
+before you ever get to pip:
 
 ```bash
 sudo apt install python3-venv    # or python3-full, which the pip error suggests
@@ -66,8 +88,10 @@ Older pipx versions want `--force` to reinstall over an existing copy:
 
 `pip install -e . --break-system-packages` overrides the PEP 668 refusal. It writes into
 the Python your operating system depends on, where it can shadow or overwrite
-distro-installed packages and break system tools that rely on them. A venv or pipx costs
-one extra line and carries none of that risk.
+distro-installed packages and break system tools that rely on them. Nothing here is worth
+that: `python3 -m picoagent` gets you the same agent with no install at all, and a venv or
+pipx gets you the shorter command for one extra line. This flag is documented so you
+recognise it as the wrong answer when a search result offers it.
 
 ## Point it at a model
 
@@ -89,6 +113,19 @@ base_url = "http://localhost:11434/v1"
 api_key = ""
 ```
 
+That file can hold a key, so picoagent makes it readable only by your account the first time it
+reads it, and prints a line on stderr saying so. Same for `~/.picoagent/endpoints/*.toml`. It
+only ever removes access, never grants it, and it does not touch a project's own
+`.picoagent/config.toml`. On Windows this does nothing — mode bits are not access control there;
+restrict `%USERPROFILE%\.picoagent` with `icacls` instead.
+
+Note that the key in `PICOAGENT_API_KEY`, or in this file, is **not** visible to commands the
+model runs. The `shell` tool passes an allowlist of environment variables — `PATH`, `HOME`, the
+locale, toolchain paths — so builds and tests work while `env` returns nothing worth stealing.
+Every tool result is written to the session log and replayed to the model, so a key that reached
+a command would be in both. If one of your commands needs a specific variable, add
+`shell_env_allow = ["THE_NAME"]`; `shell_env = "inherit"` passes everything, if you want that.
+
 ## First session
 
 ```bash
@@ -109,7 +146,10 @@ You get a prompt. Type what you want done. Useful things to know:
 | `/exit` or Ctrl-D | leaves |
 
 Sessions are saved as JSONL under `~/.picoagent/sessions/<project>/`. Resume the last one with
-`picoagent -r`.
+`picoagent -r`. The folder is named after the project path with a short digest of it on the end:
+the readable part is for you, and the digest is what stops two projects whose paths flatten to
+the same name from sharing a folder and resuming each other's history. Folders created before
+the digest existed keep their old name and go on being used.
 
 ## Scripting
 
@@ -120,6 +160,17 @@ echo "summarise this" | picoagent -p -                         # prompt from std
 ```
 
 `--json` gives you every tool call and result, which is handy for CI logs.
+
+The exit code says how the run went, so a script does not have to read the output to find out:
+
+| Code | Meaning |
+|---|---|
+| 0 | the run finished. An empty answer counts: a model with nothing to add has answered |
+| 1 | any other failure, including a `-r` path picoagent refused to append to |
+| 2 | the command line was wrong (argparse) |
+| 3 | a plugin you approved is not running, and the session did not start |
+| 4 | a config file could not be read, so no plugin decision was made at all |
+| 5 | the session started, but a turn got no answer and nothing retried it - a key, a URL or the network. A retry that then answered is not this; a follow-up answering after the prompt failed does not undo it |
 
 ## Adding behaviour
 

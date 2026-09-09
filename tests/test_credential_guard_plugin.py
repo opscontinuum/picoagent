@@ -3,13 +3,13 @@ import asyncio
 import os
 import stat
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
+from picoagent.core.tools import SHELL_ENV_ALLOWLIST
 from picoagent.plugins import loader
 
 sys.path.insert(0, str(ROOT / "examples/plugins/credential-guard"))
@@ -24,7 +24,7 @@ def load(rt, name="credential-guard"):
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.path = cg.credentials_path(self.tmp)
 
     def test_missing_file_reads_as_empty(self):
@@ -107,7 +107,7 @@ class SanitizedEnvTests(unittest.TestCase):
         self.assertEqual(out, {"PATH": "/usr/bin"})
 
     def test_toolchain_paths_still_get_through(self):
-        env = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv", "JAVA_HOME": "/jdk", "PYTHONPATH": "/src"}
+        env = {"PATH": "/usr/bin", "VIRTUAL_ENV": "/venv", "PYTHONHOME": "/py", "PYTHONPATH": "/src"}
         self.assertEqual(cg.sanitized_env(env), env)
 
     def test_extra_allow_lets_a_project_opt_a_name_back_in(self):
@@ -118,9 +118,23 @@ class SanitizedEnvTests(unittest.TestCase):
         out = cg.sanitized_env({"MY_API_KEY": "x", "PATH": "/usr/bin"}, extra_allow=["MY_API_KEY"])
         self.assertEqual(out, {"PATH": "/usr/bin"})
 
-    def test_picoagent_settings_pass_but_its_api_key_does_not(self):
-        out = cg.sanitized_env({"PICOAGENT_MODEL": "m", "PICOAGENT_API_KEY": "k", "PATH": "/usr/bin"})
-        self.assertEqual(out, {"PICOAGENT_MODEL": "m", "PATH": "/usr/bin"})
+    def test_picoagents_own_settings_are_not_a_hole_in_the_allowlist(self):
+        """Every ``PICOAGENT_*`` name used to pass unless a deny pattern caught it.
+
+        That passthrough was this plugin's own argument turned around: the deny patterns look
+        for ``api_key``, not ``key``, so ``PICOAGENT_OPENROUTER_KEY`` matched nothing and went
+        to the command. A passthrough that is only safe because a denylist is complete is the
+        thing the allowlist exists instead of. ``PICOAGENT=1`` is still set by the tool, which
+        is what a command needs to know it is running under the agent.
+        """
+        out = cg.sanitized_env({"PICOAGENT_MODEL": "m", "PICOAGENT_API_KEY": "k",
+                                "PICOAGENT_OPENROUTER_KEY": "sk-x", "PATH": "/usr/bin"})
+        self.assertEqual(out, {"PATH": "/usr/bin"})
+
+    def test_the_allowlist_is_the_one_core_applies(self):
+        """One list, so the plugin and the built-in shell cannot disagree about what is safe."""
+        self.assertIs(cg._ALLOWED_ENV, SHELL_ENV_ALLOWLIST)
+
 
 
 class InlineKeyWarningTests(unittest.TestCase):
@@ -137,35 +151,57 @@ class GuardedShellToolTests(unittest.TestCase):
         os.environ["PICOAGENT_TEST_API_KEY"] = "totally-secret"
         try:
             tool = cg.GuardedShellTool()
-            ctx = _ctx(Path(tempfile.mkdtemp()))
+            ctx = _ctx(temp_dir())
             result = run(tool.execute({"command": "echo $PICOAGENT_TEST_API_KEY"}, ctx))
             self.assertNotIn("totally-secret", result.content)
         finally:
             del os.environ["PICOAGENT_TEST_API_KEY"]
 
+    def test_a_variable_the_user_named_in_their_own_config_still_reaches_the_command(self):
+        """Core reads ``shell_env_allow``; installing this plugin must not silently un-fix a build."""
+        os.environ["ACME_BUILD_FLAG"] = "on"
+        self.addCleanup(os.environ.pop, "ACME_BUILD_FLAG", None)
+        result = run(cg.GuardedShellTool().execute(
+            {"command": "echo flag=$ACME_BUILD_FLAG"},
+            _ctx(temp_dir(), shell_env_allow=["ACME_BUILD_FLAG"])))
+        self.assertIn("flag=on", result.content)
+
     def test_ordinary_command_still_works(self):
         tool = cg.GuardedShellTool()
-        ctx = _ctx(Path(tempfile.mkdtemp()))
+        ctx = _ctx(temp_dir())
         result = run(tool.execute({"command": "echo hello"}, ctx))
         self.assertIn("hello", result.content)
         self.assertFalse(result.is_error)
 
     def test_timeout_is_reported_and_does_not_hang(self):
         tool = cg.GuardedShellTool()
-        ctx = _ctx(Path(tempfile.mkdtemp()))
+        ctx = _ctx(temp_dir())
         result = run(tool.execute({"command": "sleep 5", "timeout": 1}, ctx))
         self.assertTrue(result.is_error)
         self.assertIn("timed out", result.content)
 
+    def test_truncation_honours_the_sessions_limits_and_keeps_the_tail(self):
+        """The tool carried its own hardcoded 50_000-byte cap with no line cap, so a deployment
+        that tuned tool_output_max_bytes/lines got core's limits from the built-in shell and
+        this plugin's private ones the moment they installed the guard."""
+        result = run(cg.GuardedShellTool().execute(
+            {"command": "seq 1 100"}, _ctx(temp_dir(), tool_output_max_lines=5)))
+        self.assertIn("100", result.content)
+        self.assertNotIn("\n50\n", result.content)
+        self.assertIn("[output truncated; full output:", result.content)
+        self.assertIn("[exit code 0]", result.content)
 
-def _ctx(tmp: Path):
+
+def _ctx(tmp: Path, **config):
     from picoagent.core.tools import ToolContext
-    return ToolContext(cwd=tmp, config={"shell_timeout": 10}, tool_call_id="t1", abort=asyncio.Event())
+    return ToolContext(cwd=tmp, config={"shell_timeout": 10, "tool_output_max_bytes": 50_000,
+                                        "tool_output_max_lines": 2000, **config},
+                       tool_call_id="t1", abort=asyncio.Event())
 
 
 class ToolCallGuardTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.creds_path = cg.credentials_path(self.tmp)
         cg.write_credential(self.creds_path, "openai", "sk-secret")
 
@@ -212,7 +248,7 @@ class ToolCallGuardTests(unittest.TestCase):
         self.assertTrue(result and result.get("block"))
 
     def test_grep_search_on_an_unrelated_directory_is_still_allowed(self):
-        elsewhere = Path(tempfile.mkdtemp())
+        elsewhere = temp_dir()
         result = run(cg.guard_tool_call({"name": "grep_search", "args": {"path": str(elsewhere)}}, self._rt()))
         self.assertIsNone(result)
 
@@ -261,7 +297,7 @@ class ToolCallGuardTests(unittest.TestCase):
 
 class SecretsCommandTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _rt(self):
         return make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
@@ -304,7 +340,7 @@ class SecretsCommandTests(unittest.TestCase):
 
 class PluginIntegrationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_shell_tool_is_overridden_and_secrets_command_registered(self):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
@@ -345,8 +381,6 @@ class _DummyOpenAI:
         yield  # pragma: no cover - never reached, keeps this an async generator
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ArgumentNameCoverageTests(unittest.TestCase):
@@ -358,7 +392,7 @@ class ArgumentNameCoverageTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.creds = cg.credentials_path(self.tmp)
         self.creds.parent.mkdir(parents=True, exist_ok=True)
         cg.write_credential(self.creds, "openai", "sk-secret")
@@ -392,3 +426,7 @@ class ArgumentNameCoverageTests(unittest.TestCase):
         """Arguments are model output: ints, bools, dicts and None must not crash the guard."""
         self.assertIsNone(self.guard("t", {"n": 5, "ok": True, "d": {"a": 1}, "z": None,
                                            "items": [1, 2, None]}))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -54,8 +54,16 @@ class Compactor:
         self.threshold = int(cfg.get("threshold_tokens", 120_000))
         self.keep_recent = int(cfg.get("keep_recent", 8))
 
-    async def summarise(self, instructions: str = "") -> str | None:
-        """Summarise everything but the newest ``keep_recent`` messages. Returns the summary or ``None``."""
+    async def compact(self, instructions: str = "") -> str | None:
+        """Replace everything but the newest ``keep_recent`` messages with a summary of them.
+
+        Returns the summary, or ``None`` when there was nothing old enough to compact.
+
+        The verb is the point: the summary is written into the session as a ``compaction``
+        entry before this returns, and the loop reads the session from that entry onwards, so
+        the older messages stop being sent. There is no way to preview a summary with this -
+        calling it is the compaction.
+        """
         rt = self.api.rt
         messages = rt.session.messages()
         if len(messages) <= self.keep_recent:
@@ -84,7 +92,7 @@ class Compactor:
         """Proactive: summarise before the request is sent if history is too large."""
         if estimate_tokens(event["messages"]) <= self.threshold:
             return None
-        summary = await self.summarise()
+        summary = await self.compact()
         if not summary:
             return None
         await rt.frontend.emit("notice", {"text": f"(auto-compacted; summary {len(summary)} chars)"})
@@ -94,10 +102,10 @@ class Compactor:
         """Reactive: if the provider says the prompt is too long, summarise and ask the loop to retry."""
         if not any(marker in event["error"].lower() for marker in OVERFLOW_MARKERS):
             return None
-        return {"retry": True} if await self.summarise() else None
+        return {"retry": True} if await self.compact() else None
 
     async def on_compact(self, argstr: str, rt) -> str:
-        summary = await self.summarise(argstr)
+        summary = await self.compact(argstr)
         return "nothing to compact" if summary is None else f"compacted:\n{summary[:500]}"
 
 

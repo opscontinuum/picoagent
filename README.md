@@ -5,23 +5,40 @@ Everything else — permissions, compaction, MCP, subagents, plan mode, TUI, hoo
 installed from a git repo or local path, and any core piece (tools, provider, frontend, prompt sections) can be
 overridden by a plugin registering the same name.
 
+There is nothing to install. Clone it and run it:
+
 ```
-python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e .                                      # no third-party deps to pull in
+git clone https://github.com/opscontinuum/picoagent && cd picoagent
 export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
 export PICOAGENT_API_KEY=...                           # optional
 export PICOAGENT_MODEL=qwen2.5-coder:32b
-picoagent                                  # REPL
-picoagent -p "explain this repo"           # one-shot
-picoagent -p "fix the failing test" --json # JSONL event stream
-picoagent -e examples/plugins/permission-gate -e examples/plugins/compaction
-picoagent plugin add git:github.com/you/some-plugin@v0.1.0
-picoagent plugin list
+python3 -m picoagent                                  # REPL
+python3 -m picoagent -p "explain this repo"           # one-shot
+python3 -m picoagent -p "fix the failing test" --json # JSONL event stream
+python3 -m picoagent -e examples/plugins/permission-gate -e examples/plugins/compaction
+python3 -m picoagent plugin add git:github.com/you/some-plugin@v0.1.0
+python3 -m picoagent plugin list
 ```
 
-The venv is not boilerplate: on Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python a bare `pip install -e .`
-fails with `externally-managed-environment` (PEP 668). [docs/getting-started.md](docs/getting-started.md#install)
-covers that error, the `pipx` route, and a missing `python3 -m venv`.
+Zero third-party dependencies means there is nothing for a package manager to resolve, so `python3 -m picoagent`
+works against a bare checkout with no virtualenv and no install step. From another directory, point at the
+checkout: `PYTHONPATH=/path/to/picoagent python3 -m picoagent`.
+
+Installing is optional and buys exactly one thing — a `picoagent` command on your `$PATH` instead of
+`python3 -m picoagent`:
+
+```
+python3 -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -e .                                      # optional: registers the `picoagent` command
+```
+
+Use the venv if you install. On Debian 12+, Ubuntu 23.04+, Fedora 38+ and Homebrew Python a bare `pip install -e .`
+fails with `externally-managed-environment` (PEP 668) — but that error is a reason to skip the install, not a
+reason to fight it. [docs/getting-started.md](docs/getting-started.md) covers it, the `pipx` route, and a
+missing `python3 -m venv`.
+
+The examples below are written as `picoagent`, which is the installed spelling. Without the install, every one of
+them is `python3 -m picoagent` instead; nothing else about them changes.
 
 Config (`~/.picoagent/config.toml`, then `.picoagent/config.toml` in the project):
 
@@ -88,6 +105,37 @@ skill_dirs    = ["skills", ".picoagent/skills", ".agents/skills", ".claude/skill
 ```
 
 Both are read-only conventions — nothing else in picoagent changes either way.
+
+## What a command the model runs can see
+
+The `shell` tool runs commands as you, but it does **not** hand them your whole environment. It
+passes an allowlist — `PATH`, `HOME`, `USER`, `SHELL`, `PWD`, `TMPDIR`, the locale and timezone
+variables, the Windows equivalents, and the Python interpreter's own `VIRTUAL_ENV`, `PYTHONPATH`
+and `PYTHONHOME` — and drops everything else. `npm test` and `cargo build` still work, because a
+default toolchain install needs only `PATH` and `HOME`; what `env` does not return is your API
+keys. A relocated toolchain (a custom `GOPATH`, a `CARGO_HOME` moved off its default) is the
+case for `shell_env_allow` below.
+
+It matters because tool output is not ephemeral: every result is written to the session log and
+sent back to the model as context on the next turn. A key that reaches a command reaches both.
+
+An allowlist rather than a list of secret-looking names, because no such list is complete —
+`OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY` and `DATABASE_URL` all get past one. If a command
+genuinely needs a variable, name it:
+
+```toml
+shell_env_allow = ["ACME_BUILD_FLAG"]   # add one variable
+shell_env = "inherit"                   # or pass everything, if that is what you want
+```
+
+Both are yours to set: a repository's `.picoagent/config.toml` cannot set either, so cloning
+somebody's project cannot widen what the first command sees.
+
+**File permissions.** `~/.picoagent/config.toml` and `~/.picoagent/endpoints/*.toml` can hold an
+`api_key`, and a file you create by hand is world-readable under the usual umask. picoagent
+narrows those to your account when it reads them, tells you on stderr that it did, and never
+widens anything or touches a repository's own config. (POSIX only — on Windows, mode bits are
+not access control; use `icacls` on `%USERPROFILE%\.picoagent`.)
 
 Network reads are separately bounded: the core makes exactly one kind of outbound request,
 `POST {base_url}/chat/completions` to whichever server you configure (plus `GET {base_url}/models`
@@ -157,9 +205,19 @@ underneath you, and only you can tell those apart.
 picoagent tells you which case you're in rather than making you guess:
 
 ```bash
-picoagent plugin list          # trusted | CHANGED (approved before, but not this code) | UNTRUSTED (never approved)
-picoagent plugin trust <path>  # shows what moved, then asks
+picoagent plugin list            # trusted | CHANGED (approved before, but not this code) | UNTRUSTED (never approved)
+picoagent plugin trust <path>    # shows what moved, then asks
+picoagent plugin untrust <path>  # takes the approval back; also accepts the plugin's name
 ```
+
+`list` also names any approval that no longer has a plugin directory behind it, because that is
+the record you are most likely to want gone and the one nothing else shows you. `untrust` takes a
+name as well as a path for the same reason: an approval outlives the directory it covers, so a
+plugin you deleted still has a record, code that later lands in that directory reads as one you
+vetted once rather than one you have never seen, and a plugin you approved as `required` stops
+your sessions until you put it back or withdraw it. `untrust` reads the trust store without
+loading anything, so it works even then. Withdrawing leaves the plugin's files alone; only the
+decision is taken back.
 
 Re-approving a **changed** plugin shows what you're actually accepting — which file moved, and
 for a git checkout, the commits that arrived since you last approved:

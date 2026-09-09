@@ -1,7 +1,7 @@
 """Behavioural tests for the example plugins, loaded through the real loader."""
-import tempfile, unittest
+import unittest
 from pathlib import Path
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.core.types import Message
 from picoagent.plugins import loader
@@ -15,7 +15,7 @@ def load(rt, name):
 
 class PermissionGateTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def _rt(self, turns, answer=True):
         rt = make_runtime(self.tmp, provider=ScriptedProvider(turns), frontend=CaptureFrontend(answer=answer))
@@ -63,7 +63,7 @@ class PermissionGateTests(unittest.TestCase):
 
 class CompactionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_compact_command_summarises_and_keeps_recent(self):
         provider = ScriptedProvider([[text("SUMMARY OF OLD STUFF")]])
@@ -82,7 +82,8 @@ class CompactionTests(unittest.TestCase):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("x")]]))
         load(rt, "compaction")
         run(AgentLoop(rt).handle_input("/compact"))
-        self.assertIn(("notice", {"text": "nothing to compact"}), rt.frontend.events)
+        self.assertIn(("notice", {"text": "nothing to compact", "source": "command"}),
+                      rt.frontend.events)
 
     def test_context_overflow_error_triggers_compaction_and_retry(self):
         from picoagent.core.types import StreamEvent

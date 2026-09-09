@@ -4,3 +4,12 @@ entry = "credential_guard:register"
 description = "Stdlib-only credential storage and leak prevention: never in a prompt, never in a log"
 requires = ["picoagent>=0.1"]
 skills = ["skills"]
+
+# Declared here as well as through `api.declare_required` in register(): a plugin the trust
+# check refuses never reaches register(), so a runtime declaration cannot cover the case where
+# this plugin is the one that went missing.
+required = true
+required_reason = """\
+without it nothing guards the credentials file against a tool that names it, and the shell \
+tool is the built-in one - which strips the environment to core's allowlist but applies none \
+of your deny patterns"""

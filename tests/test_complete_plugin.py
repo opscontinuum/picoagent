@@ -2,11 +2,10 @@
 import importlib
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import ScriptedProvider, make_runtime, text, ROOT
+from helpers import ScriptedProvider, make_runtime, text, ROOT, temp_dir
 from picoagent.core.skills import Skill
 from picoagent.plugins import loader
 from picoagent.plugins.api import PluginAPI
@@ -32,7 +31,7 @@ class CompleterTests(unittest.TestCase):
     """Candidate generation, driven directly so no pty or readline binding is involved."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
         self.module = import_plugin()
         self.api = PluginAPI(self.rt, "complete", PLUGIN)
@@ -175,7 +174,7 @@ class NoReadlineTests(unittest.TestCase):
     """Windows has no readline. The plugin must still load, and then do nothing."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         # None in sys.modules is what makes `import readline` raise a real ImportError.
         self.saved = sys.modules.get("readline")
         sys.modules["readline"] = None
@@ -208,7 +207,7 @@ class RefreshTests(unittest.TestCase):
     """The one network call the plugin makes, and where it is allowed to happen."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp, provider=ListingProvider())
         self.module = import_plugin()
         self.api = PluginAPI(self.rt, "complete", PLUGIN)

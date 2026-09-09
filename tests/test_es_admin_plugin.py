@@ -6,9 +6,9 @@ Every assertion here is about what the *model* sees or what the tool *sent*, bec
 are the two things a wrong answer in production comes from: a mis-read response, or a
 request that asked the cluster for the wrong thing.
 """
-import tempfile, unittest
+import unittest
 from pathlib import Path
-from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, call, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.loop import AgentLoop
 from picoagent.plugins import loader
 from picoagent.testing.fake_es import FakeES, build_cluster
@@ -28,7 +28,7 @@ class EsAdminBase(unittest.TestCase):
         cls.es.stop()
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.es.cluster = build_cluster()        # tests mutate it (PUT _settings, serverless 404s)
         self.es.requests.clear()
         self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
@@ -346,7 +346,7 @@ class SlowlogTests(EsAdminBase):
         self.assertFalse(r.is_error)
 
     def test_allow_destructive_lets_it_run_headless(self):
-        rt = make_runtime(Path(tempfile.mkdtemp()), provider=ScriptedProvider([[text("ok")]]))
+        rt = make_runtime(temp_dir(), provider=ScriptedProvider([[text("ok")]]))
         rt.cfg["plugins"]["es-doctor"] = {"url": self.es.url, "allow_destructive": True}
         loader.load_plugin(PLUGIN, rt, loader.TrustStore(self.tmp / "home"), allow_untrusted=True)
         r = run(rt.tools.get("es_slowlog").execute(
@@ -392,8 +392,6 @@ class ServerlessTests(EsAdminBase):
         self.assertIn("daily-1", r.content)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AllocationExplainWordingTests(unittest.TestCase):
@@ -437,3 +435,7 @@ class AllocationExplainWordingTests(unittest.TestCase):
         if found:
             self.assertIn("inflight_requests", found)
             self.assertNotIn("in_flight_requests", found)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -9,14 +9,18 @@ Stdlib-only credential storage and leak prevention for picoagent. No third-party
   permissions - not encrypted, the same trust model as `~/.netrc` or `~/.aws/credentials` (OS
   file permissions, not a hand-rolled cipher). `/secrets show|delete|list` manage it; `show`
   only ever prints a masked last-4-characters form.
-* **Leak prevention**: replaces the built-in `shell` tool (auto-detected: bash/sh on Linux and
-  macOS, PowerShell on Windows) with one that passes only an **allowlist** of environment
-  variables to the command. The built-in `shell` tool passes the *entire* environment, so
-  `env`/`echo $VAR` (or `$env:VAR` on Windows) would otherwise leak a key straight into the
-  session log and the next prompt. It's an allowlist rather than a denylist of secret-shaped
-  names because a denylist can't be complete - `OPENROUTER_KEY`, `GH_PAT`, `PRIVATE_KEY`,
-  `AWS_ACCESS_KEY_ID` and `DATABASE_URL` all sail past one. Add names your commands need with
-  `extra_allow_env`.
+* **Leak prevention**: the environment **allowlist** this plugin invented is core's now.
+  `tools.SHELL_ENV_ALLOWLIST` is what the built-in `shell` tool passes by default, whether or
+  not anything is installed, because a control that only exists in an opt-in plugin is absent
+  for everyone who has not installed it (DISA V-222444). It's an allowlist rather than a
+  denylist of secret-shaped names because a denylist can't be complete - `OPENROUTER_KEY`,
+  `GH_PAT`, `PRIVATE_KEY`, `AWS_ACCESS_KEY_ID` and `DATABASE_URL` all sail past one. Add names
+  your commands need with `shell_env_allow` in your own config.
+
+  What this plugin still adds is the **narrowing**: its replacement `shell` tool applies
+  `extra_deny_patterns` on top, which only ever refuses more, so a site that knows the shape of
+  its own secret variable names can refuse one the allowlist would have passed - including one
+  the user named in `shell_env_allow` or `extra_allow_env` by mistake.
 * **File protection**: blocks *any* tool call whose path argument names a protected file - the
   credentials store, `config.toml` (which can hold `api_key`), or `trust.json` - including via
   a symlink or hardlink alias, and blocks recursive tools like `grep_search` from being pointed
@@ -32,9 +36,10 @@ copying the file first all defeat it. Treat it as catching careless behavior, no
 attempt.
 
 The real protection is the two things above it: the key isn't in the environment the command
-sees, and the files that hold it are refused by the tool layer. And all of it is void if this
-plugin isn't loaded and trusted - an untrusted plugin doesn't load, and then the built-in
-unsanitized `shell` tool is what runs.
+sees, and the files that hold it are refused by the tool layer. The first of those no longer
+depends on this plugin loading - core strips the environment either way - so an untrusted or
+disabled plugin costs you the deny patterns and the whole tool-layer file guard, not the
+allowlist.
 
 ## Scope
 

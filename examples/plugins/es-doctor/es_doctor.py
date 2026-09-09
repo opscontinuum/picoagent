@@ -12,7 +12,8 @@ Tools
                       bucket, Pearson correlation of errors vs each metric, spike detection, and
                       the top error messages inside the spike
   es_search           raw query DSL passthrough for anything the helpers don't cover
-  es_request          raw REST call; destructive ones are blocked unless ``allow_destructive = true``
+  es_request          raw REST call; only reads (GET, HEAD, and the POST endpoints that search)
+                      unless ``allow_destructive = true``
   es_shards, es_recovery, es_nodes, es_hot_threads, es_ilm, es_snapshots, es_index_inspect,
   es_templates, es_slowlog - the cluster-administration half, in ``es_admin.py``
 Skills
@@ -34,6 +35,11 @@ Configuration (``[plugins.es-doctor]`` or env vars)::
     logs_index = "logs-*,filebeat-*"          # override the default patterns if your naming differs
     metrics_index = "metrics-*,metricbeat-*"
     traces_index = "traces-apm*,apm-*"
+
+The three index patterns are the only keys a repository's ``.picoagent/config.toml`` may set;
+see :data:`PROJECT_SETTABLE`. Connection and destructive-access settings come from your own
+config, because a repository that could move ``url`` would be given the API key sitting next
+to it in your config.
 """
 from __future__ import annotations
 
@@ -45,11 +51,26 @@ import urllib.parse
 from typing import Any
 
 from es_client import (DEFAULT_LOGS_INDEX, DEFAULT_METRICS_INDEX, DEFAULT_TRACES_INDEX,
-                       ESClient, ESError, Settings, _ESTool, result, text_table)
+                       ESClient, ESError, Settings, _ESTool, destructive_refusal, is_destructive,
+                       text_table)
+from picoagent.core.tools import tool_result
 
 # ------------------------------------------------------------------ Elastic knowledge
 # Beats and Elastic Agent write ECS documents into these data streams; the default patterns
 # live in es_client.py, so a user with legacy indices overrides three config keys.
+
+#: The only ``[plugins.es-doctor]`` keys taken from a repository's ``.picoagent/config.toml``.
+#: Which index a repository's own logs land in is what a repository knows and the person who
+#: cloned it does not, and the worst a wrong pattern does is return no documents. Everything
+#: else in this plugin's config - ``url``, ``api_key``, ``username``, ``password``,
+#: ``verify_tls``, ``ca_cert``, ``allow_destructive`` - decides where a credential travels, what
+#: TLS is checked, or whether the model may delete data, and is read from the user layer only.
+#:
+#: Each key carries its default, which is also the shape the repository's value must have: an
+#: index pattern is a string, and ``logs_index = 5`` gets the default back rather than reaching
+#: a URL path. Naming the keys without their defaults left the type unchecked.
+PROJECT_SETTABLE = {"logs_index": DEFAULT_LOGS_INDEX, "metrics_index": DEFAULT_METRICS_INDEX,
+                    "traces_index": DEFAULT_TRACES_INDEX}
 
 #: Friendly names -> ECS / Beats metric fields.
 METRIC_ALIASES = {
@@ -66,7 +87,6 @@ METRIC_ALIASES = {
     "jvm_heap": "jolokia.jvm.memory.heap.used.pct",
 }
 ERROR_LEVELS = ["error", "err", "fatal", "critical", "crit", "emerg", "alert", "panic"]
-DESTRUCTIVE = re.compile(r"(_delete_by_query|_close|_shrink|_forcemerge|_reindex|_update_by_query|/_settings|_ilm)", re.I)
 
 PROMPT_NOTE = """# Elasticsearch / Elastic Stack
 You have es_* tools. Data from Beats and Elastic Agent follows ECS (Elastic Common Schema):
@@ -84,6 +104,11 @@ es_correlate (errors vs cpu/memory/latency, same window, same host/service) -> r
 # ------------------------------------------------------------------ query helpers
 
 _DURATION = re.compile(r"^\d+[smhd]$")
+
+#: Buckets where both series carry a value, below which no correlation is reported.
+MIN_CORRELATION_PAIRS = 3
+#: Buckets a series needs before any of them can be called a spike.
+MIN_SPIKE_SAMPLES = 4
 
 
 def time_bound(value: str | None, default: str) -> str:
@@ -135,9 +160,14 @@ def bucket_label(bucket: dict) -> str:
 
 
 def pearson(xs: list[float], ys: list[float]) -> float | None:
-    """Correlation coefficient, or ``None`` when either series is constant."""
+    """Correlation coefficient, or ``None`` when there is no honest one to report.
+
+    ``None`` covers both refusals, and the caller renders it the same way: fewer than
+    :data:`MIN_CORRELATION_PAIRS` buckets where both series have a value, or either series
+    constant across them. An r computed from two points is 1.0 or -1.0 whatever the data did.
+    """
     pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
-    if len(pairs) < 3:
+    if len(pairs) < MIN_CORRELATION_PAIRS:
         return None
     mx = sum(p[0] for p in pairs) / len(pairs)
     my = sum(p[1] for p in pairs) / len(pairs)
@@ -149,9 +179,13 @@ def pearson(xs: list[float], ys: list[float]) -> float | None:
 
 
 def spike_indices(values: list[float], sigma: float = 2.0) -> list[int]:
-    """Indices where the value exceeds mean + ``sigma`` standard deviations."""
+    """Indices where the value exceeds mean + ``sigma`` standard deviations.
+
+    Empty rather than wrong for a series with fewer than :data:`MIN_SPIKE_SAMPLES` values or
+    no variation at all: a standard deviation taken over two buckets calls one of them a spike.
+    """
     clean = [v for v in values if v is not None]
-    if len(clean) < 4:
+    if len(clean) < MIN_SPIKE_SAMPLES:
         return []
     mean = sum(clean) / len(clean)
     std = math.sqrt(sum((v - mean) ** 2 for v in clean) / len(clean))
@@ -162,6 +196,25 @@ def spike_indices(values: list[float], sigma: float = 2.0) -> list[int]:
 
 def fmt(value: float | None, digits: int = 3) -> str:
     return "-" if value is None else (f"{value:.{digits}f}" if isinstance(value, float) else str(value))
+
+
+def percentile_value(agg: dict | None) -> float | None:
+    """The one figure out of a ``percentiles`` aggregation, or ``None`` for an empty bucket.
+
+    Elasticsearch nests percentile results under ``values``, keyed by the percent as a string
+    ("50.0"). That is a different shape from ``avg``'s flat ``value``: reading it as an avg
+    raises, and falling back to an avg is how a mean ends up printed under a p50 heading.
+    ``keyed: false`` turns the map into ``{"key", "value"}`` pairs, so accept both shapes. A
+    bucket matching no documents answers ``null``, and older versions answer ``NaN``.
+    """
+    values = (agg or {}).get("values")
+    if isinstance(values, dict):
+        candidates = list(values.values())
+    elif isinstance(values, list):
+        candidates = [entry.get("value") for entry in values if isinstance(entry, dict)]
+    else:
+        return None
+    return next((v for v in candidates if isinstance(v, (int, float)) and math.isfinite(v)), None)
 
 
 # ------------------------------------------------------------------ tools
@@ -186,7 +239,7 @@ class ClusterHealthTool(_ESTool):
                         lines.append(f"  {node.get('node_name')}: [{decider.get('decider')}] {decider.get('decision')} - {decider.get('explanation')}")
             except ESError as exc:
                 lines.append(f"(allocation explain unavailable: {exc})")
-        return result(ctx, "\n".join(lines), health=health)
+        return tool_result(ctx, "\n".join(lines), health=health)
 
 
 class IndicesTool(_ESTool):
@@ -209,7 +262,32 @@ class IndicesTool(_ESTool):
                 signal = "traces"
             groups[signal or "other"].append(f"  {row.get('health', '?'):7} {name:45} docs={row.get('docs.count', '?'):>8} size={row.get('store.size', '?')}")
         text = "\n".join(f"{signal} ({len(rows)}):\n" + "\n".join(rows) for signal, rows in groups.items() if rows)
-        return result(ctx, text or "(no indices)")
+        return tool_result(ctx, text or "(no indices)")
+
+
+def _logs_body(args: dict) -> dict[str, Any]:
+    """The search this tool sends, separate from the rendering of what comes back.
+
+    Every filter the model can ask for is assembled here and nowhere else, which is what
+    makes "what did the tool actually query" answerable without reading the renderer:
+    ``level`` defaults to error and ``level="any"`` drops the clause entirely, free text goes
+    through ``simple_query_string`` with ``and`` so two words mean both, and the dataset
+    breakdown is always asked for because it is what tells a responder which shipper the
+    lines came from.
+    """
+    level = args.get("level", "error")
+    filters = time_filters(args.get("since"), args.get("until")) + entity_filters(args.get("host"), args.get("service"), args.get("container"))
+    if level and level.lower() != "any":
+        filters += level_filter(level)
+    if args.get("query"):
+        filters.append({"simple_query_string": {"query": args["query"], "default_operator": "and"}})
+    body: dict[str, Any] = {"size": int(args.get("size") or 40), "query": {"bool": {"filter": filters}},
+                            "sort": [{"@timestamp": {"order": "desc"}}],
+                            "_source": ["@timestamp", "log.level", "service.name", "host.name", "message", "error.message", "event.dataset"],
+                            "aggs": {"datasets": {"terms": {"field": "event.dataset", "size": 10}}}}
+    if args.get("histogram"):
+        body["aggs"]["timeline"] = {"date_histogram": {"field": "@timestamp", "fixed_interval": args.get("interval") or "5m"}}
+    return body
 
 
 class LogsTool(_ESTool):
@@ -226,19 +304,7 @@ class LogsTool(_ESTool):
         "index": {"type": "string"}, "histogram": {"type": "boolean"}, "interval": {"type": "string", "description": "e.g. 5m"}}}
 
     def run(self, args, ctx):
-        level = args.get("level", "error")
-        filters = time_filters(args.get("since"), args.get("until")) + entity_filters(args.get("host"), args.get("service"), args.get("container"))
-        if level and level.lower() != "any":
-            filters += level_filter(level)
-        if args.get("query"):
-            filters.append({"simple_query_string": {"query": args["query"], "default_operator": "and"}})
-        body: dict[str, Any] = {"size": int(args.get("size") or 40), "query": {"bool": {"filter": filters}},
-                                "sort": [{"@timestamp": {"order": "desc"}}],
-                                "_source": ["@timestamp", "log.level", "service.name", "host.name", "message", "error.message", "event.dataset"],
-                                "aggs": {"datasets": {"terms": {"field": "event.dataset", "size": 10}}}}
-        if args.get("histogram"):
-            body["aggs"]["timeline"] = {"date_histogram": {"field": "@timestamp", "fixed_interval": args.get("interval") or "5m"}}
-        data = self.es.search(args.get("index") or self.settings.logs_index, body)
+        data = self.es.search(args.get("index") or self.settings.logs_index, _logs_body(args))
 
         hits = list(reversed(data["hits"]["hits"]))
         total = data["hits"]["total"]["value"] if isinstance(data["hits"]["total"], dict) else data["hits"]["total"]
@@ -255,7 +321,7 @@ class LogsTool(_ESTool):
             lines.append("\nTimeline:")
             lines += [f"  {bucket_label(b)}  {b['doc_count']:>6}  {'#' * min(60, b['doc_count'])}"
                       for b in aggs["timeline"]["buckets"] if b["doc_count"]]
-        return result(ctx, "\n".join(lines), total=total)
+        return tool_result(ctx, "\n".join(lines), total=total)
 
 
 class MetricsTool(_ESTool):
@@ -280,13 +346,14 @@ class MetricsTool(_ESTool):
         lines += [f"{bucket_label(b)}  avg={fmt(b['value']['value'])}  max={fmt(b['peak']['value'])}" for b in buckets]
         if not buckets:
             lines.append("no data - check the field name (try es_search with size=1 on the metrics index) or the time window")
-        return result(ctx, "\n".join(lines), field=field)
+        return tool_result(ctx, "\n".join(lines), field=field)
 
 
 class CorrelateTool(_ESTool):
     name = "es_correlate"
     description = ("Correlate log errors with metrics and APM over a time window: one row per bucket with error count, "
-                   "total logs, each metric's avg, APM p50 latency and failure count; Pearson r of errors vs each series; "
+                   "total logs, each metric's avg, APM median (p50) latency and failure count; Pearson r of "
+                   "errors vs each series; "
                    "spike buckets; top error messages inside the spike. metrics: aliases or ECS fields (default cpu, memory).")
     parameters = {"type": "object", "properties": {
         "since": {"type": "string"}, "until": {"type": "string"}, "interval": {"type": "string", "description": "default 1m"},
@@ -296,51 +363,59 @@ class CorrelateTool(_ESTool):
         "logs_index": {"type": "string"}, "metrics_index": {"type": "string"}, "traces_index": {"type": "string"}}}
 
     def run(self, args, ctx):
+        """Three queries, one table, then the two readings a responder wants off it.
+
+        The coefficients and the spike section are separate functions because each answers a
+        separate question about the same table - "does anything move with the errors" and
+        "when did the errors jump, and what were they" - and a responder reads one of them at
+        a time under pressure. Inline, the two answers and the query bodies that produced
+        neither sat in one block a reader had to hold whole.
+        """
         interval = args.get("interval") or "1m"
         window = time_filters(args.get("since"), args.get("until"))
         who = entity_filters(args.get("host"), args.get("service"), args.get("container"))
-        metrics = [metric_field(m) for m in (args.get("metrics") or ["cpu", "memory"])]
+        fields = [metric_field(name) for name in (args.get("metrics") or ["cpu", "memory"])]
 
         errors_by_bucket, total_by_bucket = self._log_series(args, window, who, interval)
-        metric_series = {m: self._metric_series(args, window, entity_filters(args.get("host"), None, args.get("container")), interval, m) for m in metrics}
+        host_and_container = entity_filters(args.get("host"), None, args.get("container"))
+        metric_series = {field: self._metric_series(args, window, host_and_container, interval, field)
+                         for field in fields}
         apm = self._apm_series(args, window, who, interval) if args.get("include_apm", True) else None
 
-        keys = sorted(set(total_by_bucket) | {k for s in metric_series.values() for k in s} | set(apm["p50"] if apm else []))
-        if not keys:
-            return result(ctx, "no data in window; widen since/until or drop host/service filters", is_error=True)
+        buckets = sorted(set(total_by_bucket)
+                         | {bucket for series in metric_series.values() for bucket in series}
+                         | set(apm["p50"] if apm else []))
+        if not buckets:
+            return tool_result(ctx, "no data in window; widen since/until or drop host/service filters", is_error=True)
 
-        errors = [errors_by_bucket.get(k, 0) for k in keys]
-        header = ["bucket", "errors", "logs"] + [metric_label(m) for m in metrics]
+        errors = [errors_by_bucket.get(bucket, 0) for bucket in buckets]
+        header = ["bucket", "errors", "logs"] + [metric_label(field) for field in fields]
         header += ["apm_p50_ms", "apm_fail"] if apm else []
         rows = []
-        for i, k in enumerate(keys):
-            row = [k[:16].replace("T", " "), errors[i], total_by_bucket.get(k, 0)]
-            row += [fmt(metric_series[m].get(k)) for m in metrics]
+        for position, bucket in enumerate(buckets):
+            row = [bucket[:16].replace("T", " "), errors[position], total_by_bucket.get(bucket, 0)]
+            row += [fmt(metric_series[field].get(bucket)) for field in fields]
             if apm:
-                p50 = apm["p50"].get(k)
-                row += [fmt(p50 / 1000, 0) if p50 else "-", apm["fail"].get(k, 0)]
+                p50 = apm["p50"].get(bucket)
+                row += [fmt(p50 / 1000, 0) if p50 else "-", apm["fail"].get(bucket, 0)]
             rows.append(row)
 
-        lines = [f"errors vs metrics per {interval}, {len(keys)} buckets", text_table(header, rows), "", "Correlation of error count with:"]
-        for m in metrics:
-            r = pearson(errors, [metric_series[m].get(k) for k in keys])
-            lines.append(f"  {m:40} r={fmt(r, 2)} {_strength(r)}")
-        if apm:
-            r_lat = pearson(errors, [apm['p50'].get(k) for k in keys])
-            r_fail = pearson(errors, [apm['fail'].get(k, 0) for k in keys])
-            lines.append(f"  {'apm transaction.duration.us (p50)':40} r={fmt(r_lat, 2)} {_strength(r_lat)}")
-            lines.append(f"  {'apm event.outcome=failure count':40} r={fmt(r_fail, 2)} {_strength(r_fail)}")
-
         spikes = spike_indices(errors)
-        if spikes:
-            first, last = keys[spikes[0]], keys[spikes[-1]]
-            lines.append(f"\nError spike: {len(spikes)} bucket(s) from {first[:16]} to {last[:16]} (>2σ above mean)")
-            lines.append("Top error messages during the spike:")
-            for msg, count in self._top_errors(args, first, last, who):
-                lines.append(f"  {count:>5}  {msg[:160]}")
-        else:
-            lines.append("\nNo error spike (>2σ) detected in this window.")
-        return result(ctx, "\n".join(lines), buckets=len(keys), spike_buckets=len(spikes))
+        lines = [f"errors vs metrics per {interval}, {len(buckets)} buckets", text_table(header, rows), "",
+                 "Correlation of error count with:",
+                 *_correlation_lines(errors, buckets, fields, metric_series, apm),
+                 *self._spike_lines(args, buckets, spikes, who)]
+        return tool_result(ctx, "\n".join(lines), buckets=len(buckets), spike_buckets=len(spikes))
+
+    def _spike_lines(self, args, buckets, spikes, who) -> list[str]:
+        """The spike section: when the errors jumped, and the messages inside the jump."""
+        if not spikes:
+            return ["\nNo error spike (>2σ) detected in this window."]
+        first, last = buckets[spikes[0]], buckets[spikes[-1]]
+        lines = [f"\nError spike: {len(spikes)} bucket(s) from {first[:16]} to {last[:16]} (>2σ above mean)",
+                 "Top error messages during the spike:"]
+        return lines + [f"  {count:>5}  {message[:160]}"
+                        for message, count in self._top_errors(args, first, last, who)]
 
     # ---- the three series -------------------------------------------------
     def _log_series(self, args, window, who, interval) -> tuple[dict[str, int], dict[str, int]]:
@@ -357,15 +432,27 @@ class CorrelateTool(_ESTool):
         return {b["key_as_string"]: b["v"]["value"] for b in buckets if b["v"]["value"] is not None}
 
     def _apm_series(self, args, window, who, interval) -> dict[str, dict]:
+        """Median transaction duration and failure count per bucket.
+
+        The median is asked of Elasticsearch (``percentiles``), never approximated by a mean
+        here. Latency is the series where the two answer different questions: one 30-second
+        transaction drags a mean past every request the responder is reasoning about, so a mean
+        under a p50 heading reports that typical requests got slow when nothing typical moved.
+        A cluster that cannot answer the aggregation leaves the column empty rather than
+        substituting a mean, because during an incident a wrong latency figure costs more than
+        a missing one.
+        """
         body = {"size": 0, "query": {"bool": {"filter": window + who + [{"exists": {"field": "transaction.duration.us"}}]}},
                 "aggs": {"t": {"date_histogram": {"field": "@timestamp", "fixed_interval": interval},
-                               "aggs": {"p50": {"avg": {"field": "transaction.duration.us"}},
+                               "aggs": {"p50": {"percentiles": {"field": "transaction.duration.us",
+                                                                "percents": [50]}},
                                         "fail": {"filter": {"term": {"event.outcome": "failure"}}}}}}}
         try:
             buckets = self.es.search(args.get("traces_index") or self.settings.traces_index, body).get("aggregations", {}).get("t", {}).get("buckets", [])
         except ESError:
             return {"p50": {}, "fail": {}}
-        return {"p50": {b["key_as_string"]: b["p50"]["value"] for b in buckets if b["p50"]["value"]},
+        medians = {b["key_as_string"]: percentile_value(b.get("p50")) for b in buckets}
+        return {"p50": {bucket: value for bucket, value in medians.items() if value},
                 "fail": {b["key_as_string"]: b["fail"]["doc_count"] for b in buckets}}
 
     def _top_errors(self, args, since, until, who) -> list[tuple[str, int]]:
@@ -377,6 +464,21 @@ class CorrelateTool(_ESTool):
             msg = re.sub(r"\d+", "N", src.get("message") or (src.get("error") or {}).get("message") or "")   # collapse ids/numbers
             counts[msg] = counts.get(msg, 0) + 1
         return sorted(counts.items(), key=lambda kv: -kv[1])[:5]
+
+
+def _correlation_lines(errors: list[int], buckets: list[str], fields: list[str],
+                       metric_series: dict[str, dict], apm: dict | None) -> list[str]:
+    """One ``r=`` line per series, every one of them against the same error counts."""
+    series: list[tuple[str, list]] = [(field, [metric_series[field].get(bucket) for bucket in buckets])
+                                      for field in fields]
+    if apm:
+        series.append(("apm transaction.duration.us (p50)", [apm["p50"].get(bucket) for bucket in buckets]))
+        series.append(("apm event.outcome=failure count", [apm["fail"].get(bucket, 0) for bucket in buckets]))
+    lines = []
+    for label, values in series:
+        coefficient = pearson(errors, values)
+        lines.append(f"  {label:40} r={fmt(coefficient, 2)} {_strength(coefficient)}")
+    return lines
 
 
 def _strength(r: float | None) -> str:
@@ -394,37 +496,51 @@ class SearchTool(_ESTool):
 
     def run(self, args, ctx):
         data = self.es.search(args["index"], args["body"])
-        return result(ctx, json.dumps(data, indent=1))
+        return tool_result(ctx, json.dumps(data, indent=1))
 
 
 class RequestTool(_ESTool):
     name = "es_request"
-    description = "Raw REST call to Elasticsearch (GET/POST/PUT/DELETE + path + optional JSON body). Destructive calls are blocked unless configured."
+    description = ("Raw REST call to Elasticsearch (method + path + optional JSON body). Read-only "
+                   "unless the user configured otherwise: GET and HEAD, plus the POST endpoints that "
+                   "only read (_search, _count, _cluster/allocation/explain, _index_template/"
+                   "_simulate_index). Every other call is refused.")
     parameters = {"type": "object", "properties": {"method": {"type": "string"}, "path": {"type": "string"}, "body": {"type": "object"}},
                   "required": ["method", "path"]}
 
     def run(self, args, ctx):
+        # Always JSON: the client answers a text body with an ESError naming the endpoints that
+        # do that and what to call instead, so there is no string case to render here.
         data = self.es.request(args["method"].upper(), args["path"], args.get("body"))
-        return result(ctx, json.dumps(data, indent=1) if not isinstance(data, str) else data)
-
-
-def is_destructive(method: str, path: str) -> bool:
-    return method.upper() in ("DELETE",) or bool(DESTRUCTIVE.search(path))
+        return tool_result(ctx, json.dumps(data, indent=1))
 
 
 # ------------------------------------------------------------------ registration
 
 def register(api):
-    import es_admin       # sibling module; the loader puts the plugin root on sys.path
+    import es_admin       # sibling module; the loader rewrites this import into the
+                          # plugin's own package, so sys.path is untouched
 
     cfg = api.plugin_config()
+    # Two kinds of setting, two layers. The connection is where a credential goes and what TLS
+    # is checked, and ``allow_destructive`` decides whether the model may delete an index, so all
+    # of those come from the user's own config only - a cloned repository that set ``url`` would
+    # have the key in your config sent to its host on the first cluster call. Index patterns are
+    # taste: which indices this repository's logs live in is exactly the thing a repository knows
+    # and you do not, and naming the wrong index returns no documents rather than leaking any.
+    api.warn_about_project_config(*PROJECT_SETTABLE)
+    indices = cfg.with_project(**PROJECT_SETTABLE)
+    allow_destructive = bool(cfg.get("allow_destructive", False))
     es = ESClient(url=cfg.get("url") or os.environ.get("ELASTICSEARCH_URL", "http://localhost:9200"),
                   api_key=cfg.get("api_key") or os.environ.get("ELASTICSEARCH_API_KEY", ""),
                   username=cfg.get("username", ""), password=cfg.get("password", ""),
                   verify_tls=cfg.get("verify_tls", True),
-                  ca_cert=cfg.get("ca_cert", ""))
-    settings = Settings(logs_index=cfg.get("logs_index", DEFAULT_LOGS_INDEX), metrics_index=cfg.get("metrics_index", DEFAULT_METRICS_INDEX),
-                        traces_index=cfg.get("traces_index", DEFAULT_TRACES_INDEX), allow_destructive=bool(cfg.get("allow_destructive", False)))
+                  ca_cert=cfg.get("ca_cert", ""),
+                  allow_destructive=allow_destructive)
+    settings = Settings(logs_index=indices.get("logs_index", DEFAULT_LOGS_INDEX),
+                        metrics_index=indices.get("metrics_index", DEFAULT_METRICS_INDEX),
+                        traces_index=indices.get("traces_index", DEFAULT_TRACES_INDEX),
+                        allow_destructive=allow_destructive)
 
     for tool_class in (ClusterHealthTool, IndicesTool, LogsTool, MetricsTool, CorrelateTool, SearchTool, RequestTool):
         api.register_tool(tool_class(es, settings))
@@ -433,10 +549,19 @@ def register(api):
     api.register_system_prompt_section("es-doctor", lambda: PROMPT_NOTE + "\n" + es_admin.ES_ADMIN_PROMPT_NOTE)
 
     async def guard(event, rt):
-        """Block destructive es_request calls unless the user opted in."""
+        """Block a destructive es_request before it is dispatched, rather than after.
+
+        The client refuses the same call, so this is not what makes the gate hold - it is what
+        makes the refusal legible. Blocking here names the tool and the setting in the result the
+        model reads, and the call never leaves the process, so nothing is timed or logged at the
+        cluster. Only ``es_request`` is checked because it is the only tool that takes a method
+        and a path from the model; every other tool builds its own path and is gated in the
+        client, where a tool written later is gated too.
+        """
         if event["name"] == "es_request" and not settings.allow_destructive \
                 and is_destructive(event["args"].get("method", "GET"), event["args"].get("path", "")):
-            return {"block": True, "reason": "destructive Elasticsearch call; set allow_destructive = true in [plugins.es-doctor] to permit"}
+            return {"block": True, "reason": destructive_refusal(event["args"].get("method", "GET"),
+                                                                 event["args"].get("path", ""))}
         return None
     api.on("tool_call", guard)
 

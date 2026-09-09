@@ -28,6 +28,28 @@ the payload for later handlers and for the core.
 Plugins can define their own events with `await api.emit("thing", {...})`; other plugins
 subscribe to `"<plugin-name>:thing"`.
 
+`api.on` warns on stderr when the name is neither one of the events above nor a namespaced
+`<plugin>:<event>` one, because a typo is the one plugin mistake with no other symptom: the
+plugin loads, the loader reports it running, and the handler is never called. It is a warning
+and not a refusal - the handler is still subscribed - since an event may come from a plugin
+that has not loaded yet, or from a newer picoagent than the one you are reading.
+
+## Emitted to the frontend, not to the bus
+
+Some things happen outside a turn and go straight to the frontend. `api.on` does not reach
+them; they are what a `--json` consumer reads off stdout, alongside the `notice` that a slash
+command's output and a plugin's own warnings arrive as.
+
+| Event | When | Payload |
+|---|---|---|
+| `plugin_skipped` | startup, once per plugin that did not load | `name`, `reason` (`new`, `changed`, `shadowed`, `invalid` or `failed`), `root`, `urgent`, `text` |
+
+`urgent` is true when a plugin the user approved is not running. That is the case worth stopping
+for, because a security plugin that quietly did not load looks exactly like one that loaded and
+found nothing, so branch on the boolean rather than on `text`, which is prose for a person. The
+same wording also goes to stderr in every run mode; a frontend that renders only the events it
+knows about (the REPL, `-p` without `--json`) ignores this one, so nobody is told twice.
+
 ## Semantics worth knowing
 
 * **Blocking is first-wins.** Once a handler returns `block: True`, later handlers don't run
@@ -38,3 +60,10 @@ subscribe to `"<plugin-name>:thing"`.
   a handler can't see sibling results, but it can rely on a stable order.
 * **`context` gets a copy.** Mutating `payload["messages"]` in place is safe; returning
   `{"messages": ...}` is the explicit way.
+* **Queued messages have fixed delivery points.** `api.send_message(text, deliver_as=...)` lands
+  after the current tool batch (`steer`), as a new prompt after `agent_end` (`follow_up`), or as
+  its own message just before the user's next prompt (`next_turn`). A `steer` queued from the
+  final `turn_end` has no batch left to follow, so it is carried to the next prompt with the
+  `next_turn` text rather than turning up mid-batch in unrelated work.
+* **Commands are contained like handlers.** A slash command handler that raises is logged and
+  reported to the user; it does not end the session.

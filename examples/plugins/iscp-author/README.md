@@ -98,6 +98,11 @@ answers = "contingency/answers.json"
 output  = "contingency/out"
 ```
 
+Both are read from your own config only. Each names a place this plugin creates directories
+under and writes files to, and picking where a tool writes is not a decision a cloned
+repository gets to make. A repository's `.picoagent/config.toml` that sets either is named at
+session start rather than quietly ignored; move the files instead.
+
 ## Configuration items from infrastructure-as-code
 
 `iscp_import_cis` reads three inputs, all with the standard library:

@@ -1,7 +1,9 @@
 """Runs the full agent loop (prompt -> tool call -> tool exec -> second turn) against a fake server
 for each provider dialect. Standard library only:  python -m unittest discover -s tests -v"""
 from __future__ import annotations
-import asyncio, json, os, sys, tempfile, unittest
+import asyncio, json, os, sys, tempfile, threading, unittest, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,11 +12,13 @@ from picoagent.core.config import load_config                       # noqa: E402
 from picoagent.core.loop import AgentLoop, Runtime                  # noqa: E402
 from picoagent.core.session import Session                          # noqa: E402
 from picoagent.core.tools import BUILTIN_TOOLS                      # noqa: E402
-from picoagent.core.provider import OpenAICompatProvider            # noqa: E402
+from picoagent.core.provider import (OpenAICompatProvider, RedirectRefused,  # noqa: E402
+                                     _SameOriginRedirects, to_openai_messages)
+from picoagent.core.types import Message, ToolCall, ToolResult      # noqa: E402
 from picoagent.plugins import loader                                # noqa: E402
 from picoagent import cli                                           # noqa: E402
 from picoagent.testing.fakes import FakeServer  # noqa: E402
-from helpers import ROOT  # noqa: E402,F811
+from helpers import ROOT, temp_dir  # noqa: E402,F811
 
 
 class ErrorScrubbingTests(unittest.TestCase):
@@ -51,6 +55,42 @@ def make_runtime(tmp: Path) -> Runtime:
         rt.tools.register(t())
     rt.frontend = Capture()
     return rt
+
+
+class NoKeyMeansNoAuthorizationHeader(unittest.TestCase):
+    """With no key configured, the request carries no ``Authorization`` header at all.
+
+    The alternative - ``Authorization: Bearer `` with nothing after it - is not a harmless
+    spelling of "no key": a gateway that validates the header rejects the empty credential, so
+    the local-server configuration this client is most used for (Ollama needs no key) would
+    break against any proxy in front of it. Both request builders guard on ``self._key``; a
+    mutation forcing either guard survived the suite, which is how this test earned its place.
+    """
+
+    def setUp(self):
+        for name in ("PICOAGENT_API_KEY", "OPENAI_API_KEY"):
+            value = os.environ.pop(name, None)
+            if value is not None:
+                self.addCleanup(os.environ.__setitem__, name, value)
+
+    def test_list_models_without_a_key_sends_no_authorization_header(self):
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1")
+            asyncio.run(provider.list_models())
+        self.assertNotIn("Authorization", srv.requests[0]["headers"])
+
+    def test_chat_without_a_key_sends_no_authorization_header(self):
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1")
+
+            async def collect():
+                return [event async for event in provider.stream(
+                    system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+
+            asyncio.run(collect())
+        chat = [r for r in srv.requests if r["path"].endswith("/chat/completions")]
+        self.assertTrue(chat, "the fake server never saw the chat request")
+        self.assertNotIn("Authorization", chat[0]["headers"])
 
 
 class ListModelsTests(unittest.TestCase):
@@ -251,6 +291,420 @@ class TemperatureTests(unittest.TestCase):
             rt = self._vertex_runtime(d, srv)
             self._run(rt, "vertex")
             self.assertNotIn("temperature", srv.requests[0]["body"]["generationConfig"])
+
+
+
+
+class BaseUrlSchemeTests(unittest.TestCase):
+    """`urlopen` speaks more than HTTP, so an unchecked base_url turns the client into a reader.
+
+    `file:///etc/passwd` is the concrete case: `urllib.request.urlopen` resolves it against the
+    local filesystem, so a base_url that reaches the request builder unchecked makes the model
+    client open files instead of talking to a server. A repository cannot set `providers.base_url`
+    (it is in `USER_ONLY`), but a plugin handed one from `[plugins.<name>]`, an environment
+    variable and a typo all reach the same place.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        (self.tmp / "models").write_text('{"data": [{"id": "leaked-from-disk"}]}')
+        (self.tmp / "chat").mkdir()
+        (self.tmp / "chat" / "completions").write_text('data: {"choices":[{"delta":{"content":"hi"}}]}\n')
+        self.file_base = "file://" + self.tmp.as_posix()
+
+    def test_list_models_refuses_a_file_url_instead_of_reading_the_disk(self):
+        """Matched on the refusal's own wording, not on the word ``file``.
+
+        Every way this can go wrong says "file" somewhere: the refusal names the URL, and so does
+        the ``No such file or directory`` a transport error would carry if the check were gone and
+        the read merely missed. Only ``base_url must be http or https`` says the check ran.
+        """
+        provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertIn("base_url must be http or https", str(caught.exception))
+        self.assertNotIn("leaked-from-disk", str(caught.exception))
+
+    def test_stream_refuses_a_file_url_as_an_error_event_not_an_exception(self):
+        """Providers report expected failures as `StreamEvent("error")`; only bugs raise."""
+        provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
+
+        async def collect():
+            return [event async for event in provider.stream(
+                system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+
+        events = asyncio.run(collect())
+        self.assertEqual([event.type for event in events], ["error"])
+        self.assertIn("base_url must be http or https", events[0].error)
+        self.assertNotIn("hi", events[0].error)
+
+    def test_the_refusal_names_the_url_so_the_user_can_find_the_setting(self):
+        provider = OpenAICompatProvider(base_url=self.file_base, api_key="k")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertIn(self.file_base, str(caught.exception))
+
+    def test_an_http_base_url_still_reaches_the_server(self):
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1", api_key="k")
+            self.assertEqual(asyncio.run(provider.list_models()), ["fake-large", "fake-small"])
+
+    def test_an_https_base_url_is_not_refused_for_its_scheme(self):
+        """Nothing is listening, so this must fail as a transport error and not as a scheme one."""
+        provider = OpenAICompatProvider(base_url="https://127.0.0.1:9/v1", api_key="k")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertNotIn("http or https", str(caught.exception))
+
+
+class _RedirectHandler(BaseHTTPRequestHandler):
+    """Records what it was sent, then either redirects or answers as a model server would."""
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._handle()
+
+    def _handle(self):
+        self.server.received.append((self.path, dict(self.headers)))
+        target = self.server.routes.get(self.path)
+        if target:
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = b'{"data": [{"id": "beyond-the-redirect"}]}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        """Silence: the test's own output is the assertion, not the access log."""
+
+
+class _RedirectServer:
+    """A real HTTP server on a loopback port, so the redirect is followed by urllib itself."""
+
+    def __init__(self, routes: dict[str, str] | None = None):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+        self.httpd.routes = routes or {}
+        self.httpd.received = []
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    @property
+    def received(self) -> list:
+        return self.httpd.received
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class RedirectTests(unittest.TestCase):
+    """A credential must not leave the origin the user configured, and neither must the request.
+
+    urllib's ``HTTPRedirectHandler`` re-sends every header that is not about the body to whatever
+    ``Location`` names, so a gateway answering ``/models`` with a 302 to another host delivered
+    ``Authorization: Bearer <key>`` there. ``requests`` and ``curl`` both strip the header on a
+    cross-origin redirect; urllib does not. Dropping the header is not enough here either: the
+    body of a ``/chat/completions`` request is the user's conversation, so the redirect is refused
+    rather than followed without the key.
+    """
+
+    def setUp(self):
+        self.elsewhere = _RedirectServer()
+        self.gateway = _RedirectServer(routes={
+            "/v1/models": self.elsewhere.url + "/v1/models",
+            "/v1/chat/completions": self.elsewhere.url + "/v1/chat/completions"})
+        self.addCleanup(self.gateway.close)
+        self.addCleanup(self.elsewhere.close)
+        self.key = "sk-SECRET-KEY-12345"
+
+    def _provider(self, base: str) -> OpenAICompatProvider:
+        return OpenAICompatProvider(base_url=base + "/v1", api_key=self.key)
+
+    def _stream(self, provider):
+        async def collect():
+            return [event async for event in provider.stream(
+                system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+        return asyncio.run(collect())
+
+    def _headers_seen_elsewhere(self) -> list[str]:
+        return [headers.get("Authorization", "") for _, headers in self.elsewhere.received]
+
+    def test_a_cross_origin_redirect_never_delivers_the_key(self):
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self._provider(self.gateway.url).list_models())
+        self.assertNotIn(f"Bearer {self.key}", self._headers_seen_elsewhere())
+
+    def test_a_cross_origin_redirect_is_refused_rather_than_followed(self):
+        """The request body is the conversation, so the other host gets no request at all."""
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self._provider(self.gateway.url).list_models())
+        self.assertEqual(self.elsewhere.received, [])
+
+    def test_the_refusal_names_where_it_would_have_gone(self):
+        """The other half of the pair above: this one pins the *cross-origin* wording.
+
+        The target here is ``http:``, so the scheme branch cannot fire and only one refusal is
+        reachable - but the branch is named in the assertion anyway, so that the two tests fail
+        for different reasons rather than both resting on a URL that every refusal echoes.
+        """
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(self._provider(self.gateway.url).list_models())
+        message = str(caught.exception)
+        self.assertIn(self.elsewhere.url.split("//")[1], message)
+        self.assertIn("a host you did not configure", message)
+        self.assertNotIn("must be http or https", message)
+        self.assertNotIn(self.key, message)
+
+    def test_stream_reports_it_as_an_error_event_not_an_exception(self):
+        events = self._stream(self._provider(self.gateway.url))
+        self.assertEqual([event.type for event in events], ["error"])
+        self.assertEqual(self.elsewhere.received, [])
+
+    def test_a_redirect_to_another_scheme_is_refused(self):
+        """``urllib`` follows a redirect to ``ftp:`` happily; the scheme check has to cover the
+        URL actually fetched, not only the one the user configured.
+
+        Asserted on the wording only the *scheme* branch produces, because an ``ftp:`` target is
+        refused twice over: it fails the scheme check, and it would fail the cross-origin check
+        below it too, since an origin carries its scheme and the configured one is always http or
+        https. Both refusals interpolate the URL, so matching on ``"ftp"`` - which is what this
+        test used to do - passes whichever branch fired, and stays green with the scheme check
+        deleted. The test names a specific control, so it has to fail when that control goes.
+        """
+        gateway = _RedirectServer(routes={"/v1/models": "ftp://127.0.0.1:9/models"})
+        self.addCleanup(gateway.close)
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(self._provider(gateway.url).list_models())
+        message = str(caught.exception)
+        self.assertIn("a model endpoint must be http or https", message)
+        self.assertIn("its scheme is 'ftp'", message)
+        self.assertNotIn("a host you did not configure", message)
+
+    def test_a_same_origin_redirect_is_still_followed_with_the_key(self):
+        """The cost of the rule has to stay on the case that matters: a gateway moving a path
+        within its own origin is ordinary, and refusing it would break working setups."""
+        server = _RedirectServer(routes={"/v1/models": "/v2/models"})
+        self.addCleanup(server.close)
+        self.assertEqual(asyncio.run(self._provider(server.url).list_models()), ["beyond-the-redirect"])
+        followed = [headers.get("Authorization") for path, headers in server.received
+                    if path == "/v2/models"]
+        self.assertEqual(followed, [f"Bearer {self.key}"])
+
+
+class _OpenResponse:
+    """Stands in for the live 302 ``urllib`` hands to ``redirect_request``."""
+
+    def __init__(self, closing_raises: Exception | None = None):
+        self.closed, self._closing_raises = False, closing_raises
+
+    def close(self) -> None:
+        self.closed = True
+        if self._closing_raises is not None:
+            raise self._closing_raises
+
+
+class RefusedRedirectClosesTheResponse(unittest.TestCase):
+    """A refusal returns nothing to ``urllib``, and ``urllib`` reads and closes the 302 only on
+    the path that returns. So the response the refusal arrived on is the refuser's to close:
+    left to the collector it surfaces as ``ResourceWarning: unclosed <socket.socket ...>`` in
+    whatever unrelated test is running when the collection falls due.
+    """
+
+    def _refuse(self, response: _OpenResponse, newurl: str = "https://elsewhere.example/v1/models"):
+        request = urllib.request.Request("https://gateway.example/v1/models")
+        return _SameOriginRedirects().redirect_request(
+            request, response, 302, "Found", {}, newurl)
+
+    def test_the_response_a_refusal_arrived_on_is_closed(self):
+        response = _OpenResponse()
+        with self.assertRaises(RedirectRefused):
+            self._refuse(response)
+        self.assertTrue(response.closed)
+
+    def test_a_close_that_fails_does_not_speak_in_place_of_the_refusal(self):
+        """The refusal is the security answer; an I/O error from the socket on the way down
+        would replace it with something the caller reports as a transport failure instead."""
+        response = _OpenResponse(closing_raises=OSError("connection already reset"))
+        with self.assertRaises(RedirectRefused):
+            self._refuse(response)
+
+    def test_a_followable_redirect_leaves_the_response_open(self):
+        """``urllib`` reads and closes it itself once this returns, and hands it to an
+        ``HTTPError`` on the method check inside the base class - closing early breaks both."""
+        response = _OpenResponse()
+        self.assertIsNotNone(self._refuse(response, "https://gateway.example/v2/models"))
+        self.assertFalse(response.closed)
+
+
+class RequestBodyTests(unittest.TestCase):
+    """What actually goes on the wire for a ``POST /chat/completions``.
+
+    Everything else about this provider is tested through what comes *back* - the stream, the
+    refusals, the redirect rule - so the request body itself was never read by an assertion. Each
+    line below is one that can be wrong without any of that noticing, because the server answers
+    a wrong request exactly as readily as a right one: a request that silently carries no image,
+    one that asks for no token accounting, and one that offers an ``Authorization`` header built
+    out of an absent key.
+
+    Asserted against a real server rather than by reaching into ``_request``, because the question
+    is what a server receives, and the mapping and the header assembly both sit between the two.
+    """
+
+    def _sent(self, messages, **provider_kwargs) -> dict:
+        """Drive one turn through ``stream`` and hand back the request the server recorded."""
+        with FakeServer("openai") as srv:
+            provider = OpenAICompatProvider(base_url=srv.url + "/v1", **provider_kwargs)
+
+            async def drain():
+                async for _ in provider.stream(system="sys", messages=messages, tools=[],
+                                               model="m", max_tokens=16, thinking="off"):
+                    pass
+
+            asyncio.run(drain())
+        return srv.requests[0]
+
+    @staticmethod
+    def _authorization(request) -> list[str]:
+        """Every ``Authorization`` header on the request, however the server spelled the name."""
+        return [value for name, value in request["headers"].items()
+                if name.lower() == "authorization"]
+
+    def test_an_image_reaches_the_server_as_a_data_uri_part(self):
+        """``Message.images`` is a documented field with a mapping of its own and no test on it.
+
+        Dropping the images silently is the failure worth catching: the request stays valid, the
+        server answers, and the model simply talks about a picture it was never shown.
+        """
+        message = Message(role="user", text="what is this?",
+                          images=[{"media_type": "image/png", "data": "iVBORw0KGgo="}])
+        body = self._sent([message], api_key="k")["body"]
+        self.assertEqual(body["messages"][-1]["content"],
+                         [{"type": "image_url",
+                           "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                          {"type": "text", "text": "what is this?"}])
+
+    def test_a_text_only_message_stays_a_plain_string(self):
+        """The other half of the same branch: a message with no images must not become a list.
+
+        Servers that accept the multi-part form for an image do not all accept it for text alone,
+        so taking the multimodal path unasked is its own way to break every ordinary turn.
+        """
+        body = self._sent([Message(role="user", text="hi")], api_key="k")["body"]
+        self.assertEqual(body["messages"][-1], {"role": "user", "content": "hi"})
+
+    def test_the_request_asks_the_server_to_report_token_usage(self):
+        """Usage arrives in a streamed response only when the request asks for it.
+
+        Without this flag an OpenAI-compatible server streams the same text and no usage block, so
+        every turn reports zero tokens and nothing else in the session looks wrong.
+        """
+        body = self._sent([Message(role="user", text="hi")], api_key="k")["body"]
+        self.assertEqual(body["stream_options"], {"include_usage": True})
+
+    def test_a_configured_key_is_sent_as_a_bearer_token(self):
+        request = self._sent([Message(role="user", text="hi")], api_key="sekrit")
+        self.assertEqual(self._authorization(request), ["Bearer sekrit"])
+
+    def test_a_keyless_provider_sends_no_authorization_header_at_all(self):
+        """Ollama, llama.cpp and LM Studio are the headline configuration and want no key.
+
+        The header is built from the key only when there is one; built unconditionally it becomes
+        ``Bearer`` with the empty string after it, which a gateway in front of a local model reads
+        as a credential that was offered and is wrong.
+        """
+        with patch.dict(os.environ, {"PICOAGENT_API_KEY": "", "OPENAI_API_KEY": ""}):
+            request = self._sent([Message(role="user", text="hi")])
+        self.assertEqual(self._authorization(request), [])
+
+
+class InterruptedToolBatchTests(unittest.TestCase):
+    """An assistant message whose tool calls were never answered must not reach the wire that way.
+
+    A Ctrl-C between the assistant message and its results (the tool batch can run for minutes)
+    leaves the log ending on ``tool_calls`` with no ``role: tool`` after it. OpenAI and the strict
+    compatible servers reject that shape with a 400 on *every* later turn, so a resumed session is
+    wedged for good and the user only sees an opaque provider error.
+    """
+
+    def _mapped(self, messages):
+        return to_openai_messages("sys", messages)
+
+    def test_an_unanswered_call_gets_an_answer_before_the_request_is_sent(self):
+        messages = [Message(role="user", text="run it"),
+                    Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {"cmd": "sleep 600"})])]
+        answered = [entry for entry in self._mapped(messages) if entry["role"] == "tool"]
+        self.assertEqual([entry["tool_call_id"] for entry in answered], ["c1"])
+
+    def test_the_answer_claims_neither_success_nor_failure(self):
+        """The one thing known about an interrupted call is that its outcome is not known."""
+        messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})])]
+        content = [e for e in self._mapped(messages) if e["role"] == "tool"][0]["content"]
+        self.assertIn("unknown", content.lower())
+        self.assertNotIn("failed", content.lower())
+        self.assertNotIn("succeeded", content.lower())
+
+    def test_a_batch_that_finished_is_left_exactly_as_it_was(self):
+        messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "read", {})]),
+                    Message(role="tool", tool_results=[ToolResult("c1", "file contents")])]
+        answered = [e for e in self._mapped(messages) if e["role"] == "tool"]
+        self.assertEqual([(e["tool_call_id"], e["content"]) for e in answered], [("c1", "file contents")])
+
+    def test_only_the_calls_nobody_answered_are_answered_here(self):
+        """A half-answered batch is a plugin's history rewrite, not something the loop writes.
+        Every id has to be answered exactly once; which of the two entries comes first is the
+        server's business, since it matches them by ``tool_call_id``."""
+        calls = [ToolCall("c1", "read", {}), ToolCall("c2", "read", {})]
+        messages = [Message(role="assistant", tool_calls=calls),
+                    Message(role="tool", tool_results=[ToolResult("c1", "first")])]
+        answered = [e for e in self._mapped(messages) if e["role"] == "tool"]
+        self.assertEqual(sorted(e["tool_call_id"] for e in answered), ["c1", "c2"])
+        self.assertEqual([e["content"] for e in answered if e["tool_call_id"] == "c1"], ["first"])
+
+    def test_one_id_is_answered_once_however_often_the_model_repeated_it(self):
+        """Two calls sharing an id is already a malformed assistant message, from a model or from
+        a plugin that rewrote the batch. Answering each of them separately turns that into the
+        duplicate-``tool_call_id`` 400 - the same class of refusal this repair exists to avoid."""
+        calls = [ToolCall("dup", "read", {}), ToolCall("dup", "read", {})]
+        answered = [e for e in self._mapped([Message(role="assistant", tool_calls=calls)])
+                    if e["role"] == "tool"]
+        self.assertEqual([e["tool_call_id"] for e in answered], ["dup"])
+
+    def test_the_answer_sits_between_the_call_and_whatever_the_user_typed_next(self):
+        """On ``-r`` the next entry is the new prompt, and a tool message after it is the same 400."""
+        messages = [Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})]),
+                    Message(role="user", text="what happened?")]
+        roles = [entry["role"] for entry in self._mapped(messages)]
+        self.assertEqual(roles, ["system", "assistant", "tool", "user"])
+
+    def test_a_resumed_interrupted_session_answers_every_call_it_replays(self):
+        """End to end: the log an interrupt leaves behind, read back the way ``-r`` reads it."""
+        tmp = temp_dir()
+        session = Session(tmp / "s.jsonl", tmp)
+        session.append_message(Message(role="user", text="run it"))
+        session.append_message(Message(role="assistant", tool_calls=[ToolCall("c1", "shell", {})]))
+        before = (tmp / "s.jsonl").read_text()
+
+        resumed = Session(tmp / "s.jsonl", tmp, resume=True)
+        resumed.append_message(Message(role="user", text="are you there?"))
+        mapped = to_openai_messages("sys", resumed.messages())
+
+        called = [call["id"] for entry in mapped if entry["role"] == "assistant"
+                  for call in entry.get("tool_calls", [])]
+        self.assertEqual([entry["tool_call_id"] for entry in mapped if entry["role"] == "tool"], called)
+        self.assertTrue((tmp / "s.jsonl").read_text().startswith(before),
+                        "the repair is a rendering decision; the log keeps what actually happened")
 
 
 if __name__ == "__main__":

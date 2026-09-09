@@ -4,11 +4,10 @@
 exercise the real commands - ls-remote, fetch, merge --ff-only - with no network.
 """
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 
-from helpers import ROOT  # noqa: F401  (puts picoagent on sys.path)
+from helpers import ROOT, temp_dir  # noqa: F401  (puts picoagent on sys.path)
 from picoagent.plugins import loader, upgrade
 
 GIT_ID = ["-c", "user.email=t@t", "-c", "user.name=t"]
@@ -76,7 +75,7 @@ class ParseSpecTests(unittest.TestCase):
 
 class UpgradeDetectionTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_origin(self.tmp)
         self.checkout = self.tmp / "checkout"
         subprocess.run(["git", "clone", "-q", str(self.origin), str(self.checkout)], check=True)
@@ -145,7 +144,7 @@ class ClonePathTests(unittest.TestCase):
     """resolve_source clones on first use and moves forward on later ones."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_origin(self.tmp)
         self.cfg = {"_cwd": str(self.tmp / "project"), "_user_dir": str(self.tmp / "home"),
                     "plugins": {"enabled": []}}
@@ -176,7 +175,7 @@ class ClonePathTests(unittest.TestCase):
 
 class CheckPluginsTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.origin = make_origin(self.tmp)
         self.cfg = {"_cwd": str(self.tmp), "_user_dir": str(self.tmp / "home"),
                     "plugins": {"enabled": [f"file://{self.origin}@main"]}}

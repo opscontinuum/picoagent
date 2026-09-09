@@ -4,10 +4,12 @@ Every test spawns the real fake server in ``picoagent/testing/fake_mcp.py`` as a
 so the JSON-RPC framing, the pipe and the process lifecycle are all under test - the parts a
 transport double would replace are exactly the parts that break.
 """
-import sys, tempfile, time, unittest
+import json, os, sys, time, unittest
 from pathlib import Path
-from helpers import ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT
+from unittest import mock
+from helpers import ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.tools import ReadTool
+from picoagent.plugins import api as plugin_api
 from picoagent.plugins import loader
 
 PLUGIN = ROOT / "examples/plugins/mcp"
@@ -25,9 +27,36 @@ def server(mode="serve", **overrides):
             "env": {"PYTHONPATH": str(ROOT)}, **overrides}
 
 
+#: A server that answers one question: what environment did you start with? It is the fake
+#: server with its tool table replaced, driven through ``-c`` rather than shipped as a file,
+#: because a file on disk would be one more thing to keep in step with the fake server it
+#: borrows the handshake from.
+ENV_REPORTING_SERVER = """
+import json, os, sys
+from picoagent.testing import fake_mcp
+
+fake_mcp.TOOLS = [{"name": "env", "description": "Report this process's environment.",
+                   "inputSchema": {"type": "object", "properties": {}}}]
+fake_mcp.call_tool = lambda params: fake_mcp.text_result(json.dumps(dict(os.environ)))
+sys.exit(fake_mcp.FakeMcpServer("serve").run())
+"""
+
+#: Two variables planted in the agent's own environment: one shaped like every credential a
+#: shell exports, one that a server legitimately needs and is named per server. Neither is
+#: anything picoagent itself reads, so planting them changes nothing else in the run.
+SECRET = "PICOAGENT_TEST_CLOUD_SECRET"
+ALLOWED = "PICOAGENT_TEST_SERVER_TOKEN"
+
+
+def env_reporting_server(**overrides):
+    """The ``[plugins.mcp.servers.<name>]`` table for :data:`ENV_REPORTING_SERVER`."""
+    return {"command": sys.executable, "args": ["-c", ENV_REPORTING_SERVER],
+            "env": {"PYTHONPATH": str(ROOT)}, **overrides}
+
+
 class McpBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def load(self, servers, **plugin_config):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]))
@@ -181,6 +210,65 @@ class TranslationTests(unittest.TestCase):
         text_out, is_error = mcp_client.render_result({"content": [], "structuredContent": {"count": 2}})
         self.assertIn('"count": 2', text_out)
         self.assertFalse(is_error)
+
+
+class EnvironmentTests(McpBase):
+    """What a server process is handed. A server is a long-lived child running arguments the
+    model chose, so the agent's own environment is the one thing it must not inherit whole."""
+
+    def setUp(self):
+        super().setUp()
+        planted = mock.patch.dict(os.environ, {SECRET: "leaked-cloud-credential",
+                                               ALLOWED: "the-servers-own-token"})
+        planted.start()
+        self.addCleanup(planted.stop)
+
+    def child_env(self, **overrides) -> dict:
+        """The environment the child actually started with, as the child itself reports it."""
+        rt = self.load({"probe": env_reporting_server(**overrides)})
+        result = self.call(rt, "probe_env")
+        self.assertFalse(result.is_error, result.content)
+        return json.loads(result.content)
+
+    def test_a_credential_in_the_agents_environment_does_not_reach_the_server(self):
+        self.assertNotIn(SECRET, self.child_env())
+
+    def test_a_variable_named_in_pass_env_does_reach_the_server(self):
+        received = self.child_env(pass_env=[ALLOWED])
+        self.assertEqual(received.get(ALLOWED), "the-servers-own-token")
+        self.assertNotIn(SECRET, received)         # naming one variable widens nothing else
+
+    def test_the_server_still_gets_what_it_needs_to_be_a_runnable_program(self):
+        received = self.child_env()
+        self.assertEqual(received.get("PATH"), os.environ.get("PATH"))
+        self.assertEqual(received.get("PYTHONPATH"), str(ROOT))   # the per-server env table
+
+
+class MinimalEnvTests(unittest.TestCase):
+    """``minimal_env`` itself: the platform names that survive, and everything that does not.
+
+    Here rather than beside the plugin because a real child can only be spawned on the platform
+    running the tests, and the Windows half of the answer has to be checkable on Linux too.
+    """
+
+    WINDOWS_ENV = {"SystemRoot": r"C:\Windows", "PATH": r"C:\Windows\system32",
+                   "USERPROFILE": r"C:\Users\dana", "AWS_SECRET_ACCESS_KEY": "shibboleth"}
+
+    def test_the_windows_names_a_child_cannot_start_without_survive(self):
+        built = plugin_api.minimal_env(base=self.WINDOWS_ENV)
+        self.assertEqual(built.get("SystemRoot"), r"C:\Windows")   # sockets fail without it
+        self.assertEqual(built.get("USERPROFILE"), r"C:\Users\dana")
+
+    def test_a_credential_shaped_name_is_not_in_the_default_set(self):
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", plugin_api.minimal_env(base=self.WINDOWS_ENV))
+
+    def test_a_named_variable_is_taken_whatever_case_the_environment_spells_it(self):
+        built = plugin_api.minimal_env(pass_env=["systemroot"], base=self.WINDOWS_ENV)
+        self.assertEqual(built.get("SystemRoot"), r"C:\Windows")
+
+    def test_the_extra_table_wins_over_the_inherited_value(self):
+        built = plugin_api.minimal_env({"PATH": "/opt/only"}, base={"PATH": "/usr/bin"})
+        self.assertEqual(built["PATH"], "/opt/only")
 
 
 class LifecycleTests(McpBase):

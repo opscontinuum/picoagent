@@ -3,11 +3,11 @@ guarantee that every rendered sentence is either template text or a user's answe
 import json
 import re
 import sys
-import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
-from helpers import CaptureFrontend, ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT
+from helpers import CaptureFrontend, ScriptedProvider, make_runtime, run, text, tool_ctx, ROOT, temp_dir
 from picoagent.core.tools import PathRefused
 from picoagent.plugins import loader
 from picoagent.testing.fake_iac import (AWS_SAMPLE_TF, OCI_SAMPLE_TF, SAMPLE_ANSWERS,
@@ -124,7 +124,7 @@ class ScannerTests(unittest.TestCase):
     block boundaries but are not."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.terraform = write_sample_project(self.tmp)
         self.inventory = iac_inventory.scan_terraform_dir(self.terraform)
         self.by_address = {ci.address: ci for ci in self.inventory.cis}
@@ -204,7 +204,7 @@ class ScannerTests(unittest.TestCase):
 
 class OtherInputTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
 
     def test_terraform_show_json_resolves_values_and_walks_child_modules(self):
         inventory = iac_inventory.read_terraform_show_json(write_terraform_show_json(self.tmp))
@@ -235,7 +235,7 @@ class OtherInputTests(unittest.TestCase):
 
 class PluginBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]),
                                frontend=CaptureFrontend())
         loader.load_plugin(PLUGIN, self.rt, loader.TrustStore(self.tmp / "home"),
@@ -473,7 +473,7 @@ class ProvenanceTests(unittest.TestCase):
 
 class RunbookTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = temp_dir()
         self.cis = iac_inventory.scan_terraform_dir(write_sample_project(self.tmp)).cis
 
     def test_each_runbook_has_the_fixed_skeleton(self):
@@ -508,6 +508,45 @@ class RunbookTests(unittest.TestCase):
     def test_no_cis_yields_an_explicit_todo_rather_than_an_empty_section(self):
         document, _ = iscp_render.render_runbook(*iscp_render.RUNBOOKS[0], [], SAMPLE_ANSWERS)
         self.assertIn("TODO(iscp_import_cis)", document)
+
+
+class CiInventorySiteTests(unittest.TestCase):
+    """The Site column of CI-inventory.md, which a person signs.
+
+    Table 2.5 records a site by Designation, Site Name, Site Type and Address. It has no region
+    column, so a Configuration Item joins to it by site name: its own ``site`` where the estate
+    records one, and its ``region`` only when the user accepted the region prefill, which writes
+    each distinct region into a Site Name cell. Every case here uses a site name a user typed,
+    which is exactly what the prefill never produces.
+    """
+
+    ASHBURN = [{"Designation": "Primary Site", "Site Name": "Ashburn DC", "Site Type": "Hot Sites",
+                "Address": "44 Example Way, Ashburn VA"}]
+
+    def ci(self, **overrides) -> iac_inventory.CI:
+        fields = {"ci_id": "CI-001", "name": "orders", "address": "aws_db_instance.orders",
+                  "resource_type": "aws_db_instance", "category": "database", "cloud": "aws",
+                  "region": "us-east-1", "source": "main.tf"}
+        return iac_inventory.CI(**{**fields, **overrides})
+
+    def row_for(self, ci: iac_inventory.CI, answers: dict) -> str:
+        document = iscp_render.render_ci_inventory([ci], answers)
+        return next(line for line in document.splitlines() if line.startswith("| CI-001 "))
+
+    def test_a_site_name_the_user_typed_resolves_to_its_designation(self):
+        row = self.row_for(self.ci(site="Ashburn DC"), {"sites": self.ASHBURN})
+        self.assertIn("Primary Site", row,
+                      f"Table 2.5 designates Ashburn DC the primary site: {row!r}")
+
+    def test_a_site_absent_from_table_2_5_is_visible_rather_than_blank(self):
+        row = self.row_for(self.ci(), {"sites": self.ASHBURN})
+        self.assertIn("TODO(sites)", row,
+                      f"us-east-1 is in no Table 2.5 row, and the reader has to see that: {row!r}")
+
+    def test_an_accepted_region_prefill_still_resolves(self):
+        prefilled = [{"Designation": "Alternate Site", "Site Name": "us-east-1",
+                      "Site Type": "Warm Sites", "Address": ""}]
+        self.assertIn("Alternate Site", self.row_for(self.ci(), {"sites": prefilled}))
 
 
 class RenderToolTests(PluginBase):
@@ -579,8 +618,6 @@ class CommandTests(PluginBase):
             self.assertIn(f"{section:5}", summary)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ConfinementTests(unittest.TestCase):
@@ -589,48 +626,114 @@ class ConfinementTests(unittest.TestCase):
     It previously returned absolute paths unchecked, so a deployment that switched confinement
     on still had this plugin reading and writing outside the project while read/write/edit
     refused - the one behaviour such a deployment cannot tolerate.
+
+    The rule itself now lives in ``picoagent.core.tools`` and is shared with stig-runner, so
+    these assert that this plugin resolves through it - the plugin's own copy is what drifted
+    from stig-runner's over the ``@`` prefix and over symlinks.
     """
 
     def setUp(self):
-        self.proj = Path(tempfile.mkdtemp())
-        self.outside = Path(tempfile.mkdtemp())
+        self.proj = temp_dir()
+        self.outside = temp_dir()
         (self.outside / "main.tf").write_text('resource "aws_instance" "x" {}\n')
+
+    def resolve(self, raw, **cfg):
+        return iscp_author.resolve_path_inside_project(tool_ctx(self.proj, **cfg), raw)
 
     def test_absolute_outside_path_is_allowed_when_confinement_is_off(self):
         """The default must not change: a Terraform repo often sits beside the docs repo."""
-        ctx = tool_ctx(self.proj, confine_to_project=False)
-        self.assertEqual(iscp_author._resolve_inside(ctx, str(self.outside / "main.tf")),
+        self.assertEqual(self.resolve(str(self.outside / "main.tf"), confine_to_project=False),
                          self.outside / "main.tf")
 
     def test_absolute_outside_path_is_refused_when_confinement_is_on(self):
-        ctx = tool_ctx(self.proj, confine_to_project=True)
         with self.assertRaises(PathRefused):
-            iscp_author._resolve_inside(ctx, str(self.outside / "main.tf"))
+            self.resolve(str(self.outside / "main.tf"), confine_to_project=True)
 
     def test_relative_escape_is_refused_whether_or_not_confinement_is_on(self):
         """A usability guard, not a security one - an injection can write an absolute path."""
         for confine in (False, True):
             with self.subTest(confine=confine):
-                with self.assertRaises(ValueError):
-                    iscp_author._resolve_inside(tool_ctx(self.proj, confine_to_project=confine),
-                                                "../escape")
+                with self.assertRaises(PathRefused):
+                    self.resolve("../escape", confine_to_project=confine)
+
+    def test_an_at_prefixed_relative_escape_is_refused_too(self):
+        """``@../escape`` is ``../escape``. Models copy the ``@`` out of an ``@file`` mention and
+        the resolution strips it, so an escape check that reads the unstripped string is checking
+        a path nothing will open - and passes the one that will."""
+        with self.assertRaises(PathRefused):
+            self.resolve("@../escape")
+
+    def test_a_relative_path_leaving_through_a_symlink_is_refused(self):
+        """The escape has to be judged on the resolved path. A link inside the project is a
+        child of it textually and points wherever it points."""
+        (self.proj / "link").symlink_to(self.outside)
+        with self.assertRaises(PathRefused):
+            self.resolve("link/main.tf")
 
     def test_a_path_inside_the_project_still_resolves_under_confinement(self):
-        ctx = tool_ctx(self.proj, confine_to_project=True)
-        self.assertEqual(iscp_author._resolve_inside(ctx, "docs/out"), self.proj / "docs/out")
+        self.assertEqual(self.resolve("docs/out", confine_to_project=True), self.proj / "docs/out")
 
-    def test_a_nul_byte_is_rejected_as_a_value_error_the_tools_catch(self):
-        """A NUL used to escape the tool as an unhandled ValueError from path.exists().
-
-        It is raised here rather than returned because both call sites catch ValueError and
-        PathRefused and turn them into error results - asserted by the next test.
-        """
-        with self.assertRaises(ValueError):
-            iscp_author._resolve_inside(tool_ctx(self.proj), "out\x00")
+    def test_a_nul_byte_is_refused_rather_than_escaping_as_a_value_error(self):
+        """A NUL used to escape the tool as an unhandled ValueError from path.exists(). It is a
+        path the OS cannot resolve, which the seam already answers with a refusal."""
+        with self.assertRaises(PathRefused):
+            self.resolve("out\x00")
 
     def test_both_call_sites_convert_a_refusal_into_an_error_result(self):
         """The convention is: expected failures return an error result, bugs raise."""
         import inspect
         source = inspect.getsource(iscp_author)
-        self.assertEqual(source.count("except (ValueError, PathRefused) as exc:"), 2,
-                         "every _resolve_inside call site must catch both refusal types")
+        self.assertEqual(source.count("except PathRefused as exc:"), 2,
+                         "every resolve_path_inside_project call site must catch the refusal")
+
+
+class ProjectConfigLayerTests(unittest.TestCase):
+    """What a cloned repository's ``[plugins.iscp-author]`` may decide, which is nothing.
+
+    Both settings this plugin reads name a place it writes: the answers file it replaces on
+    every recorded answer, and the directory ``iscp_render`` creates and fills. Neither is
+    confined where ``register`` reads it, so a repository choosing one would be choosing which
+    of the user's files get overwritten with a contingency plan. The refusal is the point of
+    these tests; that it is announced rather than silent is the other half, because a
+    repository author whose setting did nothing and a user who cloned that repository both
+    need to see the same line.
+    """
+
+    def setUp(self):
+        self.tmp = temp_dir()
+        (self.tmp / ".picoagent").mkdir()
+        self.outside = self.tmp / "outside"
+
+    def _runtime(self, project: str):
+        (self.tmp / ".picoagent" / "config.toml").write_text(textwrap.dedent(project))
+        rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]), frontend=CaptureFrontend())
+        loader.load_plugin(PLUGIN, rt, loader.TrustStore(self.tmp / "home"), allow_untrusted=True)
+        return rt
+
+    def _tool(self, rt, name, **args):
+        return run(rt.tools.get(name).execute(args, tool_ctx(self.tmp)))
+
+    def test_a_repository_cannot_move_the_file_the_interview_is_written_to(self):
+        rt = self._runtime(f'[plugins.iscp-author]\nanswers = "{self.outside / "answers.json"}"\n')
+        outcome = self._tool(rt, "iscp_answer", id="scope.rto_hours", value=12)
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertTrue((self.tmp / "contingency/answers.json").exists())
+        self.assertFalse(self.outside.exists(), "a repository's config chose where the plugin writes")
+
+    def test_a_repository_cannot_move_where_the_rendered_plan_is_written(self):
+        rt = self._runtime(f'[plugins.iscp-author]\noutput = "{self.outside}"\n')
+        outcome = self._tool(rt, "iscp_render")
+        self.assertFalse(outcome.is_error, outcome.content)
+        self.assertTrue((self.tmp / "contingency/out/ISCP.md").exists())
+        self.assertFalse(self.outside.exists(), "a repository's config chose the output directory")
+
+    def test_both_refusals_are_named_at_session_start(self):
+        rt = self._runtime('[plugins.iscp-author]\nanswers = "a.json"\noutput = "out"\n')
+        run(rt.events.emit("session_start", {}, rt))
+        notices = "\n".join(payload["text"] for event, payload in rt.frontend.events if event == "notice")
+        self.assertIn("iscp-author: ignored answers, output", notices)
+        self.assertIn("read from your own config only", notices)
+
+
+if __name__ == "__main__":
+    unittest.main()

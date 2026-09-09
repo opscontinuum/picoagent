@@ -34,8 +34,14 @@ exercise real field names:
 
 Deliberately absent: anything that changes the cluster. Reroute, ILM retry/move, restore,
 index deletion and every other write still go through ``es_request`` and its
-``allow_destructive`` gate. The one exception is ``es_slowlog enable|disable``, which writes
-three named keys and nothing else, after the user confirms.
+``allow_destructive`` gate. Two calls here are exceptions and are shown to the user in full
+before they run: ``es_slowlog enable|disable`` writes three named keys and nothing else, and
+``es_snapshots verify=true`` has every node write a test blob to the repository. A shown-and-
+agreed write reaches the cluster through ``ESClient.request_after_confirmation``, the gate's
+only bypass, so that method's call sites are exactly the writes a person approved. With nobody
+to ask, ``es_snapshots verify`` is skipped outright and ``es_slowlog`` is too unless
+``allow_destructive`` is set - and where it is, the write is an authorised one rather than a
+confirmed one, so it goes through the ordinary gated ``request``.
 
 Two deviations from the 1.0 plan, both forced by the API:
 
@@ -51,14 +57,13 @@ Two deviations from the 1.0 plan, both forced by the API:
 from __future__ import annotations
 
 import fnmatch
-import inspect
 import json
 import urllib.parse
+from collections import Counter
 from typing import Any
 
-from picoagent.core.types import ToolResult
-
-from es_client import ESError, _ESTool, result, text_table
+from es_client import ESError, _ESTool, text_table
+from picoagent.core.tools import tool_result
 
 ES_ADMIN_PROMPT_NOTE = """
 ## Cluster administration
@@ -84,6 +89,10 @@ SETTING_KEYS = (
     "index.codec", "index.max_result_window",
 )
 
+#: The query that makes ``_settings`` answer with the cluster's defaults as well as the values
+#: this index explicitly set. Without it a threshold left at its default reads as absent.
+SETTINGS_QUERY = "?flat_settings=true&include_defaults=true"
+
 #: The three keys es_slowlog is allowed to write. Anything else is es_request's problem.
 SLOWLOG_KEYS = ("index.search.slowlog.threshold.query.warn",
                 "index.search.slowlog.threshold.fetch.warn",
@@ -94,11 +103,13 @@ SLOWLOG_INDEX = "logs-elasticsearch.slowlog-*,filebeat-*"
 SLOWLOG_DATASETS = ("elasticsearch.slowlog", "elasticsearch.index.slowlog", "elasticsearch.search.slowlog")
 
 #: Thread pools worth asking about; the rest are noise on a healthy cluster.
-THREAD_POOLS = "write,search,get,bulk,management,snapshot,force_merge,refresh,flush"
+THREAD_POOLS = ("write", "search", "get", "bulk", "management", "snapshot", "force_merge",
+                "refresh", "flush")
 
 HEAP_WARN_PERCENT = 75.0        # JVM heap that stays this high is the usual prelude to old-GC pain
 DISK_WARN_PERCENT = 85.0        # cluster.routing.allocation.disk.watermark.low default
 PENDING_TASK_WARN_SECONDS = 30  # a cluster-state task queued this long means a busy master
+OLD_GC_WARN_MILLIS = 60_000     # a minute of old-generation GC, totalled over the node's life
 
 
 # ------------------------------------------------------------------ small helpers
@@ -148,6 +159,17 @@ def _dig(obj: Any, *path: str) -> Any:
     return obj
 
 
+def _effective_settings(response: dict) -> dict:
+    """Merge ``defaults`` under ``settings`` for the first (usually only) index returned.
+
+    Two tools ask this question - ``es_index_inspect`` about every setting an administrator
+    reads, ``es_slowlog`` about three of them - and both have to answer it the same way, or
+    one of them reports a default as unset while the other reports its value.
+    """
+    body = next(iter(response.values())) if response else {}
+    return {**(body.get("defaults") or {}), **(body.get("settings") or {})}
+
+
 def _flag(text: str) -> str:
     return f"  ! {text}"
 
@@ -157,25 +179,9 @@ def _counts(counts: dict) -> str:
     return ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
 
 
-class _AdminTool(_ESTool):
-    """``_ESTool`` with an awaitable ``run``, so a tool can stop and ask the user.
-
-    ``_ESTool.execute`` calls ``run`` synchronously, which is right for the read-only data
-    tools. Two of these need ``ctx.ui.ask``, and one base with an ``isawaitable`` check beats
-    two near-identical bases.
-    """
-
-    async def execute(self, args: dict, ctx) -> ToolResult:
-        try:
-            outcome = self.run(args, ctx)
-            return await outcome if inspect.isawaitable(outcome) else outcome
-        except ESError as exc:
-            return ToolResult(ctx.tool_call_id, str(exc), is_error=True)
-
-
 # ------------------------------------------------------------------ shards and recovery
 
-class ShardsTool(_AdminTool):
+class ShardsTool(_ESTool):
     name = "es_shards"
     description = ("Shard table with unassigned shards first and their reasons, counts by state, and shards "
                    "per node (imbalance shows up here). explain=true adds the allocation decision for one "
@@ -198,17 +204,7 @@ class ShardsTool(_AdminTool):
         index = args.get("index") or ""
         path = f"/_cat/shards/{_quote(index)}" if index else "/_cat/shards"
         rows = self.es.request("GET", f"{path}?format=json&bytes=b&h={self.COLUMNS}")
-
-        by_state: dict[str, int] = {}
-        per_node: dict[str, int] = {}
-        reasons: dict[str, int] = {}
-        for row in rows:
-            by_state[row.get("state") or "?"] = by_state.get(row.get("state") or "?", 0) + 1
-            node = (row.get("node") or "").split(" ")[0]        # RELOCATING packs "from -> to" in one column
-            if node:
-                per_node[node] = per_node.get(node, 0) + 1
-            if row.get("unassigned.reason"):
-                reasons[row["unassigned.reason"]] = reasons.get(row["unassigned.reason"], 0) + 1
+        by_state, per_node, reasons = self._tally(rows)
 
         wanted = (args.get("state") or "").upper()
         shown = [r for r in rows if not wanted or (r.get("state") or "").upper() == wanted]
@@ -218,9 +214,7 @@ class ShardsTool(_AdminTool):
         lines = [f"{len(rows)} shards for {index or '*'}"
                  f"{f'; showing {len(shown)} in state {wanted}' if wanted else ''}"]
         header = ["index", "shard", "pr", "state", "docs", "store", "node", "unassigned"]
-        table = [[r.get("index", ""), r.get("shard", ""), r.get("prirep", ""), r.get("state", ""),
-                  r.get("docs") or "-", _bytes(_num(r.get("store"))) if r.get("store") else "-",
-                  (r.get("node") or "-"), self._unassigned(r)] for r in shown]
+        table = [self._row(row) for row in shown]
         lines.append(text_table(header, table) if table else "(no shards match)")
         lines.append("")
         lines.append("By state: " + _counts(by_state))
@@ -231,7 +225,32 @@ class ShardsTool(_AdminTool):
 
         if args.get("explain"):
             lines += ["", *self._explain(args, rows, index)]
-        return result(ctx, "\n".join(lines), shards=len(rows), unassigned=by_state.get("UNASSIGNED", 0))
+        return tool_result(ctx, "\n".join(lines), shards=len(rows), unassigned=by_state.get("UNASSIGNED", 0))
+
+    @staticmethod
+    def _tally(rows: list[dict]) -> tuple[Counter, Counter, Counter]:
+        """Shards by state, by node, and by unassigned reason.
+
+        Counted over every shard the cluster reported rather than over the rows the table is
+        about to show, which is what makes the summary lines mean something next to a filtered
+        table: ``state=UNASSIGNED`` would otherwise report "shards per node: none assigned" and
+        call it a cluster fact.
+        """
+        by_state = Counter(row.get("state") or "?" for row in rows)
+        # RELOCATING packs "from -> to" into the node column; the shard counts where it is now.
+        per_node = Counter(node for node in ((row.get("node") or "").split(" ")[0] for row in rows) if node)
+        reasons = Counter(row["unassigned.reason"] for row in rows if row.get("unassigned.reason"))
+        return by_state, per_node, reasons
+
+    def _row(self, row: dict) -> list:
+        """One cat row as table cells, in :meth:`run`'s header order.
+
+        Every cell has a fallback because cat omits a column rather than emptying it: an
+        unassigned shard has no node and no doc count, and ``store`` is absent rather than 0.
+        """
+        return [row.get("index", ""), row.get("shard", ""), row.get("prirep", ""), row.get("state", ""),
+                row.get("docs") or "-", _bytes(_num(row.get("store"))) if row.get("store") else "-",
+                row.get("node") or "-", self._unassigned(row)]
 
     def _unassigned(self, row: dict) -> str:
         if not row.get("unassigned.reason"):
@@ -283,7 +302,7 @@ class ShardsTool(_AdminTool):
         return lines
 
 
-class RecoveryTool(_AdminTool):
+class RecoveryTool(_ESTool):
     name = "es_recovery"
     description = ("Shard recoveries - snapshot restores, relocations and replica builds - with stage and "
                    "percentage complete, grouped by type. 'No active recoveries' is a real answer.")
@@ -300,7 +319,8 @@ class RecoveryTool(_AdminTool):
         path = f"/_cat/recovery/{_quote(index)}" if index else "/_cat/recovery"
         rows = self.es.request("GET", f"{path}?format=json&bytes=b&active_only={active}&h={self.COLUMNS}")
         if not rows:
-            return result(ctx, f"no {'active ' if active == 'true' else ''}recoveries for {index or '*'}")
+            return tool_result(
+                ctx, f"no {'active ' if active == 'true' else ''}recoveries for {index or '*'}")
 
         groups: dict[str, list[dict]] = {}
         for row in rows:
@@ -313,12 +333,12 @@ class RecoveryTool(_AdminTool):
                              f"time={row.get('time')}  {row.get('source_node')} -> {row.get('target_node')}  "
                              f"files {row.get('files_percent')}  bytes {row.get('bytes_percent')}  "
                              f"translog {row.get('translog_ops_percent')}")
-        return result(ctx, "\n".join(lines), recoveries=len(rows))
+        return tool_result(ctx, "\n".join(lines), recoveries=len(rows))
 
 
 # ------------------------------------------------------------------ nodes
 
-class NodesTool(_AdminTool):
+class NodesTool(_ESTool):
     name = "es_nodes"
     description = ("Node health: heap, GC, CPU, load, disk, circuit breakers (view=summary, the default); "
                    "view=thread_pools for queue depth and rejections; view=breakers for limits and trips; "
@@ -368,7 +388,7 @@ class NodesTool(_AdminTool):
         lines = [f"{len(rows)} nodes", text_table(header, table) if table else "(no nodes match)",
                  "", "Warnings:"]
         lines += warnings or ["  none - heap, disk and circuit breakers are all within thresholds"]
-        return result(ctx, "\n".join(lines), nodes=len(rows), warnings=len(warnings))
+        return tool_result(ctx, "\n".join(lines), nodes=len(rows), warnings=len(warnings))
 
     def _warnings(self, name: str, row: dict, stats: dict) -> list[str]:
         found = []
@@ -384,7 +404,7 @@ class NodesTool(_AdminTool):
                 found.append(_flag(f"{name}: breaker {breaker} tripped {body['tripped']} times "
                                    f"(estimated {body.get('estimated_size')} of {body.get('limit_size')})"))
         gc_old = _dig(stats, "jvm", "gc", "collectors", "old") or {}
-        if _num(gc_old.get("collection_time_in_millis")) > 60_000:
+        if _num(gc_old.get("collection_time_in_millis")) > OLD_GC_WARN_MILLIS:
             found.append(_flag(f"{name}: old-generation GC has spent "
                                f"{_num(gc_old['collection_time_in_millis']) / 1000:.0f}s over "
                                f"{gc_old.get('collection_count')} collections"))
@@ -392,7 +412,8 @@ class NodesTool(_AdminTool):
 
     def _thread_pools(self, node: str, ctx):
         columns = "node_name,name,active,queue,rejected,completed,size,queue_size,type"
-        rows = self.es.request("GET", f"/_cat/thread_pool/{THREAD_POOLS}?format=json&h={columns}")
+        pools = ",".join(THREAD_POOLS)
+        rows = self.es.request("GET", f"/_cat/thread_pool/{pools}?format=json&h={columns}")
         if node:
             rows = [r for r in rows if node in (r.get("node_name") or "")]
         rows.sort(key=lambda r: (-_num(r.get("rejected")), -_num(r.get("queue")), r.get("node_name") or "",
@@ -402,13 +423,13 @@ class NodesTool(_AdminTool):
                   r.get("queue", ""), r.get("queue_size", ""), r.get("rejected", ""),
                   r.get("completed", ""), r.get("size", "")] for r in rows]
         busy = [r for r in rows if _num(r.get("rejected")) or _num(r.get("queue"))]
-        lines = [f"{len(rows)} thread pools ({THREAD_POOLS}); rejecting or queueing first",
+        lines = [f"{len(rows)} thread pools ({pools}); rejecting or queueing first",
                  text_table(header, table) if table else "(no thread pools match)"]
         if busy:
             lines += ["", "Rejections mean work was dropped, not delayed - the client saw an error:"]
             lines += [f"  {r.get('node_name')} {r.get('name')}: rejected={r.get('rejected')} "
                       f"queue={r.get('queue')}" for r in busy]
-        return result(ctx, "\n".join(lines), pools=len(rows), busy=len(busy))
+        return tool_result(ctx, "\n".join(lines), pools=len(rows), busy=len(busy))
 
     def _breakers(self, node: str, ctx):
         lines = []
@@ -418,7 +439,7 @@ class NodesTool(_AdminTool):
                 lines.append(f"  {breaker:20} estimated={stats.get('estimated_size')} "
                              f"limit={stats.get('limit_size')} overhead={stats.get('overhead')} "
                              f"tripped={stats.get('tripped')}")
-        return result(ctx, "\n".join(lines) or "(no nodes match)")
+        return tool_result(ctx, "\n".join(lines) or "(no nodes match)")
 
     def _tasks(self, ctx):
         tasks = self.es.request("GET", "/_tasks?detailed=true&group_by=parents").get("tasks", {})
@@ -439,10 +460,10 @@ class NodesTool(_AdminTool):
                      if _num(task.get("time_in_queue_millis")) > PENDING_TASK_WARN_SECONDS * 1000 else "")
             lines.append(f"  {task.get('time_in_queue')}  [{task.get('priority')}] "
                          f"{task.get('source')}{stale}")
-        return result(ctx, "\n".join(lines), tasks=len(tasks), pending=len(pending))
+        return tool_result(ctx, "\n".join(lines), tasks=len(tasks), pending=len(pending))
 
 
-class HotThreadsTool(_AdminTool):
+class HotThreadsTool(_ESTool):
     name = "es_hot_threads"
     description = ("What the hottest threads on each node are doing right now, as Elasticsearch prints it. "
                    "The per-node header lines and the top stack frames are the useful part; "
@@ -460,12 +481,12 @@ class HotThreadsTool(_AdminTool):
                                         "type": (args.get("type") or "cpu").lower()})
         path = f"/_nodes/{_quote(node)}/hot_threads" if node else "/_nodes/hot_threads"
         text = self.es.request("GET", f"{path}?{query}", raw=True)
-        return result(ctx, text or "(no hot threads reported)")
+        return tool_result(ctx, text or "(no hot threads reported)")
 
 
 # ------------------------------------------------------------------ lifecycle and snapshots
 
-class IlmTool(_AdminTool):
+class IlmTool(_ESTool):
     name = "es_ilm"
     description = ("Index lifecycle management: whether ILM is running, which managed indices are in which "
                    "phase/action/step, and which are stuck in ERROR with the failing step and its reason. "
@@ -503,7 +524,7 @@ class IlmTool(_AdminTool):
         if args.get("policy"):
             lines += ["", *self._policy(args["policy"])]
         errors = sum(1 for body in managed if body.get("step") == "ERROR")
-        return result(ctx, "\n".join(lines), managed=len(managed), errors=errors)
+        return tool_result(ctx, "\n".join(lines), managed=len(managed), errors=errors)
 
     def _policy(self, name: str) -> list[str]:
         policies = self.es.request("GET", f"/_ilm/policy/{_quote(name)}")
@@ -526,7 +547,7 @@ class IlmTool(_AdminTool):
         return f"{action}(" + ", ".join(f"{k}={v}" for k, v in sorted(params.items())) + ")"
 
 
-class SnapshotsTool(_AdminTool):
+class SnapshotsTool(_ESTool):
     name = "es_snapshots"
     description = ("Snapshot repositories, recent snapshots and their state (SUCCESS / PARTIAL / FAILED / "
                    "IN_PROGRESS), progress of a running snapshot, and SLM policies with their last success "
@@ -545,7 +566,7 @@ class SnapshotsTool(_AdminTool):
             lines += await self._repository_detail(repository, args, ctx)
         if args.get("slm", True):
             lines += ["", *self._slm()]
-        return result(ctx, "\n".join(lines))
+        return tool_result(ctx, "\n".join(lines))
 
     def _repositories(self) -> list[str]:
         repos = self.es.request("GET", "/_snapshot")
@@ -632,7 +653,8 @@ class SnapshotsTool(_AdminTool):
             return "Repository verification skipped: no interactive session to confirm it. Re-run without -p."
         if not await ctx.ui.ask("confirm", prompt):
             return "Repository verification skipped at the user's request."
-        nodes = self.es.request("POST", f"/_snapshot/{_quote(repository)}/_verify").get("nodes", {})
+        nodes = self.es.request_after_confirmation(
+            "POST", f"/_snapshot/{_quote(repository)}/_verify").get("nodes", {})
         names = ", ".join(sorted(body.get("name", node) for node, body in nodes.items()))
         return f"Repository {repository} verified by {len(nodes)} nodes: {names}"
 
@@ -666,7 +688,7 @@ class SnapshotsTool(_AdminTool):
 
 # ------------------------------------------------------------------ index internals
 
-class IndexInspectTool(_AdminTool):
+class IndexInspectTool(_ESTool):
     name = "es_index_inspect"
     description = ("One index in depth: the settings an administrator cares about, how close the mapping "
                    "is to its field limit and what the fields are, and doc/store/segment/merge/search/"
@@ -680,8 +702,7 @@ class IndexInspectTool(_AdminTool):
         index, view = args["index"], (args.get("view") or "all").lower()
         settings = None
         if view in ("all", "settings", "mappings"):
-            settings = self.es.request(
-                "GET", f"/{_quote(index)}/_settings?flat_settings=true&include_defaults=true")
+            settings = self.es.request("GET", f"/{_quote(index)}/_settings{SETTINGS_QUERY}")
         lines = [f"Index {index}"]
         if view in ("all", "settings"):
             lines += ["", *self._settings(settings)]
@@ -689,15 +710,10 @@ class IndexInspectTool(_AdminTool):
             lines += ["", *self._mappings(index, settings)]
         if view in ("all", "stats"):
             lines += ["", *self._stats(index)]
-        return result(ctx, "\n".join(lines))
-
-    def _effective(self, settings: dict) -> dict:
-        """Merge ``defaults`` under ``settings`` for the first (usually only) index returned."""
-        body = next(iter(settings.values())) if settings else {}
-        return {**(body.get("defaults") or {}), **(body.get("settings") or {})}
+        return tool_result(ctx, "\n".join(lines))
 
     def _settings(self, settings: dict) -> list[str]:
-        effective = self._effective(settings)
+        effective = _effective_settings(settings)
         kept = {key: value for key, value in sorted(effective.items())
                 if any(key == k or (k.endswith(".") and key.startswith(k)) for k in SETTING_KEYS)}
         lines = ["Settings that matter (defaults merged in; bookkeeping keys left out):"]
@@ -714,7 +730,7 @@ class IndexInspectTool(_AdminTool):
         by_type: dict[str, int] = {}
         self._count_leaves(properties, by_type)
         total = sum(by_type.values())
-        limit = int(_num(self._effective(settings).get("index.mapping.total_fields.limit"), 1000))
+        limit = int(_num(_effective_settings(settings).get("index.mapping.total_fields.limit"), 1000))
         lines = [f"Mapping: {total} leaf fields against a limit of {limit} "
                  f"({total / limit * 100:.0f}% used); dynamic={_dig(body, 'mappings', 'dynamic') or 'true'}",
                  "  by type: " + ", ".join(f"{name}={count}" for name, count in sorted(by_type.items()))]
@@ -764,7 +780,7 @@ class IndexInspectTool(_AdminTool):
         return lines
 
 
-class TemplatesTool(_AdminTool):
+class TemplatesTool(_ESTool):
     name = "es_templates"
     description = ("Index, component and legacy templates, and - with simulate_index - which template an "
                    "index name would actually get, what overlaps it, and the settings that would result. "
@@ -790,7 +806,7 @@ class TemplatesTool(_AdminTool):
         if args.get("simulate_index"):
             lines += ["", *self._simulate(args["simulate_index"], templates or self._index_templates(""))]
         lines += ["", *self._data_streams()]
-        return result(ctx, "\n".join(lines))
+        return tool_result(ctx, "\n".join(lines))
 
     def _index_templates(self, name: str) -> list[dict]:
         path = f"/_index_template/{_quote(name)}" if name else "/_index_template"
@@ -882,7 +898,7 @@ class TemplatesTool(_AdminTool):
         return lines
 
 
-class SlowlogTool(_AdminTool):
+class SlowlogTool(_ESTool):
     name = "es_slowlog"
     description = ("Show or set an index's slow-log warn thresholds, and look for slow-log events that were "
                    "shipped into Elasticsearch. The slow log itself is written to files on each node, so "
@@ -902,14 +918,12 @@ class SlowlogTool(_AdminTool):
         if action == "show":
             return self._show(args, ctx)
         if action not in ("enable", "disable"):
-            return result(ctx, f"unknown action {action!r}; use show, enable or disable", is_error=True)
+            return tool_result(ctx, f"unknown action {action!r}; use show, enable or disable", is_error=True)
         return await self._write(args, ctx, action)
 
     def _thresholds(self, index: str) -> dict[str, str]:
-        settings = self.es.request(
-            "GET", f"/{_quote(index)}/_settings?flat_settings=true&include_defaults=true")
-        body = next(iter(settings.values())) if settings else {}
-        effective = {**(body.get("defaults") or {}), **(body.get("settings") or {})}
+        effective = _effective_settings(
+            self.es.request("GET", f"/{_quote(index)}/_settings{SETTINGS_QUERY}"))
         return {key: effective.get(key, "-1") for key in SLOWLOG_KEYS}
 
     def _show(self, args: dict, ctx):
@@ -922,7 +936,7 @@ class SlowlogTool(_AdminTool):
             lines.append("  None are set, so this index logs nothing slow. "
                          "es_slowlog action=enable sets them.")
         lines += ["", *self._shipped(args)]
-        return result(ctx, "\n".join(lines), thresholds=thresholds)
+        return tool_result(ctx, "\n".join(lines), thresholds=thresholds)
 
     def _shipped(self, args: dict) -> list[str]:
         """Slow logs are node files; the only way an API can show them is if something shipped them."""
@@ -957,21 +971,32 @@ class SlowlogTool(_AdminTool):
                      SLOWLOG_KEYS[2]: args.get("index_warn")}
             body = {key: value for key, value in given.items() if value}
             if not body:
-                return result(ctx, "enable needs at least one of query_warn, fetch_warn or index_warn "
-                                   "(for example query_warn='2s')", is_error=True)
+                return tool_result(ctx, "enable needs at least one of query_warn, fetch_warn or index_warn "
+                                        "(for example query_warn='2s')", is_error=True)
         summary = ", ".join(f"{key}={value}" for key, value in body.items())
+        path = f"/{_quote(index)}/_settings"
+        # Three cases, and which door the write goes through is the whole point of splitting them.
+        # ``request_after_confirmation`` bypasses the destructive gate on the strength of one
+        # claim - that this exact change was shown to a person who said yes - so only the branch
+        # where that happened may take it. Headless with ``allow_destructive`` is a real
+        # authorisation and not a confirmation: nobody was shown anything, so it goes through
+        # ``request`` like every other write the setting permits, and grepping for the bypass
+        # still lists only writes a person actually approved.
         if ctx.ui is not None:
             if not await ctx.ui.ask("confirm", f"Change slow-log settings on {index}? {summary}"):
-                return result(ctx, f"Slow-log settings on {index} left unchanged at the user's request.")
-        elif not self.settings.allow_destructive:
-            return result(ctx, f"es_slowlog {action} changes cluster settings on {index} and there is no "
-                               "interactive session to confirm it. Run without -p, or set "
-                               "allow_destructive = true in [plugins.es-doctor].", is_error=True)
-        self.es.request("PUT", f"/{_quote(index)}/_settings", body)
-        return result(ctx, f"Slow-log settings on {index} updated: {summary}\n"
-                           "The slow log is written to files on each node "
-                           "(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to "
-                           "search them here.", changed=list(body))
+                return tool_result(ctx, f"Slow-log settings on {index} left unchanged at the user's request.")
+            self.es.request_after_confirmation("PUT", path, body)
+        elif self.settings.allow_destructive:
+            self.es.request("PUT", path, body)
+        else:
+            return tool_result(
+                ctx, f"es_slowlog {action} changes cluster settings on {index} and there is no "
+                                    "interactive session to confirm it. Run without -p, or set "
+                                    "allow_destructive = true in [plugins.es-doctor].", is_error=True)
+        return tool_result(ctx, f"Slow-log settings on {index} updated: {summary}\n"
+                                "The slow log is written to files on each node "
+                                "(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to "
+                                "search them here.", changed=list(body))
 
 
 TOOL_CLASSES = (ShardsTool, RecoveryTool, NodesTool, HotThreadsTool, IlmTool,
