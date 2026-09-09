@@ -9,8 +9,8 @@ request, because a plan that trails reality fails the rule's own purpose.
 
 Every change lands through the same path: a branch, a pull request against `main`, review,
 and a squash merge producing one commit per pull request titled `Sentence (#N)`. `main` is
-never pushed to directly. Work performed by agents runs in git worktrees under
-`.claude/worktrees/` so parallel work cannot contaminate the checkout; `git stash` is not
+never pushed to directly. Work performed by agents runs in throwaway git worktrees
+so parallel work cannot contaminate the checkout; `git stash` is not
 used (the stack is shared across worktrees), and staging is by named file, never `git add
 -A`. Security-relevant changes additionally update the threat model or this assessment
 record in the same pull request (the threat model's own review triggers, quoted at

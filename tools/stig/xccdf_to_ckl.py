@@ -17,9 +17,13 @@ from pathlib import Path
 
 import sys
 STIG_DIR = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
-WORKTREE = Path("/home/nemokrad/projects/itscm/picoagent/.claude/worktrees/ollama-e2e-and-install-docs")
-sys.path.insert(0, str(WORKTREE / "examples/plugins/stig-runner"))
-sys.path.insert(0, str(WORKTREE))
+# The CKL read/write machinery lives in the stig-runner plugin (its own repository since
+# the extraction). Point STIG_RUNNER_ROOT at a checkout, or keep one as a sibling.
+import os
+REPO = Path(__file__).resolve().parents[2]
+STIG_RUNNER = Path(os.environ.get("STIG_RUNNER_ROOT", REPO.parent / "stig-runner"))
+sys.path.insert(0, str(STIG_RUNNER))
+sys.path.insert(0, str(REPO))
 
 from picoagent.testing.fake_ckl import ASSET_FIELDS, HEADER_COMMENT  # noqa: E402
 

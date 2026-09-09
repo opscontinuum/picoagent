@@ -1,9 +1,9 @@
 # picoagent — Application Security and Development STIG Assessment
 
 **Benchmark:** DISA Application Security and Development STIG, V6R4 (Release: 4, Benchmark Date: 01 Oct 2025), 286 rules, assessed from `U_ASD_STIG_V6R4_Manual-xccdf.xml`.
-**Artifact:** picoagent worktree at `/home/nemokrad/projects/itscm/picoagent/.claude/worktrees/ollama-e2e-and-install-docs` (head commit `3645b9f`), a standard-library-only Python coding-agent harness — a locally-run single-user developer CLI, not a hosted application.
+**Artifact:** picoagent working tree at head commit `3645b9f`, a standard-library-only Python coding-agent harness — a locally-run single-user developer CLI, not a hosted application.
 **Assessed:** 2026-09-07, by automated code review, execution of the repository's own stig-runner probes, targeted verification scripts, and a full run of the 972-test suite (`OK, 5 skipped` — reproduced during this assessment).
-**Assessor:** automated (Claude); see "What this assessment is not" before treating any determination as signable.
+**Assessor:** automated; see "What this assessment is not" before treating any determination as signable.
 
 ## 1. Executive summary
 
