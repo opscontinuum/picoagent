@@ -1,0 +1,670 @@
+{
+ "APSC-DV-000010": [
+  {
+   "describe": "grep /max[_-]?(concurrent[_-]?)?sessions|concurrent[_-]?session|session[_-]?limit|maximumSessions|max-sessions/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "examine configuration files in order to review user session configuration settin",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:38: r\"|maximumSessions|max-sessions\",",
+    "picoagent/testing/fake_ckl.py:412: \"MAX_CONCURRENT_SESSIONS = 2\\n\"),",
+    "tests/test_stig_runner_plugin.py:249: \"APSC-DV-000010\": \"app/session.py:4\", # a concurrent-session setting"
+   ]
+  }
+ ],
+ "APSC-DV-000060": [
+  {
+   "describe": "grep /session\\.(invalidate|destroy|clear)|clear[_-]?session|delete_cookie|res\\.clearCookie|SESSION_COOKIE_/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "identify how the application makes use of temporary client storage and cookies",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:44: pattern=r\"session\\.(invalidate|destroy|clear)|clear[_-]?session|delete_cookie\"",
+    "examples/plugins/stig-runner/asd_probes.py:45: r\"|res\\.clearCookie|SESSION_COOKIE_\",",
+    "examples/plugins/stig-runner/asd_probes.py:174: pattern=r\"http_?only|HttpOnly|SESSION_COOKIE_HTTPONLY\",",
+    "examples/plugins/stig-runner/asd_probes.py:180: pattern=r\"SESSION_COOKIE_SECURE|cookie[_-]?secure|secure\\s*[:=]\\s*(true|false)\"",
+    "picoagent/testing/fake_ckl.py:409: \"SESSION_COOKIE_HTTPONLY = True\\n\"",
+    "picoagent/testing/fake_ckl.py:410: \"SESSION_COOKIE_SECURE = False\\n\""
+   ]
+  }
+ ],
+ "APSC-DV-000070": [
+  {
+   "describe": "grep /(idle|session|inactivity)[_-]?(time_?out|lifetime|expiry|expire|age)|PERMANENT_SESSION_LIFETIME|session-timeout/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "demonstrate the configuration setting where the idle time out value is defined",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:52: r\"|PERMANENT_SESSION_LIFETIME|session-timeout\",",
+    "picoagent/testing/fake_ckl.py:411: \"PERMANENT_SESSION_LIFETIME = 900\\n\""
+   ]
+  }
+ ],
+ "APSC-DV-000080": [
+  {
+   "describe": "grep /admin[_-]?(idle|session)[_-]?(time_?out|lifetime|expiry)|(idle|session)[_-]?time_?out/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "the application configuration setting where the idle time out value is defined f",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:52: r\"|PERMANENT_SESSION_LIFETIME|session-timeout\","
+   ]
+  }
+ ],
+ "APSC-DV-000090": [
+  {
+   "describe": "grep /\\b(log_?out|sign_?out|logoff)\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Identify the command or link that provides the logoff function",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:65: pattern=r\"\\b(log_?out|sign_?out|logoff)\\b\",",
+    "examples/plugins/stig-runner/asd_probes.py:66: serves=\"Identify the command or link that provides the logoff function\"),"
+   ]
+  }
+ ],
+ "APSC-DV-000160": [
+  {
+   "describe": "grep /verify\\s*=\\s*False|InsecureSkipVerify|TrustAllCerts|NODE_TLS_REJECT_UNAUTHORIZED|rejectUnauthorized\\s*:\\s*false|CURLOPT_SSL_VERIFYPEER\\s*,\\s*(0|false)|ServerCertificateValidationCallback/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Review application configuration settings to ensure encryption is specified and ",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:72: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|TrustAllCerts|NODE_TLS_REJECT_UNAUTHORIZED\"",
+    "examples/plugins/stig-runner/asd_probes.py:74: r\"|ServerCertificateValidationCallback\",",
+    "examples/plugins/stig-runner/asd_probes.py:101: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|check_hostname\\s*=\\s*False\"",
+    "examples/plugins/stig-runner/asd_probes.py:110: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|CERT_NONE|check_hostname\\s*=\\s*False\"",
+    "examples/plugins/stig-runner/evidence.py:9: repository content. A probe that finds ``verify=False`` has found a string in a file; whether",
+    "picoagent/testing/fake_ckl.py:399: \" return requests.get(url, verify=False, timeout=10)\\n\"),",
+    "picoagent/testing/fake_ckl.py:447: (root / \"big.log\").write_text(\"verify=False padding line\\n\" * 90_000, encoding=\"utf-8\", newline=\"\\n\")",
+    "picoagent/testing/fake_ckl.py:448: (root / \"app\" / \"blob.bin\").write_bytes(b\"\\x00\\x01verify=False\\x00\" + b\"\\xff\" * 512)",
+    "tests/test_stig_runner_plugin.py:185: finding_details=r\"app/http_client.py:6 uses verify=False \"",
+    "tests/test_stig_runner_plugin.py:303: (self.repo / f\"tls_{number}.py\").write_text(\"verify=False\\n\", encoding=\"utf-8\")",
+    "tests/test_stig_runner_plugin.py:341: return \"\".join(f\"verify=False # {number}\\n\" for number in range(count))",
+    "tests/test_stig_runner_plugin.py:344: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:364: repo = self._repo({\"tls.py\": \"verify=False\\n\"})",
+    "tests/test_stig_runner_plugin.py:367: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:374: repo = self._repo({\"tls.py\": \"verify=False\\n\"})",
+    "tests/test_stig_runner_plugin.py:376: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:453: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:608: status=\"Open\", finding_details=\"app/http_client.py:6 verify=False\")",
+    "tests/test_stig_runner_plugin.py:624: self.assertIn(\"verify=False\", saved.by_vuln(\"V-222387\").finding_details)"
+   ]
+  },
+  {
+   "describe": "grep /http://(?!localhost|127\\.0\\.0\\.1)/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "determine if the session is protected via TLS",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:77: Probe(kind=\"grep\", globs=CODE_AND_CONFIG, pattern=r\"http://(?!localhost|127\\.0\\.0\\.1)\",",
+    "examples/plugins/stig-runner/asd_probes.py:141: pattern=r\"http://[^\\s\\\"']*(login|auth|signin|token)\",",
+    "picoagent/plugins/loader.py:268: if not url.startswith((\"http://\", \"https://\", \"git@\", \"ssh://\", \"file://\", \"/\")):",
+    "picoagent/plugins/upgrade.py:112: if not spec.startswith((\"git:\", \"http://\", \"https://\", \"git@\", \"ssh://\", \"file://\")):",
+    "tests/test_providers.py:28: provider = OpenAICompatProvider(base_url=\"http://x/v1\", api_key=\"sk-s****\")",
+    "tests/test_providers.py:34: provider = OpenAICompatProvider(base_url=\"http://x/v1\", api_key=\"\")",
+    "tests/test_skills_session_config.py:152: cfg = self.project('[providers.openai]\\nbase_url = \"http://attacker.example\"\\n')",
+    "tests/test_skills_session_config.py:210: 'base_url = \"http://evil\"\\napi_key = \"x\"\\n')"
+   ]
+  }
+ ],
+ "APSC-DV-002030": [
+  {
+   "describe": "grep /\\b(md5|sha1|sha-1)\\b|MessageDigest\\.getInstance\\(\\s*[\\\"'](MD5|SHA-?1)/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "what hashing algorithms are used when generating a hash value ... DoD PKI policy",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/iscp-author/iscp_template.py:15: (HTTP 200, 153865 bytes, md5 298f6b1392ee21b1cded5164c2523b86) and read out of",
+    "examples/plugins/stig-runner/asd_probes.py:82: pattern=r\"\\b(md5|sha1|sha-1)\\b|MessageDigest\\.getInstance\\(\\s*[\\\"'](MD5|SHA-?1)\",",
+    "examples/plugins/stig-runner/asd_probes.py:84: \"policy prohibits the use of SHA1 as of December 2016\"),",
+    "examples/plugins/stig-runner/asd_probes.py:135: r\"|hashlib\\.(md5|sha1)\\s*\\(\",",
+    "examples/plugins/stig-runner/asd_probes.py:137: \"application uses the MD5 hashing algorithm to create password hashes\"),",
+    "picoagent/testing/fake_ckl.py:133: ('Check_Content', 'Review the application components and the application requirements to determine if the application is capable of generating cryptographic hashes.\\n\\nReview the application documenta\u2026",
+    "picoagent/testing/fake_ckl.py:403: \" return hashlib.md5(value.encode()).hexdigest()\\n\"),",
+    "tests/test_stig_runner_plugin.py:246: \"APSC-DV-002030\": \"app/hashing.py:5\", # md5 for a fingerprint"
+   ]
+  }
+ ],
+ "APSC-DV-002040": [
+  {
+   "describe": "grep /\\b(DES|3DES|RC4|Blowfish|ECB)\\b|MODE_ECB|AES/ECB|Cipher\\.getInstance/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "identify the cryptographic modules used by the application ... determine if the ",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:88: pattern=r\"\\b(DES|3DES|RC4|Blowfish|ECB)\\b|MODE_ECB|AES/ECB|Cipher\\.getInstance\","
+   ]
+  }
+ ],
+ "APSC-DV-002290": [
+  {
+   "describe": "grep /\\brandom\\.(random|randint|choice|randrange)\\s*\\(|Math\\.random\\s*\\(\\)|new\\s+Random\\s*\\(/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "determine if the application server uses a FIPS 140-2/140-3 approved random numb",
+   "truncated": false,
+   "hits": [
+    "picoagent/testing/fake_es.py:60: rng = random.Random(seed)"
+   ]
+  }
+ ],
+ "APSC-DV-002300": [
+  {
+   "describe": "grep /verify\\s*=\\s*False|InsecureSkipVerify|check_hostname\\s*=\\s*False|CERT_NONE|TrustManager\\s*\\[\\s*\\]/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "If the application utilizes PKI certificates other than DoD-approved PKI and ECA",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/es-doctor/es_client.py:122: self._ctx.check_hostname = False",
+    "examples/plugins/es-doctor/es_client.py:123: self._ctx.verify_mode = ssl.CERT_NONE",
+    "examples/plugins/stig-runner/asd_probes.py:72: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|TrustAllCerts|NODE_TLS_REJECT_UNAUTHORIZED\"",
+    "examples/plugins/stig-runner/asd_probes.py:101: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|check_hostname\\s*=\\s*False\"",
+    "examples/plugins/stig-runner/asd_probes.py:102: r\"|CERT_NONE|TrustManager\\s*\\[\\s*\\]\",",
+    "examples/plugins/stig-runner/asd_probes.py:110: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|CERT_NONE|check_hostname\\s*=\\s*False\"",
+    "examples/plugins/stig-runner/evidence.py:9: repository content. A probe that finds ``verify=False`` has found a string in a file; whether",
+    "picoagent/testing/fake_ckl.py:399: \" return requests.get(url, verify=False, timeout=10)\\n\"),",
+    "picoagent/testing/fake_ckl.py:447: (root / \"big.log\").write_text(\"verify=False padding line\\n\" * 90_000, encoding=\"utf-8\", newline=\"\\n\")",
+    "picoagent/testing/fake_ckl.py:448: (root / \"app\" / \"blob.bin\").write_bytes(b\"\\x00\\x01verify=False\\x00\" + b\"\\xff\" * 512)",
+    "tests/test_stig_runner_plugin.py:185: finding_details=r\"app/http_client.py:6 uses verify=False \"",
+    "tests/test_stig_runner_plugin.py:303: (self.repo / f\"tls_{number}.py\").write_text(\"verify=False\\n\", encoding=\"utf-8\")",
+    "tests/test_stig_runner_plugin.py:341: return \"\".join(f\"verify=False # {number}\\n\" for number in range(count))",
+    "tests/test_stig_runner_plugin.py:344: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:364: repo = self._repo({\"tls.py\": \"verify=False\\n\"})",
+    "tests/test_stig_runner_plugin.py:367: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:374: repo = self._repo({\"tls.py\": \"verify=False\\n\"})",
+    "tests/test_stig_runner_plugin.py:376: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:453: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:608: status=\"Open\", finding_details=\"app/http_client.py:6 verify=False\")",
+    "tests/test_stig_runner_plugin.py:624: self.assertIn(\"verify=False\", saved.by_vuln(\"V-222387\").finding_details)"
+   ]
+  },
+  {
+   "describe": "exists *.pem, *.crt, *.cer, *.p12, *.pfx, *.jks",
+   "serves": "identify certificate location",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-001810": [
+  {
+   "describe": "grep /verify\\s*=\\s*False|InsecureSkipVerify|CERT_NONE|check_hostname\\s*=\\s*False|X509TrustManager|checkServerTrusted/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "identify the method employed by the application for validating certificates ... ",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/es-doctor/es_client.py:122: self._ctx.check_hostname = False",
+    "examples/plugins/es-doctor/es_client.py:123: self._ctx.verify_mode = ssl.CERT_NONE",
+    "examples/plugins/stig-runner/asd_probes.py:72: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|TrustAllCerts|NODE_TLS_REJECT_UNAUTHORIZED\"",
+    "examples/plugins/stig-runner/asd_probes.py:101: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|check_hostname\\s*=\\s*False\"",
+    "examples/plugins/stig-runner/asd_probes.py:102: r\"|CERT_NONE|TrustManager\\s*\\[\\s*\\]\",",
+    "examples/plugins/stig-runner/asd_probes.py:110: pattern=r\"verify\\s*=\\s*False|InsecureSkipVerify|CERT_NONE|check_hostname\\s*=\\s*False\"",
+    "examples/plugins/stig-runner/asd_probes.py:111: r\"|X509TrustManager|checkServerTrusted\",",
+    "examples/plugins/stig-runner/evidence.py:9: repository content. A probe that finds ``verify=False`` has found a string in a file; whether",
+    "picoagent/testing/fake_ckl.py:399: \" return requests.get(url, verify=False, timeout=10)\\n\"),",
+    "picoagent/testing/fake_ckl.py:447: (root / \"big.log\").write_text(\"verify=False padding line\\n\" * 90_000, encoding=\"utf-8\", newline=\"\\n\")",
+    "picoagent/testing/fake_ckl.py:448: (root / \"app\" / \"blob.bin\").write_bytes(b\"\\x00\\x01verify=False\\x00\" + b\"\\xff\" * 512)",
+    "tests/test_stig_runner_plugin.py:185: finding_details=r\"app/http_client.py:6 uses verify=False \"",
+    "tests/test_stig_runner_plugin.py:303: (self.repo / f\"tls_{number}.py\").write_text(\"verify=False\\n\", encoding=\"utf-8\")",
+    "tests/test_stig_runner_plugin.py:341: return \"\".join(f\"verify=False # {number}\\n\" for number in range(count))",
+    "tests/test_stig_runner_plugin.py:344: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:364: repo = self._repo({\"tls.py\": \"verify=False\\n\"})",
+    "tests/test_stig_runner_plugin.py:367: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:374: repo = self._repo({\"tls.py\": \"verify=False\\n\"})",
+    "tests/test_stig_runner_plugin.py:376: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:453: probe = evidence.Probe(kind=\"grep\", globs=(\"*.py\",), pattern=\"verify=False\",",
+    "tests/test_stig_runner_plugin.py:608: status=\"Open\", finding_details=\"app/http_client.py:6 verify=False\")",
+    "tests/test_stig_runner_plugin.py:624: self.assertIn(\"verify=False\", saved.by_vuln(\"V-222387\").finding_details)"
+   ]
+  }
+ ],
+ "APSC-DV-002440": [
+  {
+   "describe": "grep /\\bssl_version\\b|TLSv1(\\.[01])?\\b|SSLv[23]|PROTOCOL_TLSv1(_1)?\\b|MinVersion|ssl_protocols/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "If the application does not utilize TLS, IPsec or other approved encryption mech",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:118: pattern=r\"\\bssl_version\\b|TLSv1(\\.[01])?\\b|SSLv[23]|PROTOCOL_TLSv1(_1)?\\b|MinVersion\"",
+    "examples/plugins/stig-runner/asd_probes.py:119: r\"|ssl_protocols\","
+   ]
+  }
+ ],
+ "APSC-DV-001680": [
+  {
+   "describe": "grep /(min|minimum)[_-]?(password|pwd)?[_-]?length|password[_-]?min[_-]?length|MinimumLength|PASSWORD_MIN_LENGTH/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "attempt to create a password shorter than 15 characters in length",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:129: r\"|MinimumLength|PASSWORD_MIN_LENGTH\","
+   ]
+  }
+ ],
+ "APSC-DV-001740": [
+  {
+   "describe": "grep /bcrypt|scrypt|argon2|pbkdf2|password_hash\\s*\\(|BCryptPasswordEncoder|hashlib\\.(md5|sha1)\\s*\\(/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "Determine if password strings are readable/discernable. Determine if the applica",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:134: pattern=r\"bcrypt|scrypt|argon2|pbkdf2|password_hash\\s*\\(|BCryptPasswordEncoder\"",
+    "picoagent/testing/fake_ckl.py:403: \" return hashlib.md5(value.encode()).hexdigest()\\n\"),"
+   ]
+  }
+ ],
+ "APSC-DV-001750": [
+  {
+   "describe": "grep /http://[^\\s\\\"']*(login|auth|signin|token)/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "verify the web browser has gone secure prior to entering any password or authent",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-001850": [
+  {
+   "describe": "grep /type\\s*=\\s*[\\\"']text[\\\"'][^>]*(password|passwd|pin)|(password|passwd)[^>]*type\\s*=\\s*[\\\"']text[\\\"']/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.html, *.htm, *.jsx, *.tsx, *.vue, *.jsp",
+   "serves": "verify any display feedback provided when the admin enters her/his password is o",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-003110": [
+  {
+   "describe": "grep /(pass(word|wd)?|secret|token|api[_-]?key|access[_-]?key)\\s*[:=]\\s*[\\\"'][^\\\"'\\s]{6,}[\\\"']/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Identify any instances of passwords, certificates, or sensitive data included in",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/es-doctor/es_doctor.py:29: api_key = \"base****\" # ELASTICSEARCH_API_KEY (sent as `Authorization: ApiKey`)",
+    "examples/plugins/grok-provider/grok_provider.py:9: api_key = \"xai-****\" # XAI_API_KEY",
+    "tests/test_credential_guard_plugin.py:221: config.write_text('[providers.openai]\\napi_key = \"sk-i****\"\\n')",
+    "tests/test_credential_guard_plugin.py:242: config.write_text('[providers.openai]\\napi_key = \"sk-i****\"\\n')",
+    "tests/test_mcp_plugin.py:47: SECRET = \"PICO****\"",
+    "tests/test_mcp_plugin.py:221: planted = mock.patch.dict(os.environ, {SECRET: \"leak****\",",
+    "tests/test_ollama_e2e.py:129: runtime = make_runtime(tmp, provider=OpenAICompatProvider(base_url=f\"{URL}/v1\", api_key=\"olla****\"))",
+    "tests/test_ollama_e2e.py:193: models = run(OpenAICompatProvider(base_url=f\"{URL}/v1\", api_key=\"olla****\").list_models())",
+    "tests/test_plugin_config_provenance.py:58: self.layers(user='[plugins.grok-provider]\\napi_key = \"xai-****\"\\n',",
+    "tests/test_plugin_config_provenance.py:65: self.layers(user='[plugins.es-doctor]\\nurl = \"http://localhost:9200\"\\napi_key = \"es-u****\"\\n',",
+    "tests/test_plugin_config_provenance.py:73: self.layers(user='[plugins.vertex-provider]\\ntoken = \"vert****\"\\n',",
+    "tests/test_plugin_redirects.py:115: TOKEN = \"ya29****\"",
+    "tests/test_providers.py:28: provider = OpenAICompatProvider(base_url=\"http://x/v1\", api_key=\"sk-s****\")",
+    "tests/test_providers.py:70: provider = OpenAICompatProvider(base_url=srv.url + \"/v1\", api_key=\"sekr****\")",
+    "tests/test_skills_session_config.py:132: (self.home / \"credentials\").write_text('api_key = \"sk-r****\"\\n')",
+    "tests/test_skills_session_config.py:137: 'api_key = \"sk-r****\"\\n')"
+   ]
+  },
+  {
+   "describe": "exists .env, .env.*, *.pem, id_rsa, id_dsa, id_ecdsa, *.p12, *.pfx, credentials, *.keystore",
+   "serves": "this includes configuration files such as global.asa, if present, scripts, HTML ",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-003280": [
+  {
+   "describe": "grep /(pass(word|wd)?)\\s*[:=]\\s*[\\\"']?(admin|password|changeme|secret|letmein|root|test|123456|default)[\\\"']?\\s*$/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "If default passwords are found, attempt to authenticate with the published defau",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-002210": [
+  {
+   "describe": "grep /http_?only|HttpOnly|SESSION_COOKIE_HTTPONLY/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "configuring the web server with Mod_Security or ESAPI WAF with the HTTPOnly flag",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:174: pattern=r\"http_?only|HttpOnly|SESSION_COOKIE_HTTPONLY\",",
+    "examples/plugins/stig-runner/asd_probes.py:175: serves=\"configuring the web server with Mod_Security or ESAPI WAF with the HTTPOnly \"",
+    "picoagent/testing/fake_ckl.py:409: \"SESSION_COOKIE_HTTPONLY = True\\n\""
+   ]
+  }
+ ],
+ "APSC-DV-002220": [
+  {
+   "describe": "grep /SESSION_COOKIE_SECURE|cookie[_-]?secure|secure\\s*[:=]\\s*(true|false)|\\bsameSite\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Verify that the scan configuration includes checks for the secure flag on sessio",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:180: pattern=r\"SESSION_COOKIE_SECURE|cookie[_-]?secure|secure\\s*[:=]\\s*(true|false)\"",
+    "examples/plugins/stig-runner/asd_probes.py:258: pattern=r\"csrf|CsrfToken|XSRF|SameSite|csrf_exempt|WithCredentials\",",
+    "picoagent/testing/fake_ckl.py:410: \"SESSION_COOKIE_SECURE = False\\n\""
+   ]
+  }
+ ],
+ "APSC-DV-002230": [
+  {
+   "describe": "grep /(log|print|console\\.log|logger)[^\\n]*(session[_-]?id|sessionid|JSESSIONID)/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.log",
+   "serves": "Identify the application communication paths ... that transmit session identifie",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:187: pattern=r\"(log|print|console\\.log|logger)[^\\n]*(session[_-]?id|sessionid|JSESSIONID)\","
+   ]
+  }
+ ],
+ "APSC-DV-002240": [
+  {
+   "describe": "grep /session\\.(invalidate|destroy|clear)\\s*\\(|req\\.session\\.destroy|SecurityContextHolder\\.clearContext/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Review framework configuration setting to determine how the session identifiers ",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-002270": [
+  {
+   "describe": "grep /jsessionid=|sessionid=|;jsessionid|url[_-]?rewriting|disable-url-rewriting|tracking-mode/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "if the framework or the application is configured to transmit cookies within the",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:200: pattern=r\"jsessionid=|sessionid=|;jsessionid|url[_-]?rewriting|disable-url-rewriting\"",
+    "examples/plugins/stig-runner/asd_probes.py:201: r\"|tracking-mode\","
+   ]
+  }
+ ],
+ "APSC-DV-000650": [
+  {
+   "describe": "grep /(log|logger|logging)[^\\n]*\\b(password|passwd|secret|token|ssn|credit[_-]?card)\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "create search strings that could successfully identify the existence of password",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/iscp-author/iscp_template.py:735: (\"Log-in as user test user, using password test pass\", \"Initial Screen with Main Menu shows\",",
+    "examples/plugins/stig-runner/asd_probes.py:141: pattern=r\"http://[^\\s\\\"']*(login|auth|signin|token)\",",
+    "examples/plugins/stig-runner/asd_probes.py:209: pattern=r\"(log|logger|logging)[^\\n]*\\b(password|passwd|secret|token|ssn|credit[_-]?card)\\b\","
+   ]
+  }
+ ],
+ "APSC-DV-000670": [
+  {
+   "describe": "grep /asctime|%\\(asctime\\)|timestamp|%d\\{|ISO8601|logging\\.Formatter/ over *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json, *.py, *.java, *.js, *.ts, *.cs, *.go",
+   "serves": "If the time the event occurred is not included as part of the event, this is a f",
+   "truncated": true,
+   "hits": [
+    "examples/plugins/es-doctor/es_admin.py:941: window = {\"range\": {\"@timestamp\": {\"gte\": f\"now-{since}\" if bare_duration else since, \"lte\": \"now\"}}}",
+    "examples/plugins/es-doctor/es_admin.py:944: body = {\"size\": 20, \"sort\": [{\"@timestamp\": {\"order\": \"desc\"}}],",
+    "examples/plugins/es-doctor/es_admin.py:946: \"_source\": [\"@timestamp\", \"message\", \"elasticsearch.slowlog.took\", \"event.dataset\"]}",
+    "examples/plugins/es-doctor/es_admin.py:957: lines += [f\" {hit['_source'].get('@timestamp', '')[:19]} \"",
+    "examples/plugins/es-doctor/es_doctor.py:94: - key fields: @timestamp, host.name, service.name, log.level, message, event.dataset, data_stream.dataset,",
+    "examples/plugins/es-doctor/es_doctor.py:114: \"\"\"Accept ISO timestamps, ES date-math (``now-1h``) or bare durations (``15m`` -> ``now-15m``).\"\"\"",
+    "examples/plugins/es-doctor/es_doctor.py:121: return [{\"range\": {\"@timestamp\": {\"gte\": time_bound(since, \"now-1h\"), \"lte\": time_bound(until, \"now\")}}}]",
+    "examples/plugins/es-doctor/es_doctor.py:288: \"sort\": [{\"@timestamp\": {\"order\": \"desc\"}}],",
+    "examples/plugins/es-doctor/es_doctor.py:289: \"_source\": [\"@timestamp\", \"log.level\", \"service.name\", \"host.name\", \"message\", \"error.message\", \"event.dataset\"],",
+    "examples/plugins/es-doctor/es_doctor.py:292: body[\"aggs\"][\"timeline\"] = {\"date_histogram\": {\"field\": \"@timestamp\", \"fixed_interval\": args.get(\"interval\") or \"5m\"}}",
+    "examples/plugins/es-doctor/es_doctor.py:301: lines.append(f\"{src.get('@timestamp', '')[:19]} {str((src.get('log') or {}).get('level', '')):5} \"",
+    "examples/plugins/es-doctor/es_doctor.py:327: \"aggs\": {\"over_time\": {\"date_histogram\": {\"field\": \"@timestamp\", \"fixed_interval\": args.get(\"interval\") or \"1m\"},",
+    "examples/plugins/es-doctor/es_doctor.py:409: \"aggs\": {\"t\": {\"date_histogram\": {\"field\": \"@timestamp\", \"fixed_interval\": interval},",
+    "examples/plugins/es-doctor/es_doctor.py:416: \"aggs\": {\"t\": {\"date_histogram\": {\"field\": \"@timestamp\", \"fixed_interval\": interval}, \"aggs\": {\"v\": {\"avg\": {\"field\": field}}}}}}",
+    "examples/plugins/es-doctor/es_doctor.py:432: \"aggs\": {\"t\": {\"date_histogram\": {\"field\": \"@timestamp\", \"fixed_interval\": interval},",
+    "examples/plugins/es-doctor/es_doctor.py:446: \"query\": {\"bool\": {\"filter\": [{\"range\": {\"@timestamp\": {\"gte\": since, \"lte\": until}}}] + who + level_filter(\"error\")}}}",
+    "examples/plugins/iscp-author/iscp_render.py:406: \"the moment of loss, replica timestamps, the last committed transaction. This is \"",
+    "examples/plugins/stig-runner/asd_probes.py:215: pattern=r\"asctime|%\\(asctime\\)|timestamp|%d\\{|ISO8601|logging\\.Formatter\",",
+    "picoagent/cli.py:690: class SafeLogFormatter(logging.Formatter):",
+    "picoagent/core/session.py:10: * ``header`` - written once at creation (cwd, timestamp, format version)",
+    "picoagent/plugins/api.py:54: #: * ``TZ``, ``TMPDIR`` / ``TEMP`` / ``TMP`` - a timestamp and a scratch directory.",
+    "picoagent/testing/fake_es.py:34: size, sort on @timestamp, and aggs date_histogram(fixed_interval) with sub-aggs",
+    "picoagent/testing/fake_es.py:71: docs.append((\"logs-checkout-default\", {**base, \"@timestamp\": _iso(ts, i * 6),",
+    "picoagent/testing/fake_es.py:77: \"@timestamp\": _iso(ts, 10 + i * 15), \"log\": {\"level\": \"error\"},",
+    "picoagent/testing/fake_es.py:83: docs.append((\"metrics-system.cpu-default\", {**base, \"agent\": {\"type\": \"metricbeat\"}, \"@timestamp\": _iso(ts, sec),"
+   ]
+  }
+ ],
+ "APSC-DV-000700": [
+  {
+   "describe": "grep /(log|logger)[^\\n]*\\b(user_?id|username|principal|subject|actor)\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Observe if the log includes an entry to indicate the user ID of the user that co",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:221: pattern=r\"(log|logger)[^\\n]*\\b(user_?id|username|principal|subject|actor)\\b\","
+   ]
+  }
+ ],
+ "APSC-DV-000830": [
+  {
+   "describe": "grep /(log|logger|audit)[^\\n]*\\b(login|logon|authenticat|sign[_-]?in|failed)\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "If successful and unsuccessful logon events are not recorded in the logs, this i",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/complete/complete.py:103: log.debug(\"completion failed for %r\", word, exc_info=True)",
+    "examples/plugins/complete/complete.py:178: log.debug(\"model list refresh failed\", exc_info=True)",
+    "examples/plugins/es-doctor/es_admin.py:950: return [f\"Shipped slow-log search failed: {exc}\"]",
+    "examples/plugins/stig-runner/asd_probes.py:141: pattern=r\"http://[^\\s\\\"']*(login|auth|signin|token)\",",
+    "examples/plugins/stig-runner/asd_probes.py:227: pattern=r\"(log|logger|audit)[^\\n]*\\b(login|logon|authenticat|sign[_-]?in|failed)\\b\",",
+    "picoagent/core/events.py:120: log.exception(\"handler from '%s' for event '%s' failed: %s\", owner, event, exc)",
+    "picoagent/core/loop.py:149: log.exception(\"command /%s failed\", command.name)",
+    "picoagent/core/loop.py:359: log.exception(\"tool %s failed\", call.name)",
+    "picoagent/plugins/loader.py:1283: log.exception(\"failed to load plugin at %s: %s\", root, exc)",
+    "picoagent/testing/fake_ckl.py:75: ('Check_Content', 'For production environments; Review the system documentation, identify the number of application user logon sessions allowed per user, identify the methods utilized for user session\u2026",
+    "picoagent/testing/fake_es.py:521: return {\"logs-checkout-default\": {\"_shards\": {\"total\": 2, \"successful\": 2, \"failed\": 0},"
+   ]
+  }
+ ],
+ "APSC-DV-001010": [
+  {
+   "describe": "grep /(log|logger)[^\\n]*\\b(SUCCESS|FAILURE|ERROR|PASS|outcome|result)\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "a log record that displays the application event/operation that occurred followe",
+   "truncated": true,
+   "hits": [
+    "examples/plugins/es-doctor/es_doctor.py:289: \"_source\": [\"@timestamp\", \"log.level\", \"service.name\", \"host.name\", \"message\", \"error.message\", \"event.dataset\"],",
+    "examples/plugins/es-doctor/es_doctor.py:340: description = (\"Correlate log errors with metrics and APM over a time window: one row per bucket with error count, \"",
+    "examples/plugins/es-doctor/es_doctor.py:341: \"total logs, each metric's avg, APM median (p50) latency and failure count; Pearson r of \"",
+    "examples/plugins/iscp-author/iscp_template.py:735: (\"Log-in as user test user, using password test pass\", \"Initial Screen with Main Menu shows\",",
+    "examples/plugins/mcp/mcp_client.py:13: being logged as an error. Every registered tool is ``<server>_<tool>``, and a name that is",
+    "examples/plugins/mcp/mcp_stdio.py:15: stderr is log output, which is drained here and kept as a tail for error messages, because",
+    "examples/plugins/stig-runner/asd_probes.py:233: pattern=r\"(log|logger)[^\\n]*\\b(SUCCESS|FAILURE|ERROR|PASS|outcome|result)\\b\",",
+    "examples/plugins/vertex-provider/vertex_provider.py:130: with the log in exactly that shape, and resuming it wedges the session behind a provider error",
+    "examples/plugins/vertex-provider/vertex_provider.py:197: \"\"\"The answer to a call the log never recorded a result for.",
+    "picoagent/core/events.py:55: that raises is logged with its owner, a tool that fails becomes a tool result, a plugin",
+    "picoagent/core/provider.py:49: #: What the model is told about a tool call the log never recorded a result for. Everything it",
+    "picoagent/plugins/loader.py:141: log.error(\"ignoring [plugins].enabled entry %r: a plugin spec is a string (a git url or a \"",
+    "picoagent/plugins/loader.py:505: log.error(\"%s could not be read (%s), so no plugin counts as approved this run. \"",
+    "picoagent/plugins/loader.py:1078: log.error(\"cannot resolve plugin %s: %s\", spec, exc)",
+    "picoagent/plugins/loader.py:1214: (log.error if notice.urgent else log.warning)(\"%s\", notice.text)",
+    "picoagent/plugins/loader.py:1266: log.error(\"cannot read plugin at %s: %s\", root, exc)",
+    "picoagent/testing/fake_es.py:8: logs-nginx.error-default web-server error log",
+    "picoagent/testing/fake_es.py:76: docs.append((\"logs-nginx.error-default\", {**base, \"agent\": {\"type\": \"filebeat\"},",
+    "picoagent/testing/fake_es.py:77: \"@timestamp\": _iso(ts, 10 + i * 15), \"log\": {\"level\": \"error\"},",
+    "picoagent/testing/fake_es.py:79: \"event\": {\"dataset\": \"nginx.error\"}, \"data_stream\": {\"type\": \"logs\", \"dataset\": \"nginx.error\"}}))",
+    "picoagent/testing/fake_es.py:228: row(\"logs-nginx.error-default\", \"0\", \"p\", \"STARTED\", \"18000\", \"24000000\", \"node-2\"),",
+    "picoagent/testing/fake_es.py:229: row(\"logs-nginx.error-default\", \"0\", \"r\", \"UNASSIGNED\", \"\", \"\", \"\",",
+    "picoagent/testing/fake_es.py:367: \"logs-nginx.error-default\": {",
+    "picoagent/testing/fake_es.py:368: \"index\": \"logs-nginx.error-default\", \"managed\": True, \"policy\": \"logs\",",
+    "picoagent/testing/fake_es.py:380: \"[logs-nginx.error-default]\"},"
+   ]
+  }
+ ],
+ "APSC-DV-001080": [
+  {
+   "describe": "grep /syslog|SyslogHandler|fluentd|fluent-bit|logstash|filebeat|splunk|cloudwatch|opentelemetry|otlp|GELF|graylog/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "determine if the system is configured to utilize a centralized log management sy",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/es-doctor/es_admin.py:98: #: Where a shipped slow log lands, and the three dataset names Filebeat / Elastic Agent use.",
+    "examples/plugins/es-doctor/es_admin.py:99: SLOWLOG_INDEX = \"logs-elasticsearch.slowlog-*,filebeat-*\"",
+    "examples/plugins/es-doctor/es_admin.py:954: f\"files on the nodes (*_index_search_slowlog.json) unless Filebeat or Elastic Agent \"",
+    "examples/plugins/es-doctor/es_admin.py:993: \"(*_index_search_slowlog.json); ship them with Filebeat or Elastic Agent to \"",
+    "examples/plugins/es-doctor/es_client.py:33: DEFAULT_LOGS_INDEX = \"logs-*,filebeat-*\"",
+    "examples/plugins/es-doctor/es_doctor.py:8: es_logs dig through logs (filebeat, Elastic Agent logs-*) by service, host, level,",
+    "examples/plugins/es-doctor/es_doctor.py:35: logs_index = \"logs-*,filebeat-*\" # override the default patterns if your naming differs",
+    "examples/plugins/es-doctor/es_doctor.py:92: - data streams: logs-*, metrics-*, traces-apm* (Elastic Agent); filebeat-*, metricbeat-*, packetbeat-*,",
+    "examples/plugins/es-doctor/es_doctor.py:256: if signal is None and any(name.startswith(b) for b in (\"filebeat\", \"winlogbeat\", \"auditbeat\")):",
+    "examples/plugins/es-doctor/es_doctor.py:269: description = (\"Search logs (Elastic Agent logs-*, filebeat-*). Filters: service, host, container, level \"",
+    "examples/plugins/iscp-author/iac_inventory.py:186: \"aws_cloudwatch_\": \"monitoring\",",
+    "examples/plugins/iscp-author/iac_inventory.py:205: \"AWS::CloudWatch::\": \"monitoring\",",
+    "examples/plugins/stig-runner/asd_probes.py:240: pattern=r\"syslog|SyslogHandler|fluentd|fluent-bit|logstash|filebeat|splunk\"",
+    "examples/plugins/stig-runner/asd_probes.py:241: r\"|cloudwatch|opentelemetry|otlp|GELF|graylog\",",
+    "picoagent/testing/fake_es.py:7: logs-checkout-default filebeat-style app logs (ECS: log.level, message, service.name)",
+    "picoagent/testing/fake_es.py:62: base = {\"host\": {\"name\": \"web-01\"}, \"agent\": {\"type\": \"filebeat\"}, \"service\": {\"name\": \"checkout\"}}",
+    "picoagent/testing/fake_es.py:76: docs.append((\"logs-nginx.error-default\", {**base, \"agent\": {\"type\": \"filebeat\"},",
+    "picoagent/testing/fake_es.py:551: return {\"filebeat-7\": {\"order\": 1, \"index_patterns\": [\"filebeat-7*\", \"logs-checkout-*\"],",
+    "picoagent/testing/fake_es.py:565: \"overlapping\": [{\"name\": \"filebeat-7\", \"index_patterns\": [\"filebeat-7*\", \"logs-checkout-*\"]}]}}",
+    "tests/test_es_admin_plugin.py:294: self.assertIn(\"filebeat-7\", r.content)",
+    "tests/test_es_admin_plugin.py:301: self.assertIn(\"filebeat-7\", r.content)",
+    "tests/test_es_doctor_plugin.py:73: self.assertTrue(req[\"path\"].startswith(\"/logs-*,filebeat-*\"), req[\"path\"])"
+   ]
+  }
+ ],
+ "APSC-DV-002490": [
+  {
+   "describe": "grep /innerHTML\\s*=|dangerouslySetInnerHTML|v-html|\\|\\s*safe\\b|mark_safe|document\\.write\\s*\\(|\\bautoescape\\s*(=|:)\\s*(false|off)/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.html, *.jsx, *.tsx, *.vue, *.jsp, *.erb",
+   "serves": "perform manual testing in various data entry fields to determine if XSS exist",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:249: pattern=r\"innerHTML\\s*=|dangerouslySetInnerHTML|v-html|\\|\\s*safe\\b|mark_safe\""
+   ]
+  },
+  {
+   "describe": "build pipeline definitions and security gates",
+   "serves": "Review the application documentation and the vulnerability assessment scan resul",
+   "truncated": false,
+   "hits": [
+    ".github/workflows/security-scan.yml: pipeline; security tooling named: bandit, dependabot, semgrep, trivy",
+    ".github/workflows/sonarcloud.yml: pipeline; security tooling named: sonar"
+   ]
+  }
+ ],
+ "APSC-DV-002500": [
+  {
+   "describe": "grep /csrf|CsrfToken|XSRF|SameSite|csrf_exempt|WithCredentials/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Review the scan results for CSRF vulnerabilities ... web application firewalls t",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:181: r\"|\\bsameSite\\b\",",
+    "examples/plugins/stig-runner/asd_probes.py:258: pattern=r\"csrf|CsrfToken|XSRF|SameSite|csrf_exempt|WithCredentials\",",
+    "examples/plugins/stig-runner/asd_probes.py:259: serves=\"Review the scan results for CSRF vulnerabilities ... web application \""
+   ]
+  }
+ ],
+ "APSC-DV-002510": [
+  {
+   "describe": "grep /os\\.system\\s*\\(|subprocess\\.[A-Za-z_]+\\([^)]*shell\\s*=\\s*True|Runtime\\.getRuntime\\(\\)\\.exec|child_process\\.exec\\s*\\(|\\bpopen\\s*\\(|eval\\s*\\(/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "automated code review and vulnerability scans conducted to test for command inje",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/mcp/mcp_stdio.py:110: self._proc = subprocess.Popen("
+   ]
+  }
+ ],
+ "APSC-DV-002530": [
+  {
+   "describe": "grep /\\b(pydantic|marshmallow|cerberus|joi|zod|yup|jsonschema|@Valid|Validated|FluentValidation|express-validator|validate_input)\\b/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Verify scan configuration settings include input validation and fuzzing tests",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/iscp-author/iscp_author.py:7: iscp_answer record one answer, validated against the question's kind",
+    "examples/plugins/iscp-author/iscp_author.py:266: description = (\"Record one ISCP interview answer. Validated against the question's kind; \"",
+    "examples/plugins/iscp-author/iscp_template.py:258: Para(\"During validation, the system is tested and validated as operational prior to returning \"",
+    "examples/plugins/stig-runner/asd_probes.py:90: \"the cryptographic modules used by the application have been FIPS-validated\"),",
+    "examples/plugins/stig-runner/asd_probes.py:271: pattern=r\"\\b(pydantic|marshmallow|cerberus|joi|zod|yup|jsonschema|@Valid|Validated\"",
+    "examples/plugins/stig-runner/asd_probes.py:272: r\"|FluentValidation|express-validator|validate_input)\\b\",",
+    "picoagent/testing/fake_ckl.py:130: ('Rule_Title', 'The application must utilize FIPS-validated cryptographic modules when generating cryptographic hashes.'),",
+    "picoagent/testing/fake_ckl.py:131: ('Vuln_Discuss', 'Use of weak or untested encryption algorithms undermines the purposes of utilizing encryption to protect data. The application must implement cryptographic modules adhering to the hi\u2026",
+    "picoagent/testing/fake_ckl.py:133: ('Check_Content', 'Review the application components and the application requirements to determine if the application is capable of generating cryptographic hashes.\\n\\nReview the application documenta\u2026",
+    "picoagent/testing/fake_ckl.py:134: ('Fix_Text', 'Configure the application to use a FIPS-validated hashing algorithm when creating a cryptographic hash.'),",
+    "picoagent/testing/fake_ckl.py:163: ('Fix_Text', 'Verify user input is validated and encode or escape user input to prevent embedded script code from executing.\\n\\nDevelop your application using a web template system or a web applicatio\u2026",
+    "picoagent/testing/fake_ckl.py:189: ('Vuln_Discuss', 'SQL Injection is a code injection attack against database applications. Malicious SQL statements are inserted into an application data entry field where they are submitted to the dat\u2026"
+   ]
+  }
+ ],
+ "APSC-DV-002540": [
+  {
+   "describe": "grep /(execute|query|rawQuery|createStatement|prepare)\\s*\\([^)]*(\\+\\s*[A-Za-z_]|%\\s*[\\(A-Za-z_]|\\.format\\(|f[\\\"']|\\$\\{)|SELECT\\s+.*\\+|WHERE\\s+.*[\\\"']\\s*\\+/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "Verify the scan configuration is configured to test for SQL injection flaws",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/iscp-author/iscp_questions.py:374: \"Select all that apply: \" + \" \".join(TEST_OBJECTIVES), kind=\"list\",",
+    "picoagent/testing/fake_ckl.py:406: ' cursor.execute(\"SELECT * FROM users WHERE name = \\'\" + name + \"\\'\")\\n'"
+   ]
+  }
+ ],
+ "APSC-DV-002550": [
+  {
+   "describe": "grep /XMLReader|DocumentBuilderFactory|SAXParser|etree\\.(parse|fromstring)|xml\\.dom\\.minidom|resolve_entities|XXE|DTD/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "verify the scan was configured to test for XML-related vulnerabilities and secur",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:284: pattern=r\"XMLReader|DocumentBuilderFactory|SAXParser|etree\\.(parse|fromstring)\"",
+    "examples/plugins/stig-runner/asd_probes.py:285: r\"|xml\\.dom\\.minidom|resolve_entities|XXE|DTD\","
+   ]
+  }
+ ],
+ "APSC-DV-002485": [
+  {
+   "describe": "grep /type\\s*=\\s*[\\\"']hidden[\\\"']/ over *.html, *.htm, *.jsx, *.tsx, *.vue, *.jsp, *.erb",
+   "serves": "Examine identified hidden fields and determine what type of data is stored in th",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-002480": [
+  {
+   "describe": "grep /\\bDEBUG\\s*[:=]\\s*(True|true|1)\\b|app\\.debug\\s*=\\s*True|display_errors\\s*=\\s*On|customErrors\\s+mode\\s*=\\s*[\\\"']Off/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m, *.yml, *.yaml, *.json, *.toml, *.ini, *.cfg, *.conf, *.properties, *.xml, *.env, .env*, web.config, appsettings*.json",
+   "serves": "Review web server configuration and determine if custom error pages are configur",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-002570": [
+  {
+   "describe": "grep /printStackTrace\\s*\\(|traceback\\.(print_exc|format_exc)|\\.getStackTrace|e\\.stack\\b|str\\(e\\)|exc\\.args/ over *.py, *.js, *.ts, *.jsx, *.tsx, *.java, *.cs, *.go, *.rb, *.php, *.kt, *.scala, *.c, *.cc, *.cpp, *.h, *.rs, *.swift, *.m",
+   "serves": "If variable names, SQL strings, system path information, or source or program co",
+   "truncated": false,
+   "hits": [
+    "examples/plugins/stig-runner/asd_probes.py:307: pattern=r\"printStackTrace\\s*\\(|traceback\\.(print_exc|format_exc)|\\.getStackTrace\""
+   ]
+  }
+ ],
+ "APSC-DV-001460": [
+  {
+   "describe": "build pipeline definitions and security gates",
+   "serves": "obtain and review their application vulnerability scanning process. Request the ",
+   "truncated": false,
+   "hits": [
+    ".github/workflows/security-scan.yml: pipeline; security tooling named: bandit, dependabot, semgrep, trivy",
+    ".github/workflows/sonarcloud.yml: pipeline; security tooling named: sonar"
+   ]
+  }
+ ],
+ "APSC-DV-002630": [
+  {
+   "describe": "dependency manifests and lockfiles",
+   "serves": "If application updates are not checked on at least on a weekly basis and applied",
+   "truncated": false,
+   "hits": [
+    "pyproject.toml: ~8 declared dependencies; NO lockfile beside it - dependency versions are not pinned"
+   ]
+  },
+  {
+   "describe": "exists .github/dependabot.yml, .github/dependabot.yaml, renovate.json, .renovaterc, .renovaterc.json",
+   "serves": "inquire about patching process",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-003170": [
+  {
+   "describe": "build pipeline definitions and security gates",
+   "serves": "If code reviews are conducted with software tools, have the application represen",
+   "truncated": false,
+   "hits": [
+    ".github/workflows/security-scan.yml: pipeline; security tooling named: bandit, dependabot, semgrep, trivy",
+    ".github/workflows/sonarcloud.yml: pipeline; security tooling named: sonar"
+   ]
+  },
+  {
+   "describe": "exists CODEOWNERS, .github/CODEOWNERS, CONTRIBUTING.md, .github/pull_request_template.md",
+   "serves": "describe the code review process or provide documentation outlining the organiza",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-003230": [
+  {
+   "describe": "exists THREAT_MODEL*, threat-model*, threat_model*, docs/threat*, *.tm7",
+   "serves": "Review the threat model document and identify the following sections are present",
+   "truncated": false,
+   "hits": []
+  }
+ ],
+ "APSC-DV-003235": [
+  {
+   "describe": "build pipeline definitions and security gates",
+   "serves": "Identify the most recent security scans and code analysis testing conducted. Ver",
+   "truncated": false,
+   "hits": [
+    ".github/workflows/security-scan.yml: pipeline; security tooling named: bandit, dependabot, semgrep, trivy",
+    ".github/workflows/sonarcloud.yml: pipeline; security tooling named: sonar"
+   ]
+  }
+ ],
+ "APSC-DV-002960": [
+  {
+   "describe": "exists *.conf, *.ini, *.properties, config/*, conf/*, settings.py, appsettings*.json",
+   "serves": "Identify the directory where the application code, configuration settings and ot",
+   "truncated": false,
+   "hits": []
+  }
+ ]
+}
