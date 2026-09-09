@@ -195,7 +195,7 @@ def main() -> int:
     reached = run_suite(args.pattern)
     testing = ROOT / "picoagent" / "testing"
     package = report("picoagent - the application", ROOT / "picoagent", reached, skip=testing)
-    plugins = report("examples/plugins - shipped, loaded only if the user asks for them",
+    plugins = report("examples/plugins - the provider references, loaded only if the user asks",
                      ROOT / "examples" / "plugins", reached)
     fakes = report("picoagent/testing - the fake servers the suite runs against", testing, reached)
 

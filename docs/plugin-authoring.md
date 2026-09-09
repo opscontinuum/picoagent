@@ -288,12 +288,13 @@ survives - the read is cancelled with it - so there is no partial output to insp
 ## Spawning a process
 
 **The rule: a child process a plugin starts gets a minimal environment, and anything more is
-named one variable at a time.** Two kinds of child sit outside it, and both are stated rather
-than overlooked: a command the *user* typed runs with the user's own environment (`!cmd` in the
+named one variable at a time.** One kind of child sits outside it, and is stated rather than
+overlooked: a command the *user* typed runs with the user's own environment (`!cmd` in the
 REPL, and the `git`/`pip` calls that install a plugin, which authenticate through a credential
-helper that reads it), and the built-in `shell` tool inherits everything, which is the leak
-`examples/plugins/credential-guard` exists to close by replacing that tool. Everything a plugin
-spawns for itself is on this side of the line.
+helper that reads it). The built-in `shell` tool applies its own allowlist,
+`tools.SHELL_ENV_ALLOWLIST`, by default - the `credential-guard` plugin
+(`opscontinuum/picoagent-plugins`) only narrows further. Everything a plugin spawns for
+itself is on this side of the line.
 
 `api.exec` already does this: the child starts from `minimal_env()` in `picoagent/plugins/api.py`
 and your `env=` dict is merged over the top. If you spawn your own process instead of using
@@ -473,7 +474,8 @@ about, arriving one level up.
 
 **Matching patterns against a resolved path.** A resolved path is absolute, so a relative
 pattern like `.git/**` or `.env` will not `fnmatch` it. Match against every trailing run of the
-path's components instead - `permission_gate._spellings` is nine lines of it:
+path's components instead - `permission_gate._spellings` (in `opscontinuum/picoagent-plugins`)
+is nine lines of it:
 
 ```python
 def _spellings(path):
@@ -545,12 +547,12 @@ See `tests/test_example_plugins.py` for complete examples.
 
 ## A complete domain plugin
 
-`examples/plugins/es-doctor` is the reference for "teach the agent a system": it combines
-seven tools, three runbook skills, a system-prompt section of domain knowledge, a `/es`
-command and a `tool_call` guard, all against plain HTTP. Its tests run against a fake
-Elasticsearch (`picoagent/testing/fake_es.py`) that serves a scripted incident, which is the
-pattern to copy for any plugin that talks to an external service: fake the service, script a
-scenario, assert on the queries the plugin sends and the text it returns.
+[es-doctor](https://github.com/opscontinuum/es-doctor) is the reference for "teach the agent
+a system": it combines its tools, runbook skills, a system-prompt section of domain
+knowledge, a `/es` command and a `tool_call` guard, all against plain HTTP. Its tests run
+against a fake Elasticsearch (its `tests/fake_es.py`) that serves a scripted incident, which
+is the pattern to copy for any plugin that talks to an external service: fake the service,
+script a scenario, assert on the queries the plugin sends and the text it returns.
 
 ## Publishing
 

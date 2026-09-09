@@ -382,16 +382,19 @@ class ShippedManifestFields(unittest.TestCase):
                           for path in sorted(ROOT.glob("examples/plugins/*/plugin.toml"))]
 
     def test_there_are_manifests_to_check(self):
-        self.assertGreater(len(self.manifests), 5)
+        """Two provider examples remain since the plugin extraction; zero would mean the glob
+        is wrong, not that the repository stopped shipping examples."""
+        self.assertGreater(len(self.manifests), 0)
 
-    def test_requires_is_parsed_off_the_manifests_that_set_it(self):
-        """Eight shipped plugins declare ``requires``; nothing enforces it, so this is the
-        only thing standing between the field and silently becoming unparsed."""
-        declared = [m for m in self.manifests if m.requires]
-        self.assertGreater(len(declared), 0, "no shipped manifest sets 'requires'")
-        for manifest in declared:
-            with self.subTest(plugin=manifest.name):
-                self.assertTrue(all(isinstance(entry, str) for entry in manifest.requires))
+    def test_requires_is_parsed_as_a_list_of_strings(self):
+        """The manifests that declared ``requires`` moved out with their plugins, so the parse
+        is pinned on a synthetic manifest rather than on whatever happens to ship."""
+        root = temp_dir()
+        (root / "plugin.toml").write_text(
+            'name = "p"\nentry = "p:register"\nrequires = ["picoagent>=0.1"]\n')
+        manifest = Manifest.load(root)
+        self.assertEqual(manifest.requires, ["picoagent>=0.1"])
+        self.assertTrue(all(isinstance(entry, str) for entry in manifest.requires))
 
     def test_a_requires_value_of_the_wrong_shape_costs_the_value_not_the_plugin(self):
         root = temp_dir()

@@ -1,4 +1,4 @@
-"""Two plugins send a credential to a URL a user configured. A redirect must not move it.
+"""The vertex provider sends a credential to a URL a user configured. A redirect must not move it.
 
 ``urllib`` re-sends every header that is not about the body to whatever ``Location`` names, so a
 server answering with a 302 to another host is handed the ``Authorization`` header in full -
@@ -6,12 +6,13 @@ demonstrated here against a second local server that records what it received. `
 ``curl`` strip the header on a cross-origin redirect; ``urllib`` does not, and it will follow a
 redirect to ``ftp:`` as well.
 
-The vertex provider carries an OAuth bearer token minted from the user's ``gcloud`` login, and
-es-doctor an Elasticsearch API key or a Basic password, so both are exactly the case core's
-``_SameOriginRedirects`` exists for: the redirect is refused rather than followed with the header
-dropped, because the request body - a conversation, or a query over the cluster - is worth
+The vertex provider carries an OAuth bearer token minted from the user's ``gcloud`` login, so it
+is exactly the case core's ``_SameOriginRedirects`` exists for: the redirect is refused rather
+than followed with the header dropped, because the request body - a conversation - is worth
 stealing on its own. ``test_providers.RedirectTests`` holds the same property for core's own
-provider; this file holds it for the two plugins that open their own connections.
+provider; this file holds it for the shipped provider plugin that opens its own connections.
+es-doctor holds it for its Elasticsearch client in its own repository
+(``opscontinuum/es-doctor``, ``tests/test_redirects.py``).
 
 The redirect is done by a real ``http.server`` on loopback rather than a stubbed opener: what is
 under test is what ``urllib`` does with a ``Location`` header, so a fake that answers instead of
@@ -20,18 +21,12 @@ redirecting would prove nothing about it.
 import asyncio
 import importlib.util
 import json
-import sys
 import threading
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from helpers import ROOT
-
-ES_PLUGIN = ROOT / "examples/plugins/es-doctor"
-if str(ES_PLUGIN) not in sys.path:
-    sys.path.insert(0, str(ES_PLUGIN))
-import es_client                                              # noqa: E402 - needs the path above
 
 _spec = importlib.util.spec_from_file_location(
     "vertex_provider", ROOT / "examples/plugins/vertex-provider/vertex_provider.py")
@@ -159,40 +154,6 @@ class VertexRedirectTests(_RedirectCase):
         followed = [headers.get("Authorization") for path, headers in self.gateway.received
                     if path.startswith(MOVED)]
         self.assertEqual(followed, [f"Bearer {self.TOKEN}"])
-
-
-class ESDoctorRedirectTests(_RedirectCase):
-    KEY = "SECRET-ES-API-KEY"
-
-    def _client(self, url: str) -> "es_client.ESClient":
-        return es_client.ESClient(url=url, api_key=self.KEY)
-
-    def test_a_cross_origin_redirect_never_delivers_the_api_key(self):
-        with self.assertRaises(es_client.ESError):
-            self._client(self.gateway.url).request("GET", "/_cluster/health")
-        self.assertNotIn(f"ApiKey {self.KEY}", self.elsewhere.authorization_seen())
-
-    def test_a_cross_origin_redirect_is_refused_rather_than_followed(self):
-        """The body of a search is the query the assessor wrote, so the other host gets nothing."""
-        with self.assertRaises(es_client.ESError):
-            self._client(self.gateway.url).search("logs-*", {"query": {"match_all": {}}})
-        self.assertEqual(self.elsewhere.received, [])
-
-    def test_the_refusal_is_an_es_error_a_tool_can_report(self):
-        """Expected failures are values here: a tool turns ``ESError`` into a result, and anything
-        else would leave the plugin raising out of ``run`` instead."""
-        with self.assertRaises(es_client.ESError) as caught:
-            self._client(self.gateway.url).request("GET", "/_cluster/health")
-        self.assertIn("redirect", str(caught.exception))
-        self.assertNotIn(self.KEY, str(caught.exception))
-
-    def test_a_same_origin_redirect_is_still_followed_with_the_key(self):
-        self.gateway.redirect_to_self()
-        answer = self._client(self.gateway.url).request("GET", "/_cluster/health")
-        self.assertEqual(answer, {"status": "green"})
-        followed = [headers.get("Authorization") for path, headers in self.gateway.received
-                    if path.startswith(MOVED)]
-        self.assertEqual(followed, [f"ApiKey {self.KEY}"])
 
 
 if __name__ == "__main__":
