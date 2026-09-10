@@ -58,7 +58,7 @@ Access to it is access to the shell of the user running it.
 | Component | Job | Why an attacker cares |
 |---|---|---|
 | `core/loop.py` | the agent loop and the shared registries | decides which tool call runs, and in which order the guards see it |
-| `core/tools.py` | `read`, `write`, `edit`, `shell`, and the path-resolution seam | the only code that touches the filesystem and spawns processes on the model's say-so |
+| `core/tools.py` | `read`, `write`, `edit`, `glob`, `grep`, `shell`, and the path-resolution seam | the only code that touches the filesystem and spawns processes on the model's say-so |
 | `core/provider.py` | the OpenAI-dialect HTTP client | where the API key becomes an `Authorization` header, and where a redirect is decided |
 | `core/session.py` | the append-only JSONL log | the record of everything, and the thing replayed to the model next turn |
 | `core/config.py` | layered TOML config, `USER_ONLY`, `PluginConfig` | decides which settings a cloned repository may set |
