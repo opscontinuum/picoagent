@@ -19,7 +19,7 @@ picoagent/
   core/
     loop.py              AgentLoop (control flow) + Runtime (shared registries)
     provider.py          Provider protocol + built-in OpenAI-compatible client
-    tools.py             Tool protocol, registry, read/write/edit/bash
+    tools.py             Tool protocol, registry, read/write/edit/glob/grep/shell
     skills.py            SKILL.md discovery and /skill:name expansion
     context.py           system-prompt sections, AGENTS.md discovery
     session.py           append-only JSONL log with parent ids (a tree)
@@ -72,7 +72,7 @@ user types "add a --verbose flag"
 ## Why the core is this small
 
 The four popular harnesses (Claude Code, Codex CLI, Pi, OpenCode) disagree about almost
-everything except: a model loop, read/write/edit/shell tools, SKILL.md skills, a context
+everything except: a model loop, read/write/edit/glob/grep/shell tools, SKILL.md skills, a context
 file, a session log, and lifecycle hooks. Pi ships with only that and pushes the rest to
 packages, which proves it is enough. Keeping permissions, compaction, MCP, subagents, plan
 mode and the TUI out of core means:

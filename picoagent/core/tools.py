@@ -1,4 +1,4 @@
-"""Tools: the protocol, the registry, and the four built-ins the model gets by default.
+"""Tools: the protocol, the registry, and the six built-ins the model gets by default.
 
 Design notes
 ------------
@@ -18,9 +18,10 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import signal
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -386,6 +387,371 @@ class EditTool:
                           details={"path": str(path), "old": old, "new": new})
 
 
+#: Directory names no search descends into.
+#:
+#: A walk that goes into ``.git`` or ``node_modules`` spends nearly all of its time there and
+#: answers with files nobody asked about: a match inside a vendored dependency reads exactly
+#: like a match in the code being edited, and the model has no way to tell them apart. The list
+#: is a module-level constant rather than a parameter because it is a fact about repositories
+#: rather than about one call, and because a name that turns out to be wrong here has to be
+#: visible to be fixed.
+#:
+#: Only names that never hold hand-written source are on it. ``build``, ``dist`` and ``target``
+#: were considered and deliberately left off: each is generated output in one ecosystem and a
+#: source directory in another, and a source tree skipped in silence is a worse failure than a
+#: slow search. Narrowing beyond this list is the caller's job, through ``path`` or ``glob``.
+IGNORED_DIRECTORIES: frozenset[str] = frozenset({
+    ".git", ".hg", ".svn", ".bzr",                       # version control metadata
+    "node_modules", ".venv", "venv", "site-packages",    # installed dependencies
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".eggs",
+    ".cache", ".next", ".nuxt", ".terraform",
+    ".idea", ".vscode",                                  # editor state
+})
+
+#: How much of a file is examined for the NUL byte that says "not text". A binary file that
+#: begins with a text-shaped header - an ELF interpreter path, a PNG's chunk names - still has
+#: one well inside the first block, and reading more than a block to decide costs the whole file.
+_BINARY_SNIFF_BYTES = 8192
+
+#: The most matches ``grep`` collects before it stops walking.
+#:
+#: The output limits in the config would cut the *text* either way, but only after every file
+#: had been read: a pattern like ``.`` matches every line of every file in the tree, and the
+#: work of finding a hundred thousand matches is spent whether or not they are shown. The cap
+#: is on the search, so a too-broad pattern costs a moment rather than a minute, and the result
+#: says the cap was reached so the model narrows the pattern instead of trusting the count.
+GREP_MATCH_LIMIT = 200
+
+#: How much of one matching line is quoted back. A minified bundle is one line of 400 KB, and
+#: a single such match would otherwise fill the whole tool result on its own.
+GREP_MAX_LINE_CHARS = 300
+
+#: Files larger than this are not searched. Every candidate is read into memory to be decoded,
+#: and a repository with a database dump or a packed asset in it should cost a skipped file
+#: rather than the session's memory. The skip is named in the tool description, because a model
+#: that does not know a file was left out reads "no matches" as "not there".
+GREP_MAX_FILE_BYTES = 2_000_000
+
+
+def _glob_matcher(pattern: str) -> re.Pattern[str]:
+    """Compile a glob pattern into a regex matched against ``/``-separated relative paths.
+
+    Neither obvious alternative does this correctly. ``fnmatch`` has no notion of a directory
+    separator - its ``*`` matches ``/`` too, so ``*.py`` would match ``pkg/b.py`` and, worse,
+    ``**/*.py`` would *not* match a file sitting at the root, because its two stars insist on
+    the slash between them. ``Path.glob`` has the semantics right but owns the walk, so it
+    descends into ``node_modules`` before anything can be filtered out of its results and
+    leaves nowhere to poll an abort.
+
+    Translating once here and matching against the paths our own walk produces gives both.
+    ``**/`` is any number of directories including none, ``*`` and ``?`` stop at a ``/``, and a
+    character class is handed to the regex engine, which spells one the same way glob does.
+
+    Raises :class:`re.error` for a pattern that cannot be compiled, which the tool turns into an
+    error result rather than letting it escape as an exception.
+    """
+    parts: list[str] = []
+    index, end = 0, len(pattern)
+    while index < end:
+        if pattern.startswith("**/", index):
+            parts.append("(?:[^/]+/)*")
+            index += 3
+        elif pattern.startswith("**", index):
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        elif pattern[index] == "[":
+            close = pattern.find("]", index + 1)
+            if close < 0:                       # an unclosed bracket is a literal one, as in a shell
+                parts.append(re.escape("["))
+                index += 1
+            else:
+                body = pattern[index + 1:close]
+                parts.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
+                index = close + 1
+        else:
+            parts.append(re.escape(pattern[index]))
+            index += 1
+    return re.compile("".join(parts))
+
+
+def _walk_files(root: Path, abort: asyncio.Event) -> Iterator[tuple[Path, str]]:
+    """Every file under ``root`` as ``(absolute path, path relative to root)``, noise skipped.
+
+    The relative spelling comes back with the absolute one because both are wanted at every
+    call site and recomputing it per file is the walk's second-largest cost after the reads.
+
+    ``dirnames`` is edited in place rather than filtered afterwards: that is the documented way
+    to tell ``os.walk`` not to descend, and it is the difference between skipping ``.git`` and
+    reading it and then throwing the results away. Symlinked directories are not followed, so a
+    link pointing at its own parent cannot make this run forever.
+
+    ``abort`` is polled once per directory rather than once per file, which is often enough to
+    stop a large tree promptly and rare enough to cost nothing. A partial answer is the right
+    answer for a cancelled search; the caller says so in the result.
+    """
+    for parent, dirnames, filenames in os.walk(root, followlinks=False):
+        if abort.is_set():
+            return
+        dirnames[:] = [name for name in dirnames if name not in IGNORED_DIRECTORIES]
+        relative = Path(parent).relative_to(root)
+        for name in filenames:
+            yield Path(parent) / name, (relative / name).as_posix()
+
+
+def _reported_path(root: Path, project_root: Path) -> Callable[[str], str]:
+    """Map a search-root-relative path to the spelling ``read`` and ``edit`` will accept.
+
+    A search rooted at ``pkg`` matches its patterns against ``b.py`` - the short spelling is
+    what the model asked about, and what it should be able to write a pattern against. But
+    every path this tool reports is one the model's *next* call hands straight back, and
+    ``read b.py`` resolves against the project root, where there is no such file. Reporting the
+    short spelling therefore costs a turn every time ``path`` is used, on a call that looked
+    like it succeeded.
+
+    So the two spellings are kept apart on purpose: the pattern still matches relative to the
+    search root, and the answer comes back relative to the project root, which is where the
+    caller will resolve it. A root outside the project has no relative spelling at all, so
+    those come back absolute - still directly usable, just longer.
+    """
+    try:
+        prefix = root.relative_to(project_root)
+    except ValueError:
+        return lambda relative: str(root / relative)
+    if prefix == Path("."):
+        return lambda relative: relative
+    return lambda relative: (prefix / relative).as_posix()
+
+
+def _search_root(ctx: ToolContext, raw: str | None) -> Path:
+    """The directory ``glob`` and ``grep`` walk: the model's ``path``, or the project root.
+
+    Resolved through :func:`resolve_path_inside_project`, one rule stricter than ``read`` and
+    ``write`` use, because a search root is almost always the model's own construction rather
+    than something a user typed. ``path="../.."`` is nobody's request, and a search that quietly
+    walked the parent of the work tree - reading the sibling repository, reporting its files as
+    though they were this one's - is worse than one that says no. An absolute path is still
+    allowed, so searching the sibling repository on purpose still works.
+
+    Raises :class:`PathRefused`, which both tools turn into an error result.
+    """
+    return resolve_path_inside_project(ctx, raw or ".")
+
+
+def _read_source_text(path: Path) -> str | None:
+    """A file's text, or ``None`` for anything a search must not quote back.
+
+    Three skips, each of which would otherwise put something wrong in the transcript.
+
+    A **binary** file decoded with ``errors="replace"`` becomes pages of replacement characters
+    that match nothing and read as corruption, so a NUL byte in the first block is taken as the
+    answer - the same test ``grep`` itself uses, and wrong only for the UTF-16 text nobody keeps
+    source in. A file that is not **UTF-8** is decoded strictly and skipped rather than guessed
+    at, because a guessed encoding puts characters in the result that are not in the file. And
+    an **unreadable** file - permissions, a dangling symlink, a device node, a file deleted
+    between the walk and the read - is one file's problem: the ``OSError`` stops here so that
+    the other thousand files still get searched.
+
+    Returning ``None`` rather than raising keeps the skip decision in one place; a caller that
+    sees ``None`` has nothing to decide.
+    """
+    try:
+        if path.stat().st_size > GREP_MAX_FILE_BYTES:
+            return None
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
+        return None
+    try:
+        return raw.decode()
+    except UnicodeDecodeError:
+        return None
+
+
+class GlobTool:
+    """Find files by path pattern, without the model having to compose a `find` command."""
+    name = "glob"
+    description = ("Find files by path pattern. Returns matching file paths, one per line, "
+                   "sorted, relative to the project root. '**/' matches any number of "
+                   "directories including none ('**/*.py' finds every Python file); '*' and '?' "
+                   "stop at a '/'. Dependency, build-cache and version-control directories "
+                   "(.git, node_modules, __pycache__, .venv, ...) are never searched. "
+                   "Output is truncated at ~2000 lines / 50KB - narrow the pattern if it is.")
+    parameters = {"type": "object", "properties": {
+        "pattern": {"type": "string", "description": "glob pattern, e.g. '**/*.py' or 'src/**/test_*.py'"},
+        "path": {"type": "string",
+                 "description": "directory to search from (default: the project root); "
+                                "results stay relative to the project root"}},
+        "required": ["pattern"]}
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        """Resolve the root, compile the pattern, walk, and hand back the sorted matches.
+
+        The walk runs in a worker thread. That is not about speed: ``ctx.abort`` is set by
+        another task on this event loop, and a walk that blocks the loop for thirty seconds is a
+        walk during which nothing can set the event it is meant to be polling. Off the loop, the
+        poll inside :func:`_walk_files` can actually see it, and the frontend keeps painting.
+
+        Finding nothing is an answer, not a failure: the pattern the model guessed was wrong,
+        which is information it can act on, and an ``is_error`` result invites it to retry the
+        same call instead of writing a different pattern.
+        """
+        try:
+            root = _search_root(ctx, args.get("path"))
+        except PathRefused as exc:
+            return tool_result(ctx, str(exc), is_error=True)
+        if not root.is_dir():
+            return tool_result(ctx, f"Not a directory: {root}", is_error=True)
+        pattern = args["pattern"]
+        try:
+            matcher = _glob_matcher(pattern)
+        except re.error as exc:
+            return tool_result(ctx, f"Cannot use {pattern!r} as a glob pattern: {exc}", is_error=True)
+
+        matches = await asyncio.to_thread(self._matching_paths, root, matcher, ctx.abort,
+                                          _reported_path(root, ctx.cwd))
+        body = "\n".join(matches) or f"No files match {pattern!r} under {root}"
+        # A cancelled walk reports what it found, and says the tree was not finished. Without
+        # that line an abort at the first directory is indistinguishable from a pattern that
+        # genuinely matches nothing, and the model draws the wrong conclusion from an empty list.
+        if ctx.abort.is_set():
+            body += "\n[search aborted before the whole tree was walked]"
+        return tool_result(ctx, body, path=str(root), count=len(matches))
+
+    @staticmethod
+    def _matching_paths(root: Path, matcher: re.Pattern[str], abort: asyncio.Event,
+                        report: Callable[[str], str]) -> list[str]:
+        """The relative paths under ``root`` the pattern matches, in path order.
+
+        Path order rather than most-recently-modified. Both are defensible and the trade is
+        real: mtime order puts the file the model just edited first, which survives a
+        truncation that path order would push it out of. Path order wins on the two properties
+        that turned out to matter more here. It is *stable* - the same call twice gives the same
+        list, so a model comparing a result against the one it got two turns ago is comparing
+        like with like, and a truncated result is a prefix it can page past rather than a
+        reshuffle. And it groups a directory's files together, so the listing shows the shape of
+        the tree, which is most of what a model asks ``glob`` for in the first place. mtime also
+        costs a ``stat`` per file, which path order does not spend at all.
+        """
+        return sorted(report(relative) for _, relative in _walk_files(root, abort)
+                      if matcher.fullmatch(relative))
+
+
+class GrepTool:
+    """Find file *contents* by regular expression: the search `glob` cannot do."""
+    name = "grep"
+    description = ("Search file contents with a Python regular expression. Returns one "
+                   "'path:line:text' line per match, in path order, with paths relative to the "
+                   "project root and line numbers counted from 1. Narrow the search with "
+                   "path (a directory) and glob (a path pattern such as '**/*.py'). Dependency "
+                   "and version-control directories are never searched, and binary files, "
+                   "non-UTF-8 files and files over 2MB are skipped. Stops after "
+                   f"{GREP_MATCH_LIMIT} matches and says so - narrow the pattern if it does.")
+    parameters = {"type": "object", "properties": {
+        "pattern": {"type": "string", "description": "Python regular expression, e.g. 'def \\w+_tool'"},
+        "path": {"type": "string",
+                 "description": "directory to search from (default: the project root); "
+                                "results stay relative to the project root"},
+        "glob": {"type": "string", "description": "only search files whose path matches this glob"},
+        "case_insensitive": {"type": "boolean", "description": "match without regard to case"}},
+        "required": ["pattern"]}
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        """Compile both patterns, then search off the event loop.
+
+        The two patterns are compiled before anything is walked, so a typo in either costs no
+        file reads and the message names which one was wrong. A regular expression the model got
+        wrong is an ordinary event - it is composing them blind, from a description of code it
+        has not read - so it comes back as an error result it can correct on the next turn, never
+        as the ``re.error`` that would otherwise be raised from inside the walk.
+        """
+        try:
+            root = _search_root(ctx, args.get("path"))
+        except PathRefused as exc:
+            return tool_result(ctx, str(exc), is_error=True)
+        if not root.is_dir():
+            return tool_result(ctx, f"Not a directory: {root}", is_error=True)
+        pattern = args["pattern"]
+        try:
+            matcher = re.compile(pattern, re.IGNORECASE if args.get("case_insensitive") else 0)
+        except re.error as exc:
+            return tool_result(ctx, f"Invalid regular expression {pattern!r}: {exc}", is_error=True)
+        selector = args.get("glob")
+        try:
+            selecting = _glob_matcher(selector) if selector else None
+        except re.error as exc:
+            return tool_result(ctx, f"Cannot use {selector!r} as a glob pattern: {exc}", is_error=True)
+
+        hits, capped = await asyncio.to_thread(self._hits, root, matcher, selecting, ctx.abort,
+                                               _reported_path(root, ctx.cwd))
+        body = self._report(hits, capped, f"No matches for {pattern!r} under {root}", ctx)
+        return ToolResult(ctx.tool_call_id, body, details={"path": str(root), "matches": len(hits)})
+
+    @staticmethod
+    def _hits(root: Path, matcher: re.Pattern[str], selecting: re.Pattern[str] | None,
+              abort: asyncio.Event, report: Callable[[str], str]) -> tuple[list[str], bool]:
+        """Every matching line as ``path:line:text``, and whether the cap stopped the search.
+
+        One flat line per match rather than a per-file heading with its matches under it. The
+        heading form is prettier and reads better in a terminal, and it breaks in the one place
+        this output has to survive: a truncation. Output here is cut to the session's limits
+        from the head, and a cut through a grouped listing leaves line numbers whose filename
+        has already scrolled away - references to nothing. Every line of the flat form carries
+        its own path, so a result cut anywhere is still entirely usable, and it is the shape
+        ``grep -n`` has printed for forty years, which the model has read a great deal of.
+        """
+        hits: list[str] = []
+        for path, relative in _walk_files(root, abort):
+            if selecting is not None and not selecting.fullmatch(relative):
+                continue
+            text = _read_source_text(path)
+            if text is None:
+                continue
+            for number, line in enumerate(text.splitlines(), start=1):
+                if not matcher.search(line):
+                    continue
+                shown = line if len(line) <= GREP_MAX_LINE_CHARS else line[:GREP_MAX_LINE_CHARS] + " ..."
+                hits.append(f"{report(relative)}:{number}:{shown}")
+                if len(hits) >= GREP_MATCH_LIMIT:
+                    return hits, True
+        return hits, False
+
+    @staticmethod
+    def _report(hits: list[str], capped: bool, empty: str, ctx: ToolContext) -> str:
+        """The matches, cut to the session's limits, with a footer saying what is missing and why.
+
+        Cut first and append after, the way :meth:`ReadTool._window` does, so the footer is the
+        one line that cannot itself be truncated away - a note about a truncation that got
+        truncated is worse than no note, because the model then reads a partial result as a
+        complete one and stops looking.
+
+        Only one footer, and the output limit outranks the match cap when both applied: it is
+        the tighter of the two and its advice - narrow the pattern - is the same either way.
+
+        Finding nothing takes the same path, with ``empty`` standing in for the list, because a
+        search that matched nothing and one that was cancelled before it got anywhere have to be
+        told apart, and the abort footer is what tells them apart. Nothing found is an answer
+        rather than an error: it means the pattern was wrong, which is something the model can
+        act on, while ``is_error`` invites it to retry the same call unchanged.
+        """
+        body, cut = truncate("\n".join(hits) or empty, ctx.config["tool_output_max_bytes"],
+                             ctx.config["tool_output_max_lines"])
+        if cut:
+            body += f"\n[truncated: {len(hits)} matches; narrow the pattern, or set path/glob]"
+        elif capped:
+            body += (f"\n[stopped at {GREP_MATCH_LIMIT} matches; there are more - "
+                     "narrow the pattern, or set path/glob]")
+        if ctx.abort.is_set():
+            body += "\n[search aborted before the whole tree was walked]"
+        return body
+
+
 def is_windows() -> bool:
     return platform.system() == "Windows"
 
@@ -612,7 +978,7 @@ class ShellTool:
                           details={"exit_code": proc.returncode})
 
 
-BUILTIN_TOOLS: list[type] = [ReadTool, WriteTool, EditTool, ShellTool]
+BUILTIN_TOOLS: list[type] = [ReadTool, WriteTool, EditTool, GlobTool, GrepTool, ShellTool]
 
 
 # --------------------------------------------------------------------------- registry

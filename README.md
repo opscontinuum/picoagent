@@ -1,6 +1,6 @@
 # picoagent
 
-A minimal-core coding agent harness in Python — **standard library only, no third-party dependencies**. **Core = chat + skills + tools** (`read`, `write`, `edit`, `shell` - the shell tool auto-detects the platform: bash/sh on Linux and macOS, PowerShell on Windows).
+A minimal-core coding agent harness in Python — **standard library only, no third-party dependencies**. **Core = chat + skills + tools** (`read`, `write`, `edit`, `glob`, `grep`, `shell` - the shell tool auto-detects the platform: bash/sh on Linux and macOS, PowerShell on Windows).
 Everything else — permissions, compaction, MCP, subagents, plan mode, TUI, hooks, LSP, worktrees — is a plugin
 installed from a git repo or local path, and any core piece (tools, provider, frontend, prompt sections) can be
 overridden by a plugin registering the same name.
