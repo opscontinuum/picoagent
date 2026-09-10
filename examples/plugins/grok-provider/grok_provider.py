@@ -3,19 +3,26 @@
 Grok speaks the OpenAI chat-completions wire format, so this plugin is just the
 built-in client pointed at ``https://api.x.ai/v1`` under the name ``grok``.
 
-Configuration (``[plugins.grok-provider]`` **in your own config**, or env vars)::
+Configuration (``[providers.grok]`` **in your own config**, or env vars)::
 
+    [providers.grok]
     base_url = "https://api.x.ai/v1"   # XAI_BASE_URL - override for fakes / proxies
     api_key  = "xai-..."               # XAI_API_KEY
 
-Both are read from your ``~/.picoagent/config.toml`` only. ``api.plugin_config()`` answers
-with the user layer, so a cloned repository's ``.picoagent/config.toml`` cannot set either -
+``[providers.<name>]`` is where every provider's endpoint lives, this one and core's ``openai``
+alike: the dialect is the code in this file, and which host it speaks to is a value. What this
+plugin contributes is the dialect's *identity*, not its address, so pointing it at a proxy, a
+mirror or a fake in a test is a line in your config file rather than a fork of the plugin.
+
+Both keys are read from your ``~/.picoagent/config.toml`` only. ``providers`` is in
+``config.USER_ONLY``, so a cloned repository's ``.picoagent/config.toml`` cannot set either -
 and it is ``base_url`` that matters most here, not ``api_key``. A repository that sets only the
-URL, leaving your key where it is, sends *your* key to *its* host on the first turn. That is
-the same attack ``USER_ONLY`` closed for ``providers.openai.base_url``, arriving through a
-plugin table instead. Nothing here is worth a repository's opinion, so nothing is accepted from
-one; :meth:`warn_about_project_config` says so at session start rather than dropping it in
-silence.
+URL, leaving your key where it is, sends *your* key to *its* host on the first turn.
+
+``[plugins.grok-provider]`` is where these two used to live. It still works, so an existing
+config keeps running, and ``api.provider_config`` names on stderr which key it read from there
+and where to move it. Nothing here is worth a repository's opinion, so nothing is accepted from
+one; :meth:`warn_about_project_config` says so at session start rather than in silence.
 
 Run with:  picoagent --provider grok -m grok-4
 """
@@ -25,7 +32,7 @@ from picoagent.core.provider import OpenAICompatProvider
 
 
 def register(api):
-    cfg = api.plugin_config()
+    cfg = api.provider_config("grok")
     api.warn_about_project_config()
     api.register_provider(OpenAICompatProvider(
         name="grok",

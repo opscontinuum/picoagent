@@ -10,18 +10,32 @@ neutral messages to Gemini's ``contents`` / ``parts`` / ``functionCall`` /
 Authentication is an OAuth bearer token: ``GOOGLE_OAUTH_ACCESS_TOKEN`` if set,
 otherwise ``gcloud auth print-access-token``.
 
-Configuration (``[plugins.vertex-provider]`` **in your own config.toml**, or env vars)::
+Configuration (``[providers.vertex]`` **in your own config.toml**, or env vars)::
 
+    [providers.vertex]
     project  = "my-gcp-project"        # GOOGLE_CLOUD_PROJECT
     location = "us-central1"           # GOOGLE_CLOUD_LOCATION
     base_url = "http://127.0.0.1:8766" # VERTEX_BASE_URL - override for fakes / proxies
 
-Every one of these decides where an OAuth bearer token is sent, so all four are read from the
-user layer of the config only - ``api.plugin_config()`` does not carry a repository's values.
-A cloned repository setting ``base_url`` would receive a live Google access token, minted from
-your ``gcloud`` login, on the first turn. See ``docs/security/trust-boundaries.md``. A redirect
-cannot move the token either: the request goes through core's opener, which refuses a redirect
-that leaves the origin ``base_url`` names rather than following it to a host you did not choose.
+``[providers.<name>]`` is where every provider's endpoint lives, this one and core's ``openai``
+alike, and it carries whatever a dialect needs rather than a fixed pair: Gemini's URL is built
+from ``project`` and ``location``, so those are endpoint settings here in the same sense
+``base_url`` is. The dialect - the mapping in this file - is code; the host it speaks to is a
+value. That is the whole reason ``base_url`` exists beside ``location``: the same dialect points
+at commercial Vertex AI for one user and at a government deployment for another, and that is a
+line in a config file, not a second plugin.
+
+Every one of these decides where an OAuth bearer token is sent, so all of them are read from the
+user layer of the config only. ``providers`` is in ``config.USER_ONLY``, so a repository's
+``.picoagent/config.toml`` never reaches this table: a cloned repository setting ``base_url``
+would otherwise receive a live Google access token, minted from your ``gcloud`` login, on the
+first turn. See ``docs/security/trust-boundaries.md``. A redirect cannot move the token either:
+the request goes through core's opener, which refuses a redirect that leaves the origin
+``base_url`` names rather than following it to a host you did not choose.
+
+``[plugins.vertex-provider]`` is where these used to live. It still works, so an existing config
+keeps running, and ``api.provider_config`` names on stderr which key it read from there and
+where to move it.
 
 Run with:  picoagent --provider vertex -m gemini-2.5-pro
 """
@@ -53,6 +67,7 @@ from picoagent.core.provider import _OPENER as SAME_ORIGIN_OPENER
 # provider owes its own wire is the *shape* of the answer; what the model is told happened is the
 # same fact on every wire, and two wordings would be two chances to say something untrue.
 from picoagent.core.provider import INTERRUPTED_TOOL_RESULT
+from picoagent.core.provider import SetupField
 from picoagent.core.types import Message, StreamEvent, ToolCall, ToolResult, new_id
 
 log = logging.getLogger("vertex_provider")
@@ -211,6 +226,19 @@ class VertexProvider:
         self.project, self.location = project, location
         self._base = (base_url or f"https://{location}-aiplatform.googleapis.com").rstrip("/")
         self._token = token
+        # What `picoagent setup` asks for, which for this dialect is not a URL and a key. The
+        # URL is built from `project` and `location`, and there is no key at all - the credential
+        # is an OAuth token minted per call from `gcloud` or the environment, so storing one in
+        # config.toml would store something that expires within the hour. `base_url` is offered
+        # last and defaults to empty on purpose: blank keeps the host derived from `location`,
+        # which is what a commercial Vertex user wants, while a government or proxied deployment
+        # names its own host and keeps everything else.
+        self.setup_fields: tuple[SetupField, ...] = (
+            SetupField("project", "Google Cloud project id", project),
+            SetupField("location", "Vertex location (e.g. us-central1)", location),
+            SetupField("base_url", "Endpoint host (blank derives it from the location above)",
+                       base_url or ""),
+        )
 
     # ------------------------------------------------------------------ auth
     def access_token(self) -> str:
@@ -325,7 +353,7 @@ class VertexProvider:
 
 
 def register(api):
-    cfg = api.plugin_config()
+    cfg = api.provider_config("vertex")
     api.warn_about_project_config()
     api.register_provider(VertexProvider(
         project=cfg.get("project") or os.environ.get("GOOGLE_CLOUD_PROJECT", "my-project"),
