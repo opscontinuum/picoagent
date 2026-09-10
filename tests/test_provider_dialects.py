@@ -355,10 +355,17 @@ class TheExamplePluginsStillLoad(DialectCase):
         provider = rt.providers.get("grok")
         self.assertEqual((provider._base, provider._key), ("http://mine/v1", "xai-mine"))
 
-    def test_vertex_provider_loads_and_registers_its_own_class(self):
+    def test_vertex_provider_registers_the_dialect_core_owns(self):
+        """The example demonstrates registration; the dialect it registers is core's.
+
+        It carried its own copy of the wire format until core gained one, and two
+        implementations of one dialect in one repository is a drift hazard rather than a
+        teaching aid - the copy had already missed the ``base_url`` scheme check core added.
+        Asserting the identity, not just the name, is what keeps a future edit from quietly
+        forking it again.
+        """
         rt = self.runtime(plugin="vertex-provider")
-        self.assertEqual(type(rt.providers.get("vertex")).__name__, "VertexProvider")
-        self.assertNotIsInstance(rt.providers.get("vertex"), VertexProvider)
+        self.assertIsInstance(rt.providers.get("vertex"), VertexProvider)
 
     def test_the_two_of_them_load_together_without_colliding(self):
         rt = self.runtime(plugin="grok-provider")
