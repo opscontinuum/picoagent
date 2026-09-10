@@ -19,7 +19,9 @@ picoagent/
   setup.py               the `picoagent setup` wizard: ask, verify, write config.toml
   core/
     loop.py              AgentLoop (control flow) + Runtime (shared registries)
-    provider.py          Provider protocol + built-in OpenAI-compatible client
+    provider.py          Provider protocol + registry + the OpenAI-compatible dialect
+    vertex.py            the Gemini/Vertex dialect (:streamGenerateContent)
+    dialects.py          one provider per [providers.<name>] table, by the dialect it names
     tools.py             Tool protocol, registry, read/write/edit/bash
     skills.py            SKILL.md discovery and /skill:name expansion
     context.py           system-prompt sections, AGENTS.md discovery
@@ -111,18 +113,28 @@ from that - see T23 in [the threat model](security/threat-model.md).
 ## Providers
 
 `Provider.stream()` is an async generator of `StreamEvent`s: `text`, `thinking`,
-`tool_call`, `done`, `error`. The built-in client speaks OpenAI's dialect over `urllib`;
-the blocking HTTP read runs in a thread that feeds an `asyncio.Queue`. A provider with a
-different dialect (Vertex/Gemini in `examples/plugins/vertex-provider`) implements the
-same generator and maps messages itself.
+`tool_call`, `done`, `error`. Both built-in clients run the blocking HTTP read in a thread that
+feeds an `asyncio.Queue`; what differs between them is the mapping either side of it.
+
+**A dialect is code, an endpoint is a value, and a provider is one table.** Core ships two
+dialects - `provider.OpenAICompatProvider` and `vertex.VertexProvider` - and `dialects.py`
+registers one provider for every `[providers.<name>]` table, choosing the class from that
+table's `dialect` key (absent means OpenAI-compatible). So `[providers.grok]` with a
+`base_url` is a working provider named `grok` with nothing installed, and `[providers.milgemini]`
+with `dialect = "vertex"` points the Gemini dialect at a host that is not Google's. An unknown
+dialect registers nothing and says which ones exist: guessing a wire format for a configured
+endpoint fails as a 400 about a request field, or worse, quietly works against a proxy that
+accepts both.
 
 Every provider reads its endpoint from `[providers.<name>]`, core's and a plugin's alike -
-`config.provider_config`, reached by plugins as `api.provider_config(name)`. The dialect is
-code and the endpoint is a value, so the same Vertex plugin points at commercial Vertex AI for
-one user and at a government host for another. The table is in `USER_ONLY`, so a repository
-never chooses where a credential goes. Two members of the protocol are optional and checked
-with `hasattr`: `list_models`, and `setup_fields`, which is how a provider tells
-`picoagent setup` what to ask for.
+`config.provider_config`, reached by plugins as `api.provider_config(name)`. The table is in
+`USER_ONLY`, so a repository never chooses where a credential goes. Two members of the protocol
+are optional and checked with `hasattr`: `list_models`, and `setup_fields`, which is how a
+provider tells `picoagent setup` what to ask for.
+
+A **third** wire format is still a plugin: `api.register_provider(obj)` takes any object
+implementing the protocol, and because later registration wins and plugins load after core, a
+plugin's provider replaces the one a config table of the same name built.
 
 ## Frontends
 

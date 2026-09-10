@@ -1,5 +1,17 @@
 """grok-provider - xAI Grok for picoagent.
 
+**This plugin is no longer needed.** Grok speaks the OpenAI chat-completions wire format, so a
+name and a URL is the whole of it, and core now registers a provider for every
+``[providers.<name>]`` table in your config::
+
+    [providers.grok]
+    base_url = "https://api.x.ai/v1"
+    api_key  = "xai-..."
+
+That is the same provider this file registers, with nothing to install, approve or upgrade. The
+plugin still loads and still works, so an install that has it enabled keeps running; it is kept
+here as the smallest possible worked example of ``register(api)``.
+
 Grok speaks the OpenAI chat-completions wire format, so this plugin is just the
 built-in client pointed at ``https://api.x.ai/v1`` under the name ``grok``.
 

@@ -7,9 +7,10 @@ behaviour comes from plugins you choose.
 ## Requirements
 
 * Python 3.11 or newer. Nothing else - the package has no third-party dependencies.
-* A model server that speaks the OpenAI chat-completions API. That includes OpenAI itself,
-  a local Ollama / vLLM / llama.cpp / LM Studio, OpenRouter, or a company gateway.
-  (Gemini on Vertex AI and xAI Grok are covered by the example plugins.)
+* A model server speaking one of the two wire formats picoagent ships: the OpenAI
+  chat-completions API (OpenAI itself, xAI Grok, a local Ollama / vLLM / llama.cpp / LM Studio,
+  OpenRouter, a company gateway) or Gemini's `:streamGenerateContent` (Vertex AI, and hosts
+  serving the same API). Either is a `[providers.<name>]` table; neither needs a plugin.
 
 ## Run it
 
@@ -110,6 +111,11 @@ It asks the provider what it needs rather than carrying a list of vendors, so a 
 registered turns up in the list the day you install it, asking for its own settings. Vertex wants
 a project and a location; an OpenAI-compatible endpoint wants a URL and a key.
 
+The last option in that list is **a new provider**. Pick it and setup asks for a name (`grok`,
+`local`, `milgemini` — whatever you want to type after `--provider`) and which wire format it
+speaks, then asks that dialect's own questions and writes the table. This is how you add a
+second or third model server without editing the file by hand and without installing anything.
+
 `setup` needs a terminal, since it is questions. In a script or a container, write the file
 yourself — that is all it is doing:
 
@@ -122,16 +128,41 @@ base_url = "http://localhost:11434/v1"
 api_key = ""
 ```
 
-`[providers.<name>]` is where every provider's endpoint lives, the built-in one and a plugin's
-alike. The dialect is code and the endpoint is a value, so the same Vertex plugin points at
-commercial Vertex AI for one person and at a government host for another with nothing forked:
+`[providers.<name>]` is where every provider's endpoint lives — and the table *is* the provider.
+Core registers one for each of them, choosing the wire format from the table's `dialect` key.
+Leave `dialect` out and you get the OpenAI-compatible client, which is what most servers are:
+
+```toml
+[providers.grok]                      # then: picoagent --provider grok -m grok-4
+base_url = "https://api.x.ai/v1"
+api_key = "xai-..."
+
+[providers.local]                     # then: picoagent --provider local
+base_url = "http://localhost:11434/v1"
+```
+
+`dialect = "vertex"` picks the other one core ships, Gemini's `:streamGenerateContent`. The
+dialect is code and the endpoint is a value, so the same dialect points at commercial Vertex AI
+for one person and at a government host for another with nothing forked and nothing installed:
 
 ```toml
 [providers.vertex]
+dialect = "vertex"
 project = "my-project"
 location = "us-gov-west1"
-base_url = "https://genai.mil"
+base_url = "https://genai.mil"        # omit to derive the commercial host from the location
 ```
+
+Vertex's credential is not in that table on purpose: it is an OAuth access token minted per call
+from `GOOGLE_OAUTH_ACCESS_TOKEN` or `gcloud auth print-access-token`, and one written into a
+config file expires within the hour.
+
+A `dialect` picoagent does not have is refused by name — it tells you which ones exist rather
+than falling back to a format your endpoint does not speak.
+
+If you previously used `examples/plugins/vertex-provider`, add `dialect = "vertex"` to the table
+you already have. If you used `examples/plugins/grok-provider`, the `[providers.grok]` table
+above replaces it. Both plugins still load and work if you leave them enabled.
 
 Three environment variables still work, and are the quickest way to try a different server for
 one run:
@@ -200,6 +231,7 @@ The exit code says how the run went, so a script does not have to read the outpu
 | 3 | a plugin you approved is not running, and the session did not start |
 | 4 | a config file could not be read, so no plugin decision was made at all |
 | 5 | the session started, but a turn got no answer and nothing retried it - a key, a URL or the network. A retry that then answered is not this; a follow-up answering after the prompt failed does not undo it |
+| 6 | the session did not start: `provider` names something no `[providers.<name>]` table built and no plugin registered. Usually a typo, or a table whose `dialect` picoagent refused |
 
 ## Adding behaviour
 

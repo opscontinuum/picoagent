@@ -1,5 +1,12 @@
 """Google Vertex AI (Gemini) provider plugin - standard library only.
 
+**This dialect ships in core now**, as :mod:`picoagent.core.vertex`, selected by
+``dialect = "vertex"`` in a ``[providers.<name>]`` table. This file is a second, independent
+implementation of the same wire format: it still loads, still registers under ``vertex`` (and
+replaces core's, because later registration wins), and is kept as the worked example of
+implementing a foreign dialect end to end - the mapping, the streaming, the credential model and
+the reuse of core's redirect-refusing opener, in one readable file.
+
 Gemini does **not** speak the OpenAI wire format, so this plugin maps picoagent's
 neutral messages to Gemini's ``contents`` / ``parts`` / ``functionCall`` /
 ``functionResponse`` structures and streams from::

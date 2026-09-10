@@ -20,7 +20,8 @@ in `picoagent/testing/fakes.py`.
 | `test_loop_and_plugins.py` | the loop end-to-end with a scripted model; plugin loading and trust |
 | `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, where a redirect may take a credentialed request, and what a failed model call says to somebody who has not configured anything yet |
 | `test_provider_endpoints.py` | `[providers.<name>]` as the one place any provider's endpoint lives: a plugin's dialect reading it, the deprecated `[plugins.<name>]` fallback still working and naming where to move to, a repository refused for every provider, and what a provider says it needs configured |
-| `test_setup_wizard.py` | `picoagent setup`: what it asks, that it edits config.toml rather than rewriting it, that nothing is replaced unasked and no stored secret is shown whole, that it refuses without a terminal, and that the file it writes a key into is owner-only |
+| `test_provider_dialects.py` | the table *as* the provider: a table with no `dialect` registering the OpenAI-compatible client under its own name, `dialect = "vertex"` selecting the Gemini one, an unknown dialect refused by name rather than guessed at, several tables registering several providers, the zero-config `openai` path unchanged, a plugin still replacing a table of the same name, both example plugins still loading, and the Vertex dialect driven from a config table against the fake Gemini server |
+| `test_setup_wizard.py` | `picoagent setup`: what it asks, that it edits config.toml rather than rewriting it, that nothing is replaced unasked and no stored secret is shown whole, that it refuses without a terminal, that the file it writes a key into is owner-only, and that a provider can be *invented* - named, given a wire format, verified and written as a table that rebuilds it |
 | `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
 | `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
 | `test_torn_state_files.py` | `trust.json` and the session log caught mid-write: the store is published by rename and reads as empty when it is damaged, a partial last line in the log is dropped and a hole in the middle is not |
@@ -29,7 +30,7 @@ in `picoagent/testing/fakes.py`.
 | `test_log_sanitisation.py` | escape sequences a plugin's exception writes through `log.exception`, and the formatter `main` installs |
 | `test_command_injection.py` | that untrusted data reaches a subprocess as argv and never as shell text, and that only the two intended places hand a string to a shell |
 | `test_suite_shape.py` | the suite's own invariants: nothing defined below a file's `__main__` block, where it would never run, and no test file calling `tempfile.mkdtemp` instead of the resolved `temp_dir()` |
-| `test_vertex_mapping.py` | Gemini schema cleaning and message mapping |
+| `test_vertex_mapping.py` | the Gemini dialect's schema cleaning and message mapping, in core |
 | `test_untrusted_text.py` | who may mark a notice as a command's answer; escape sequences and runaway length in text picoagent did not write |
 | `test_headless_run.py` | what a program driving `-p` reads: the exit code of a run whose model call failed, and which project's sessions `-r last` resumes |
 | `test_ollama_e2e.py` | live end-to-end against a real Ollama server (opt-in, skipped by default) |
@@ -55,7 +56,8 @@ python3 tools/coverage_report.py -p 'test_tools.py'   # one file, while you work
 Runs the suite under the standard library's `trace` and prints, per module, how many of that
 module's executable lines the run reached. Three tables, because they answer different
 questions: `picoagent/` is the application, `examples/plugins/` is the two provider references
-the docs teach with, and `picoagent/testing/` is the fake servers the suite runs against -
+the docs teach with (both redundant as configuration now, both still loaded by the suite), and
+`picoagent/testing/` is the fake servers the suite runs against -
 averaging the fakes into the application's number would flatter it. The plugin family that
 used to be measured here reports its own coverage from its own repositories.
 
