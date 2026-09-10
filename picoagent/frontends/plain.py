@@ -12,6 +12,7 @@ one place every string passes through and the only place that knows which codec 
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import sys
 from typing import Any
@@ -78,7 +79,21 @@ class PlainFrontend:
         prompt = safe_for_stream(prompt, sys.stdout)
         return await asyncio.get_running_loop().run_in_executor(None, input, prompt)
 
+    async def _read_secret(self, prompt: str) -> str:
+        """A credential typed at the terminal, with the terminal not echoing it.
+
+        ``getpass`` rather than ``input`` for the one kind of answer that must not be left on
+        screen behind the person typing it, or in a screen recording, or in a shoulder's view.
+        ``getpass`` falls back to an echoing read, warning as it does so, on a terminal that
+        cannot turn echo off. That is the right trade here: the answer is still needed, and
+        refusing to take it would leave somebody unable to configure the tool at all.
+        """
+        prompt = safe_for_stream(prompt, sys.stdout)
+        return await asyncio.get_running_loop().run_in_executor(None, getpass.getpass, prompt)
+
     async def ask(self, kind: str, prompt: str, **kw: Any) -> Any:
+        if kind == "input" and kw.get("secret"):
+            return await self._read_secret(f"{prompt} ")
         if kind == "confirm":
             answer = await self._readline(f"{prompt} [y/N] ")
             return answer.strip().lower() in ("y", "yes")
