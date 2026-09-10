@@ -1,10 +1,8 @@
-"""Unit tests for the Vertex plugin's message/schema mapping (no network)."""
-import importlib.util, json, unittest
-from helpers import ROOT
+"""Unit tests for the Gemini/Vertex dialect's message/schema mapping (no network)."""
+import json, unittest
+import helpers  # noqa: F401 - puts the checkout on sys.path
+from picoagent.core import vertex
 from picoagent.core.types import Message, ToolCall, ToolResult
-
-spec = importlib.util.spec_from_file_location("vertex_provider", ROOT / "examples/plugins/vertex-provider/vertex_provider.py")
-vertex = importlib.util.module_from_spec(spec); spec.loader.exec_module(vertex)
 
 
 class SchemaCleaningTests(unittest.TestCase):

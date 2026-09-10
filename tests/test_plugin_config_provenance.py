@@ -17,6 +17,8 @@ below.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 import textwrap
@@ -68,8 +70,13 @@ class LayeredConfigCase(unittest.TestCase):
     def runtime(self, plugin: str | None = None, frontend=None):
         rt = make_runtime(self.tmp, provider=ScriptedProvider([[text("ok")]]), frontend=frontend)
         if plugin:
-            loader.load_plugin(PLUGINS / plugin, rt, loader.TrustStore(self.tmp / "home"),
-                               allow_untrusted=True)
+            # stderr is swallowed because the provider plugins say on it that a setting came
+            # from their deprecated `[plugins.<name>]` table, which is what these layers set on
+            # purpose. That notice has its own tests in test_provider_endpoints.py; here it is
+            # noise in a run whose subject is which layer a value came from.
+            with contextlib.redirect_stderr(io.StringIO()):
+                loader.load_plugin(PLUGINS / plugin, rt, loader.TrustStore(self.tmp / "home"),
+                                   allow_untrusted=True)
             self.addCleanup(lambda: run(rt.events.emit("session_end", {}, rt)))
         return rt
 

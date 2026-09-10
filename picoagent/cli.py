@@ -5,6 +5,7 @@
     picoagent -p "prompt" --json   one-shot; JSONL event stream
     picoagent -r                   resume the most recent session for this directory
     picoagent -e ./my-plugin       load a plugin directory for this run
+    picoagent setup                ask what to point at, then write it into config.toml
     picoagent plugin add|trust|untrust|list
 
 The heavy lifting is delegated: :func:`build_runtime` wires registries and plugins,
@@ -21,13 +22,15 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterator
 
 from .core.config import HARDENED_USER_FILES_KEY, UNREADABLE_PROJECT_CONFIG_KEY, load_config
+from .core.dialects import providers_from_config
 from .core.loop import AgentLoop, Runtime
-from .core.provider import OpenAICompatProvider
+from .core.provider import SETUP_COMMAND
 from .core.session import Session, restrict_to_owner
 from .core.text import describe_exception, safe_for_display
 from .core.tools import BUILTIN_TOOLS
@@ -36,6 +39,7 @@ from .frontends.print import PrintFrontend
 from .plugins import loader
 from .plugins import upgrade as upgrade_mod
 from .plugins.manifest import ManifestError
+from . import setup as setup_mod
 
 
 # ---------------------------------------------------------------------------- wiring
@@ -45,16 +49,18 @@ from .plugins.manifest import ManifestError
 #: carry no mark, so the one line worth stopping for does not look like the rest.
 URGENT_MARK = "!!"
 
-#: Exit codes for the two startup refusals the plugin loader raises, and for a headless run whose
-#: model call failed. They are separate from each other, and from 1 (every other failure,
-#: ``open_session``'s ``SystemExit`` refusals included) and 2 (argparse's usage error), because the
-#: answers differ and a wrapper should not have to read English to tell them apart: 3 means a
-#: control someone approved is not going to run and a person has to look at it, 4 means a config
-#: file could not be read so no plugin decision was made at all, 5 means the session started but
-#: the model was never reached - a key, a URL or the network, none of which the prompt can fix.
+#: Exit codes for the two startup refusals the plugin loader raises, for a session whose selected
+#: provider does not exist, and for a headless run whose model call failed. They are separate from
+#: each other, and from 1 (every other failure, ``open_session``'s ``SystemExit`` refusals
+#: included) and 2 (argparse's usage error), because the answers differ and a wrapper should not
+#: have to read English to tell them apart: 3 means a control someone approved is not going to run
+#: and a person has to look at it, 4 means a config file could not be read so no plugin decision
+#: was made at all, 5 means the session started but the model was never reached - a key, a URL or
+#: the network, none of which the prompt can fix - and 6 means there was nothing to reach it with.
 EXIT_REQUIRED_PLUGIN = 3
 EXIT_PLUGIN_PROVENANCE = 4
 EXIT_MODEL_ERROR = 5
+EXIT_NO_SUCH_PROVIDER = 6
 
 #: How much of the project path goes into a session directory's name before the digest. Long
 #: enough to recognise a checkout, short enough that a deep path stays under the 255-byte
@@ -183,11 +189,25 @@ def looks_like_session(path: Path) -> bool:
 
 
 def register_core(rt: Runtime) -> None:
-    """Built-in provider, tools, skills and commands - the part plugins can override."""
-    provider_cfg = rt.cfg.get("providers", {}).get("openai", {})
-    rt.providers.register(OpenAICompatProvider(base_url=provider_cfg.get("base_url"),
-                                               api_key=provider_cfg.get("api_key"),
-                                               extra_headers=provider_cfg.get("headers")))
+    """Built-in providers, tools, skills and commands - the part plugins can override.
+
+    One provider per ``[providers.<name>]`` table, built by :mod:`picoagent.core.dialects` from
+    the dialect that table names. ``DEFAULTS`` carries ``providers = {"openai": {}}``, so an
+    install that has configured nothing still gets the built-in OpenAI-compatible client under
+    the name it has always had; a config with four tables gets four providers, all of them
+    selectable with ``--provider``, none of them requiring a plugin.
+
+    Refusals are printed rather than raised. A dialect nobody has - a ``[providers.experimental]``
+    somebody is halfway through configuring - must not stop the tool starting for the provider
+    they actually meant to use, and it must not silently become an OpenAI client either. So the
+    name goes unregistered, the reason goes to stderr where the other startup notices go, and
+    ``--provider experimental`` then fails with the registry's own list of what does exist.
+    """
+    providers, refusals = providers_from_config(rt.cfg)
+    for provider in providers:
+        rt.providers.register(provider)
+    for refusal in refusals:
+        print(f"picoagent: {refusal}", file=sys.stderr)
     for tool_class in BUILTIN_TOOLS:
         rt.tools.register(tool_class())
     for directory in rt.cfg["skill_dirs"]:
@@ -298,14 +318,57 @@ def build_runtime_or_refuse(args: argparse.Namespace) -> Runtime:
     frames are where a plugin author finds the actual fault, so ``--verbose`` keeps them.
     """
     try:
-        return build_runtime(args)
-    except loader.RequiredPluginError as exc:
+        rt = build_runtime(args)
+    except (loader.RequiredPluginError, loader.PluginProvenanceError) as exc:
+        raise startup_refusal(exc) from None
+    refusal = why_the_provider_is_unusable(rt)
+    if refusal:
+        sys.stderr.write(f"picoagent: {refusal}\n")
+        raise SystemExit(EXIT_NO_SUCH_PROVIDER)
+    return rt
+
+
+def why_the_provider_is_unusable(rt: Runtime) -> str | None:
+    """Why this session cannot reach a model at all, or ``None`` when it can.
+
+    The one thing every session needs and the one failure worth stopping for before the terminal
+    opens: ``provider`` naming something no table built and no plugin registered. Left alone it
+    surfaced as a ``KeyError`` traceback out of ``AgentLoop._model_turn`` on the first prompt -
+    after the REPL had drawn, after the user had typed - and the frames named a registry rather
+    than the config line that chose the name.
+
+    Two ways to arrive here, and one answer suits both because the fix is the same: a typo in
+    ``--provider`` or in ``provider =``, and a ``[providers.<name>]`` table whose ``dialect``
+    :mod:`picoagent.core.dialects` refused to build. The second is why this check exists at all -
+    a refusal that is honest about not registering the provider owes the user something better
+    than a stack trace when they then select it. That refusal has already been printed by
+    :func:`register_core`, so this line does not repeat it; it says what is missing and lists
+    what is there.
+    """
+    if rt.provider_name in rt.providers.names():
+        return None
+    available = ", ".join(sorted(rt.providers.names())) or "none"
+    return (f"no provider called '{rt.provider_name}' is registered, so this session has nothing "
+            f"to send a prompt to. Registered: {available}. Run `{SETUP_COMMAND}`, or check the "
+            f"provider name in your config.toml against its [providers.<name>] table.")
+
+
+def startup_refusal(exc: Exception) -> SystemExit:
+    """One of the loader's startup refusals as the line and the code the CLI answers it with.
+
+    Shared by every entry point that builds a runtime, because the refusal is about the session
+    and not about which verb asked for one: ``picoagent setup`` cannot list a plugin's provider
+    if the plugin was refused, and a user who reads a different sentence depending on which
+    command they typed learns that there are two problems.
+    """
+    if isinstance(exc, loader.RequiredPluginError):
+        # For the other subclass: a required plugin whose `register()` raised carries that
+        # exception as its cause, and those frames are where a plugin author finds the actual
+        # fault, so `--verbose` keeps them.
         logging.getLogger("picoagent").debug("required plugin refusal", exc_info=exc)
-        sys.stderr.write(f"picoagent: {exc}\n")
-        raise SystemExit(EXIT_REQUIRED_PLUGIN) from None
-    except loader.PluginProvenanceError as exc:
-        sys.stderr.write(f"picoagent: {exc}\n")
-        raise SystemExit(EXIT_PLUGIN_PROVENANCE) from None
+    sys.stderr.write(f"picoagent: {exc}\n")
+    return SystemExit(EXIT_REQUIRED_PLUGIN if isinstance(exc, loader.RequiredPluginError)
+                      else EXIT_PLUGIN_PROVENANCE)
 
 
 def _report_skipped(report: loader.LoadReport) -> None:
@@ -537,6 +600,61 @@ def report_available_upgrades(rt: Runtime) -> None:
         sys.stderr.write(f"picoagent: {status.describe()}\n")
     if outdated:
         sys.stderr.write("picoagent: run `picoagent upgrade` to update plugins.\n")
+
+
+def build_setup_runtime(args: argparse.Namespace, overrides: dict, scratch: Path) -> Runtime:
+    """A runtime for ``picoagent setup``: the same wiring as a session, without being one.
+
+    Everything the wizard needs comes from a fully wired runtime - the provider registry with
+    every plugin's dialect in it, the config layered the way a real run layers it - so this
+    builds one. What it does not do is open a session, and that is the point of the separate
+    function. ``open_session`` writes a log under the project's session directory, and a
+    configuration command that left a one-line conversation behind would put itself at the front
+    of ``-r last``: the next ``picoagent -r`` would resume the empty session setup created
+    instead of the work the user was doing. So the log goes to a scratch directory the caller
+    throws away.
+
+    ``overrides`` are the answers the wizard has collected, layered where a config file's values
+    would go, so the second runtime it builds holds providers constructed from what the user just
+    typed rather than from what the file still says.
+    """
+    cwd = Path(args.cwd or ".").resolve()
+    cfg = load_config(cwd, {"model": args.model, "provider": args.provider, **overrides})
+    report_hardened_user_files(cfg)
+    rt = Runtime(cfg, cwd, Session(scratch / "setup.jsonl", cwd))
+    register_core(rt)
+    rt.frontend = PlainFrontend()
+    rt.load_report = loader.load_all(rt, extra_paths=args.extension,
+                                     allow_untrusted=args.dangerously_trust_all)
+    return rt
+
+
+def setup_command(args: argparse.Namespace) -> int:
+    """``picoagent setup`` - the wizard in :mod:`picoagent.setup`, wired to a runtime.
+
+    The split is deliberate: building runtimes is this module's job and asking questions is that
+    one's, so the wizard is handed a runtime and a way to make another rather than importing the
+    wiring and taking a circular dependency for six lines.
+
+    Refusing without a terminal happens before anything is built, because the answer does not
+    depend on the config, the plugins or the registry - there is nobody to ask, and reading
+    somebody's config to tell them that would be work done for nothing.
+    """
+    refusal = setup_mod.refusal_without_a_terminal(args.non_interactive)
+    if refusal:
+        sys.stderr.write(f"picoagent: {refusal}\n")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="picoagent-setup-") as scratch:
+        try:
+            first = build_setup_runtime(args, {}, Path(scratch))
+        except (loader.RequiredPluginError, loader.PluginProvenanceError) as exc:
+            raise startup_refusal(exc) from None
+        _report_skipped(first.load_report)
+
+        def rebuild(overrides: dict) -> Runtime:
+            return build_setup_runtime(args, overrides, Path(scratch))
+
+        return asyncio.run(setup_mod.run(first, rebuild))
 
 
 def plugin_command(args: argparse.Namespace) -> int:
@@ -846,7 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-p", "--prompt", help="non-interactive: run one prompt ('-' reads stdin)")
     ap.add_argument("--json", action="store_true", help="emit JSONL events (use with -p)")
     ap.add_argument("-m", "--model")
-    ap.add_argument("--provider", help="provider name (built-in: openai; others from plugins)")
+    ap.add_argument("--provider", help="provider name: any [providers.<name>] table, or one a plugin registered")
     ap.add_argument("--thinking", choices=["off", "low", "medium", "high"])
     ap.add_argument("--temperature", type=float,
                     help="sampling temperature (omit to use the server's own default)")
@@ -861,6 +979,9 @@ def build_parser() -> argparse.ArgumentParser:
     plugin.add_argument("spec", nargs="?",
                         help="git:host/user/repo@ref, a local path, or for untrust an approved name")
     plugin.add_argument("--project", action="store_true", help="install under the project instead of the user dir")
+    setup_p = sub.add_parser("setup", help="point picoagent at a model and store the key")
+    setup_p.add_argument("--non-interactive", action="store_true",
+                         help="refuse rather than prompt (setup has nothing to do without a person)")
     upgrade_p = sub.add_parser("upgrade", help="check for and apply plugin updates")
     upgrade_p.add_argument("ucmd", nargs="?",
                            help="'check' to only report, a plugin name, or omit for all")
@@ -905,6 +1026,8 @@ def main(argv: list[str] | None = None) -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(SafeLogFormatter("%(name)s: %(message)s"))
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, handlers=[handler])
+    if args.cmd == "setup":
+        sys.exit(setup_command(args))
     if args.cmd == "plugin":
         sys.exit(plugin_command(args))
     if args.cmd == "upgrade":

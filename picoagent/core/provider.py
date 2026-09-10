@@ -1,10 +1,15 @@
-"""Model providers.
+"""Model providers: the protocol, the registry, and the OpenAI-compatible dialect.
 
-The core ships exactly one: an OpenAI-compatible ``/chat/completions`` client written
-with ``urllib`` (no third-party packages). That single dialect covers OpenAI, xAI Grok,
-Ollama, vLLM, llama.cpp, LM Studio, OpenRouter, Azure and most corporate gateways.
-Providers with their own wire format (Vertex/Gemini, Bedrock) are plugins
-that implement the same :class:`Provider` protocol.
+Core ships two wire dialects and no more. This module holds the first - an OpenAI-compatible
+``/chat/completions`` client written with ``urllib`` (no third-party packages), covering OpenAI,
+xAI Grok, Ollama, vLLM, llama.cpp, LM Studio, OpenRouter, Azure and most corporate gateways.
+:mod:`picoagent.core.vertex` holds the second, Gemini's ``:streamGenerateContent``.
+
+Two, because a dialect is code and an endpoint is a value. Everything that once needed a plugin
+to "add a provider" but spoke OpenAI's format was a name and a URL wearing a module: it is a
+``[providers.<name>]`` table now, and :mod:`picoagent.core.dialects` builds it. The seam stays
+open for a genuinely different wire format - Anthropic, Bedrock - which is a plugin registering
+an object with the same :class:`Provider` protocol.
 
 Streaming design: ``urllib`` is blocking, so the HTTP read runs in a daemon thread
 that pushes parsed SSE chunks onto an ``asyncio.Queue``; the async generator drains it.
@@ -21,12 +26,35 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Iterator, Protocol, runtime_checkable
 
 from .text import safe_for_display
 from .types import Message, StreamEvent, ToolCall, ToolSpec, new_id
 
 log = logging.getLogger("picoagent.provider")
+
+
+@dataclass(frozen=True)
+class SetupField:
+    """One value ``picoagent setup`` has to ask for before this provider can be used.
+
+    ``key`` is the name under ``[providers.<provider>]`` the answer is written to, so a provider
+    describing its fields is also saying what its own config table looks like - the two cannot
+    drift, because the wizard reads the same key it writes. ``prompt`` is what the person at the
+    terminal is asked, in their words rather than the config file's. ``default`` is offered when
+    nothing is configured yet. ``secret`` says the value is a credential, which decides two
+    things: it is never echoed back in full when it is already set, and the terminal does not
+    echo it as it is typed.
+
+    A plain description rather than a callback, because the wizard has to *show* the current
+    value and confirm before replacing it, and a provider that took the input itself would own
+    that half too - four dialects, four spellings of "are you sure".
+    """
+    key: str
+    prompt: str
+    default: str = ""
+    secret: bool = False
 
 
 @runtime_checkable
@@ -36,6 +64,13 @@ class Provider(Protocol):
     ``list_models`` is *optional*: a provider that can enumerate what the server offers
     implements it, and callers check with ``hasattr`` rather than requiring it. Not every
     backend has an equivalent of ``GET /models``, and a provider shouldn't have to fake one.
+
+    ``setup_fields`` is optional in the same way and for the same reason: a sequence of
+    :class:`SetupField` saying what ``picoagent setup`` must ask for, so the wizard asks the
+    provider what it needs instead of carrying a table of vendor knowledge that goes stale the
+    day somebody registers a dialect core has never heard of. A provider without it is still a
+    provider - the wizard falls back to ``base_url`` and ``api_key``, which is what an
+    OpenAI-compatible endpoint wants and what most of them are.
     """
     name: str
 
@@ -156,6 +191,45 @@ def check_base_url(url: str) -> str | None:
             f"base_url must be http or https, {found}")
 
 
+#: The statuses that mean the endpoint answered and would not accept who we are. They are the
+#: two a first run produces: no key at all, or a key for a different service.
+AUTH_STATUSES = (401, 403)
+
+#: The command that fixes every failure :func:`describe_model_failure` frames.
+SETUP_COMMAND = "picoagent setup"
+
+
+def describe_model_failure(provider: str, base_url: str, detail: str,
+                           status: int | None = None) -> str:
+    """picoagent's own account of a model call that never produced an answer.
+
+    A first run with nothing configured used to print an OpenAI 401 body verbatim - a JSON
+    object about an ``api_key`` parameter, naming no file picoagent reads, no environment
+    variable it looks at, and no command that would fix it. The text is true and it is written
+    for somebody debugging an HTTP client, not for somebody who has just installed this tool and
+    does not yet know it has a config file. So the sentence in front says what picoagent tried,
+    which endpoint it tried it against, and what to run.
+
+    The server's own words are kept, on the line after, rather than discarded. They are the only
+    part that distinguishes a missing key from a revoked one or from an organisation that has
+    not been verified, and a wizard that hides the actual failure is the next support ticket.
+    What changes is which of the two a reader meets first.
+
+    Only two failures are framed, because only two are reliably a configuration story: a status
+    in :data:`AUTH_STATUSES`, and never reaching the server at all (``status`` is ``None``).
+    Anything else - a 400 about a request body, a 500 from the gateway - is returned in the shape
+    it already had, since telling someone to re-run setup over a server-side fault would send
+    them to re-type a key that was fine.
+    """
+    if status is not None and status not in AUTH_STATUSES:
+        return f"HTTP {status}: {detail}"
+    what = (f"the server at {safe_for_display(base_url)} refused the credentials (HTTP {status})"
+            if status is not None else f"the server at {safe_for_display(base_url)} could not be reached")
+    return (f"picoagent asked '{provider}' for a completion and {what}. Run `{SETUP_COMMAND}` to "
+            f"point picoagent at a model and store its key, or set base_url and api_key under "
+            f"[providers.{provider}] in your config.toml. The server said: {detail}")
+
+
 class RedirectRefused(Exception):
     """A redirect that would take a credentialed request off the origin the user configured."""
 
@@ -265,6 +339,11 @@ class OpenAICompatProvider:
     """
     name = "openai"
 
+    #: Which ``dialect`` value in a ``[providers.<name>]`` table selects this class, and the one
+    #: a table that names no dialect gets. Read by ``picoagent setup`` when it is creating a
+    #: *new* provider, so the table it writes says how to rebuild what it just registered.
+    dialect = "openai"
+
     def __init__(self, base_url: str | None = None, api_key: str | None = None,
                  extra_headers: dict[str, str] | None = None, name: str | None = None):
         self._base = (base_url or os.environ.get("PICOAGENT_BASE_URL") or os.environ.get("OPENAI_BASE_URL")
@@ -273,6 +352,18 @@ class OpenAICompatProvider:
         self._headers = extra_headers or {}
         if name:
             self.name = name
+        # What `picoagent setup` asks for. A URL and a key is the whole of this dialect's
+        # configuration, and it is the same two whether the endpoint is OpenAI, Ollama, vLLM or a
+        # corporate gateway. Built per instance rather than declared on the class because this
+        # one class is registered under several identities pointing at different vendors - the
+        # `grok` provider is this client with another name - so the URL worth offering is the one
+        # *this* instance resolved, not the one OpenAI happens to use. An empty key is an
+        # ordinary answer here, not a missing one: a local model server wants none.
+        self.setup_fields: tuple[SetupField, ...] = (
+            SetupField("base_url", "Endpoint URL (OpenAI-compatible, ending in /v1)", self._base),
+            SetupField("api_key", "API key (leave empty for a local server that wants none)",
+                       secret=True),
+        )
 
     def _request(self, system, messages, tools, model, max_tokens, thinking,
                  temperature=None) -> urllib.request.Request:
@@ -347,12 +438,31 @@ class OpenAICompatProvider:
             with _OPENER.open(request, timeout=30) as response:
                 payload = json.loads(response.read().decode(errors="replace"))
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(safe_for_display(
-                self._scrub(f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:300]}"))) from None
+            raise RuntimeError(safe_for_display(self._scrub(self._explain(
+                exc.read().decode(errors="replace")[:300], exc.code)))) from None
         except Exception as exc:  # noqa: BLE001 - surface transport failures the same way
-            raise RuntimeError(safe_for_display(self._scrub(f"{type(exc).__name__}: {exc}"))) from None
+            raise RuntimeError(safe_for_display(
+                self._scrub(self._explain_transport(exc)))) from None
         entries = payload.get("data") if isinstance(payload, dict) else None
         return sorted(str(e["id"]) for e in (entries or []) if isinstance(e, dict) and e.get("id"))
+
+    def _explain(self, detail: str, status: int | None) -> str:
+        """This client's failure, worded by :func:`describe_model_failure`."""
+        return describe_model_failure(self.name, self._base, detail, status)
+
+    def _explain_transport(self, exc: BaseException) -> str:
+        """The same for an exception raised before any status came back.
+
+        Only the ones that are actually about reaching the server are framed as a configuration
+        problem. :class:`RedirectRefused` is the exception that matters here: it is a refusal
+        this client made on purpose, its message already says what may not happen and why, and
+        wrapping it in "could not be reached ... run picoagent setup" would send somebody to
+        re-type a key over a security decision that has nothing to do with one.
+        """
+        detail = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, RedirectRefused) or not isinstance(exc, (urllib.error.URLError, OSError)):
+            return detail
+        return describe_model_failure(self.name, self._base, detail)
 
     def _scrub(self, text: str) -> str:
         """Never let the key itself appear in an error we surface.
@@ -368,16 +478,30 @@ class OpenAICompatProvider:
 
     def _read_sse(self, request, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
         """Thread body: push each parsed chunk, an Exception on failure, then ``None`` as the sentinel."""
-        put = lambda item: loop.call_soon_threadsafe(queue.put_nowait, item)  # noqa: E731
+        def put(item) -> None:
+            """Hand ``item`` to the consumer, or drop it once there is no consumer left.
+
+            ``stream`` returns on the first error event, and its caller's loop can be closed
+            while this thread is still on its way to the sentinel below. ``call_soon_threadsafe``
+            raises on a closed loop, and a daemon thread has nowhere to report that: it died
+            printing a traceback about an outcome the session had already handled and reported.
+            Dropping is right rather than merely quiet - the queue that item was for is gone,
+            and nothing is left that could read it.
+            """
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+            except RuntimeError:
+                pass
+
         try:
             with _OPENER.open(request, timeout=600) as response:
                 for chunk in parse_sse(response):
                     put(chunk)
         except urllib.error.HTTPError as exc:
-            put(RuntimeError(safe_for_display(
-                self._scrub(f"HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}"))))
+            put(RuntimeError(safe_for_display(self._scrub(self._explain(
+                exc.read().decode(errors="replace")[:500], exc.code)))))
         except Exception as exc:  # noqa: BLE001 - surface anything as a provider error
-            put(RuntimeError(safe_for_display(self._scrub(f"{type(exc).__name__}: {exc}"))))
+            put(RuntimeError(safe_for_display(self._scrub(self._explain_transport(exc)))))
         put(None)
 
     @staticmethod

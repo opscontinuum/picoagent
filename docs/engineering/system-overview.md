@@ -13,7 +13,9 @@ graph TD
 
     subgraph core["core/"]
         loop["loop.py<br/>AgentLoop + Runtime"]
-        provider["provider.py<br/>Provider protocol"]
+        provider["provider.py<br/>Provider protocol + OpenAI dialect"]
+        vertex["vertex.py<br/>Gemini/Vertex dialect"]
+        dialects["dialects.py<br/>a provider per [providers.n] table"]
         tools["tools.py<br/>Tool protocol + registry"]
         skills["skills.py<br/>SKILL.md discovery"]
         context["context.py<br/>system prompt sections"]
@@ -36,6 +38,7 @@ graph TD
     end
 
     cli --> config
+    cli --> dialects
     cli --> loop
     cli --> loader
     cli --> plain
@@ -53,6 +56,9 @@ graph TD
     loader --> api
     api --> loop
 
+    dialects --> provider
+    dialects --> vertex
+    vertex --> provider
     provider --> types
     tools --> types
     session --> types
@@ -79,8 +85,11 @@ graph LR
 ```
 
 So a project can override what a user installed, and a one-off `-e` beats both. The same rule
-covers providers (`openai`), commands (`help`), system-prompt sections (`base`), and the
-frontend - one mechanism instead of five.
+covers providers, commands (`help`), system-prompt sections (`base`), and the frontend - one
+mechanism instead of five. Providers reach that ladder one rung earlier than the others: the
+user's config registers one per `[providers.<name>]` table before any plugin loads, so a plugin
+registering the same name still wins, and a table naming a dialect core does not have registers
+nothing at all rather than something that speaks the wrong format.
 
 The cost of that simplicity is worth naming: two plugins that both register `shell` do not
 conflict loudly, the later one just wins. `picoagent plugin list` and `/tools` are how you see

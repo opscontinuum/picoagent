@@ -12,6 +12,10 @@ One thing to know before reading settings: :meth:`PluginAPI.plugin_config` answe
 user's config layers, not with a repository's. A repository's ``[plugins.<name>]`` values are
 kept apart and taken only when a plugin names them. See :class:`picoagent.core.config.PluginConfig`.
 
+One thing to know before registering a provider: its endpoint does not go in that table.
+``[providers.<provider>]`` is where every provider's endpoint lives, core's and yours alike, and
+:meth:`PluginAPI.provider_config` is how you read it.
+
 One thing to know before spawning anything: :func:`minimal_env` is the environment a child gets,
 and :meth:`PluginAPI.exec` uses it. See its docstring for the rule and for the one exception the
 tree makes.
@@ -20,11 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Callable
 
-from ..core.config import PluginConfig, plugin_config
+from ..core.config import PluginConfig, plugin_config, provider_config
 from ..core.events import warn_if_unpublished
 from ..core.loop import Runtime
 from ..core.skills import Skill
@@ -133,6 +138,11 @@ class PluginAPI:
     def __init__(self, rt: Runtime, name: str, root: Path):
         self.rt, self.name, self.root = rt, name, root
         self.required_reason: str | None = None
+        #: Provider names this plugin has already been warned about reading from the deprecated
+        #: ``[plugins.<name>]`` table. One line per provider per session, however often
+        #: :meth:`provider_config` is called - a plugin that reads its settings in two places
+        #: should not make the user read the notice twice.
+        self._deprecated_provider_tables: set[str] = set()
 
     def declare_required(self, reason: str) -> None:
         """Say that this session should not run without this plugin.
@@ -184,7 +194,10 @@ class PluginAPI:
         self.rt.commands.register(name, handler, description, owner=self.name)
 
     def register_provider(self, provider: Any) -> None:
-        """Add a model provider; select it with ``--provider <name>`` or ``api.set_model``."""
+        """Add a model provider; select it with ``--provider <name>`` or ``api.set_model``.
+
+        Read its endpoint with :meth:`provider_config`, not :meth:`plugin_config`.
+        """
         self.rt.providers.register(provider)
 
     def register_frontend(self, frontend: Any) -> None:
@@ -352,6 +365,45 @@ class PluginAPI:
         See :class:`picoagent.core.config.PluginConfig` for why that is the default direction.
         """
         return plugin_config(self.rt.cfg, self.name)
+
+    def provider_config(self, name: str) -> dict:
+        """Settings for the provider called ``name``, from ``[providers.<name>]`` in config.toml.
+
+        The same table core reads for its built-in ``openai`` client. A dialect is code and an
+        endpoint is a value, so the same Vertex plugin points at commercial Vertex AI for one
+        user and at a government deployment for another with no fork and no second plugin - and
+        a user looking for "where does my endpoint go?" gets one answer whether the dialect
+        shipped in core or arrived with your plugin.
+
+        The user layer only, and not by convention: ``("providers",)`` is in
+        :data:`~picoagent.core.config.USER_ONLY`, so a repository's ``.picoagent/config.toml``
+        never reaches this table at all. That is the point. A repository that could set
+        ``base_url`` while leaving the user's ``api_key`` where it is would be handed that key on
+        the first turn, which is exactly the attack ``USER_ONLY`` closed for
+        ``providers.openai.base_url`` and exactly the one that stayed open for as long as
+        provider plugins read their endpoints out of ``[plugins.<name>]``.
+
+        What keys belong in the table is yours to decide - Vertex needs ``project`` and
+        ``location`` beside the URL - and :class:`~picoagent.core.provider.SetupField` is how you
+        tell ``picoagent setup`` about them.
+
+        **Deprecated fallback.** A key your plugin's old ``[plugins.<this plugin>]`` table sets
+        and ``[providers.<name>]`` does not is still handed over, so nobody's config breaks on
+        the day their plugin migrates, and a line on stderr names the table to move it to. The
+        shim lives here rather than in each plugin because the wording is a promise about when it
+        goes away, and one sentence is easier to keep than four. Remove this method's fallback,
+        not a plugin's call site, when it does.
+        """
+        settings = provider_config(self.rt.cfg, name)
+        legacy = {key: value for key, value in self.plugin_config().items() if key not in settings}
+        if legacy and name not in self._deprecated_provider_tables:
+            self._deprecated_provider_tables.add(name)
+            sys.stderr.write(
+                f"picoagent: {self.name} read {', '.join(sorted(legacy))} from "
+                f"[plugins.{self.name}] in your config.toml. Provider settings live in "
+                f"[providers.{name}] now; move them there, as that table is the one a "
+                f"repository can never write to and the one `picoagent setup` maintains.\n")
+        return {**legacy, **settings}
 
     def warn_about_project_config(self, *accepted: str) -> None:
         """At session start, name the ``[plugins.<this plugin>]`` keys this repository set and

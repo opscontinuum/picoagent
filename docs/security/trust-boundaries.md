@@ -61,6 +61,7 @@ Two paths were open before `USER_ONLY` existed, both confirmed by execution:
 | A repo set | What happened |
 |---|---|
 | `providers.openai.base_url` | The endpoint moved to the repo author's host, and the API key from *your* config followed it as an `Authorization` header on the first turn |
+| `providers.<any>.dialect` | Would be closed the same way, and is: the whole `providers` table is `USER_ONLY`, so a repository can neither add a provider nor change which wire format an existing one speaks. The key selects code (one of core's two dialects) rather than a value, which is why it is worth naming here even though nothing new had to be added to close it |
 | `context_files = ["~/.picoagent/credentials"]` | `find_context_files` joins with `/`, which discards the left side for an absolute path, so the credentials file was read into the system prompt |
 
 Also closed: `skill_dirs` (prompt text), `plugins.rewrite` (redirects a plugin clone before you
@@ -321,7 +322,7 @@ took a decision from it that a repository must not make - each confirmed by exec
 
 | A repo set | What happened |
 |---|---|
-| `[plugins.grok-provider] base_url` | Only the URL. The `api_key` beside it was still the user's, and went to the repo author's host on the first turn. Same for `[plugins.es-doctor] url` and the vertex provider's OAuth token |
+| `[plugins.grok-provider] base_url` | Only the URL. The `api_key` beside it was still the user's, and went to the repo author's host on the first turn. Same for `[plugins.es-doctor] url` and the vertex provider's OAuth token. Both provider plugins now read `[providers.<name>]` instead, which a repository cannot write at all |
 | `[plugins.mcp.servers.x] command` | Spawned at session start, before the first prompt and outside the trust store that gates every other way a repository gets code to run. The child inherited the user's whole environment too; it now starts from a minimal allowlist, and a server entry's own `pass_env` names by hand anything else it may see |
 | `[plugins.permission-gate] mode = "yolo"` | The confirmation prompt the user installed the plugin for, switched off by the repository it was meant to guard against |
 | `[plugins.credential-guard] extra_allow_env` | Named variables the shell tool may expose. `DATABASE_URL` is not secret-shaped, so nothing else stopped it |
@@ -336,6 +337,12 @@ lifted out of the merge into `_project_plugin_config` and handed to plugins as a
   read, and each call is a decision the plugin answers for.
 * `api.warn_about_project_config(*accepted)` names what the plugin refused, at session start,
   the same way `_ignored_project_keys` names a refused `USER_ONLY` key.
+
+The provider plugins have since gone further and left the table entirely: their endpoints are
+read from `[providers.<name>]` through `api.provider_config(name)`, the same table core reads for
+its own `openai` client. That is a stronger answer than a named refusal, because `providers` is
+already in `USER_ONLY` and there is nothing for a repository to write. The old table still works,
+so an existing config keeps running, and the read says on stderr where to move the settings to.
 
 The line the shipped plugins draw: a repository may **tighten** and may set what is only taste.
 It may not choose a destination, a command, or a permission. The plugins in this table live in

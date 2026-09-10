@@ -222,11 +222,46 @@ session, which is the outcome the catch exists to prevent.
 
 ```python
 api.register_provider(MyProvider())              # then --provider myprovider
+api.provider_config("myprovider")                # [providers.myprovider] from config.toml
 await api.set_model("gpt-4.1", provider="openai")
 api.set_thinking("high")
 api.set_active_tools(["read", "shell"])          # read-only mode; None restores all
 api.get_active_tools()                           # what is offered now; all_tools() is everything
 ```
+
+**Your provider's endpoint goes in `[providers.<name>]`, not in your plugin's own table.** That is
+the same table core reads for its own two dialects, so "where does my endpoint go?" has one
+answer whether the dialect shipped in core or arrived with you. What belongs in it is yours to
+decide: Vertex needs `project` and `location` beside a URL, and there is no fixed schema.
+
+One key in it is core's: `dialect` selects one of core's built-in wire formats for a table with
+no plugin behind it. You do not set it and you do not read it — a plugin adds a provider by
+registering an object, not by adding a value core would have to know how to build.
+
+The reason it is that table and not `[plugins.<your plugin>]` is `USER_ONLY`. `providers` is in it,
+so a repository's `.picoagent/config.toml` cannot reach the table at all. A repository that could
+set `base_url` while leaving the user's `api_key` alone is handed that key on the first turn — the
+attack `USER_ONLY` closed for `providers.openai.base_url`, which stayed open for as long as provider
+plugins read their endpoints out of a plugin table. If your plugin used to read them from
+`[plugins.<your plugin>]`, `provider_config` still hands those values over and says on stderr where
+to move them, so nobody's config breaks on the day you migrate.
+
+Tell `picoagent setup` what to ask for by declaring `setup_fields` on your provider. It is optional
+in the same way `list_models` is — callers check with `hasattr`, and a provider without it is asked
+for `base_url` and `api_key`:
+
+```python
+from picoagent.core.provider import SetupField
+
+class MyProvider:
+    name = "myprovider"
+    setup_fields = (SetupField("base_url", "Endpoint URL", "https://api.example/v1"),
+                    SetupField("api_key", "API key", secret=True))
+```
+
+`key` is the `[providers.<name>]` key the answer is written to, so the wizard reads back exactly what
+it wrote. `secret` keeps the value off the screen as it is typed and shows only its last characters
+when it is already stored.
 
 Read the active set before you narrow it. `api.set_active_tools(["read"])` replaces whatever
 another plugin set, so a plugin that only wants `shell` gone should subtract from what is there:
@@ -268,6 +303,7 @@ So queue a `steer` only when the guidance still reads sensibly one prompt later,
 api.append_entry("todo", {"items": [...]})       # saved in the session, never sent to the model
 for entry in api.entries("todo"): ...
 api.plugin_config()                              # [plugins.my-plugin] from config.toml
+api.provider_config("myprovider")                # [providers.myprovider] - endpoints live here
 ```
 
 **Run things**
@@ -503,7 +539,24 @@ and the two stay in step.
 
 ## Writing a provider
 
-Implement one async generator:
+**First, check whether you need one.** A provider plugin is worth writing for a *dialect* — a
+wire format core does not speak. It is not worth writing for an endpoint. Core registers one
+provider per `[providers.<name>]` table and picks the class from that table's `dialect` key, so
+any OpenAI-compatible server (xAI, Ollama, vLLM, OpenRouter, a gateway) and any Gemini host are
+already config:
+
+```toml
+[providers.grok]
+base_url = "https://api.x.ai/v1"
+api_key  = "xai-..."
+```
+
+`examples/plugins/grok-provider` is what that used to require: thirty-four lines of which six
+did work, because it was the built-in client renamed. It still loads, and it is now a worked
+example of `register(api)` rather than the way to reach xAI.
+
+What is still a plugin is a third wire format — Anthropic's messages API, Bedrock — because that
+is real code with real mapping decisions in it. Implement one async generator:
 
 ```python
 from picoagent.core.types import StreamEvent, ToolCall
@@ -521,9 +574,26 @@ class MyProvider:
         # on failure: yield StreamEvent("error", error="...") and return
 ```
 
-If your API is OpenAI-compatible you don't need any of this - see
-`examples/plugins/grok-provider` (12 lines). For a different dialect, see
-`examples/plugins/vertex-provider`.
+Register it with `api.register_provider(MyProvider())`. Later registration wins and plugins load
+after core, so a provider you register under a name that also has a config table replaces the one
+that table built — your dialect is what `--provider mine` gets.
+
+For a foreign dialect implemented end to end, read `picoagent/core/vertex.py`: the Gemini
+mapping (`contents` / `parts` / `functionCall`, matched by name because Gemini has no tool-call
+ids), the schema cleaning Gemini's OpenAPI subset requires, the SSE reader in a thread, and the
+credential model — an OAuth token minted per call, which is why it declares no secret
+`setup_field`. `examples/plugins/vertex-provider` is the same dialect written as a plugin, and
+is worth reading for the two things a plugin has to do that core does not: importing core's
+redirect-refusing opener rather than calling `urlopen`, and reading its settings through
+`api.provider_config(name)`.
+
+Do not copy core's security controls into your own file. `urllib` re-sends the `Authorization`
+header to whatever a `Location` names, so a plain `urlopen` hands your user's credential — and
+the conversation in the request body — to any host a gateway redirects to. Import the opener:
+
+```python
+from picoagent.core.provider import _OPENER as SAME_ORIGIN_OPENER
+```
 
 ## Keeping state across restarts
 

@@ -44,7 +44,9 @@ class Frontend(Protocol):
 
     async def ask(self, kind: str, prompt: str, **kw: Any) -> Any:
         """Ask the user something. ``kind`` is ``confirm`` (-> bool), ``select`` (``options=[...]`` -> choice)
-        or ``input`` (-> str). Headless frontends should return a safe default (False/None)."""
+        or ``input`` (-> str). ``input`` also takes ``secret=True``, which asks a frontend not to
+        echo what is typed; a frontend that cannot honour it still has to answer the question.
+        Headless frontends should return a safe default (False/None)."""
 
     async def read_input(self) -> str | None:
         """Next line from the user, or ``None`` to end the session."""

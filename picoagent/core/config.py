@@ -22,6 +22,13 @@ record of who wrote it: a repository's ``base_url`` and the user's ``api_key`` a
 in the same dictionary and the plugin sent one to the other. Layer 3's plugin tables are
 lifted out into :data:`PROJECT_PLUGIN_KEY` and handed to plugins through
 :class:`PluginConfig`, which reads as the user layer and names the layer of every value.
+
+A provider's endpoint is not one of those settings. ``[providers.<name>]`` is the one place
+any provider's endpoint lives, core's ``openai`` and a plugin's alike, and
+:func:`provider_config` is how both read it. The split that matters is dialect against
+endpoint: the dialect - OpenAI-compatible, Gemini - is code, and which host it speaks to is a
+value. The same Vertex dialect points at commercial Vertex AI for one user and at a government
+deployment for another, and that is a line in this file rather than a fork of the plugin.
 """
 from __future__ import annotations
 
@@ -40,8 +47,12 @@ log = logging.getLogger("picoagent.config")
 
 DEFAULTS: dict[str, Any] = {
     "model": os.environ.get("PICOAGENT_MODEL", "gpt-4o-mini"),
-    "provider": "openai",            # the built-in OpenAI-compatible client; others come from plugins
-    "providers": {"openai": {}},     # per-provider overrides: base_url / api_key / headers
+    "provider": "openai",            # which [providers.<name>] table this session talks to
+    # One table per provider, and one provider per table. A table names its wire format with
+    # `dialect` ("openai" or "vertex"); leaving it out means OpenAI-compatible, which is what
+    # this empty default is - the built-in client, under the name it has always had, configured
+    # by nothing. Add `[providers.grok] base_url = "https://api.x.ai/v1"` and there are two.
+    "providers": {"openai": {}},
     "max_tokens": 8192,
     "temperature": None,             # None leaves sampling to the server; 0.0 is a value, not "unset"
     "thinking": "off",               # off | low | medium | high - each provider maps this to its own knob
@@ -577,3 +588,28 @@ def plugin_config(cfg: dict, name: str) -> PluginConfig:
     project = cfg.get(PROJECT_PLUGIN_KEY, {}).get(name)
     refusals = cfg.setdefault(REFUSED_PROJECT_VALUES_KEY, {}).setdefault(name, [])
     return PluginConfig(user if isinstance(user, dict) else {}, project, refusals)
+
+
+def provider_config(cfg: dict, name: str) -> dict:
+    """One provider's ``[providers.<name>]`` table - endpoint, key, and whatever else it needs.
+
+    The same table core reads for its built-in ``openai`` client, reachable by any provider a
+    plugin registers, because "where do I put the URL?" should not have two answers depending on
+    whether a dialect happens to ship in core. What belongs in it is the provider's to say: an
+    OpenAI-compatible endpoint needs ``base_url`` and ``api_key``, Vertex needs ``project`` and
+    ``location`` as well, and a schema fixed here would be a schema the next dialect does not fit.
+
+    There is no project half, and no :class:`PluginConfig` around it, which is the difference
+    from :func:`plugin_config`. ``("providers",)`` is in :data:`USER_ONLY`, so
+    :func:`_strip_user_only` has already dropped the whole table out of a repository's config
+    before the merge that built ``cfg`` - a repository never had an opinion to hand on. Returning
+    a ``PluginConfig`` anyway would offer a ``from_project`` that can only ever answer with the
+    default, and an accessor whose existence suggests a repository is worth consulting about
+    where an API key is sent is worse than no accessor. What the repository tried to set is
+    reported by ``cli.warn_about_ignored_project_keys``, which names it once for the whole table.
+
+    A copy, so a provider that mutates what it was handed is not editing the session's config.
+    """
+    table = cfg.get("providers")
+    value = table.get(name) if isinstance(table, dict) else None
+    return copy.deepcopy(value) if isinstance(value, dict) else {}

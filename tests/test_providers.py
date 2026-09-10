@@ -13,7 +13,8 @@ from picoagent.core.loop import AgentLoop, Runtime                  # noqa: E402
 from picoagent.core.session import Session                          # noqa: E402
 from picoagent.core.tools import BUILTIN_TOOLS                      # noqa: E402
 from picoagent.core.provider import (OpenAICompatProvider, RedirectRefused,  # noqa: E402
-                                     _SameOriginRedirects, to_openai_messages)
+                                     _SameOriginRedirects, describe_model_failure,
+                                     to_openai_messages)
 from picoagent.core.types import Message, ToolCall, ToolResult      # noqa: E402
 from picoagent.plugins import loader                                # noqa: E402
 from picoagent import cli                                           # noqa: E402
@@ -705,6 +706,175 @@ class InterruptedToolBatchTests(unittest.TestCase):
         self.assertEqual([entry["tool_call_id"] for entry in mapped if entry["role"] == "tool"], called)
         self.assertTrue((tmp / "s.jsonl").read_text().startswith(before),
                         "the repair is a rendering decision; the log keeps what actually happened")
+
+
+class _RefusingHandler(BaseHTTPRequestHandler):
+    """A gateway answering the way one answers a request whose key it will not accept.
+
+    The body is the shape OpenAI's actually is, because that body is the thing this class of
+    test exists about: it is what a first run printed, and it is what has to stop being the
+    first thing somebody reads. It echoes the ``Authorization`` header back, which real
+    gateways have been observed to do and which is what ``_scrub`` exists for.
+    """
+
+    def do_GET(self):
+        self._refuse()
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self._refuse()
+
+    def _refuse(self):
+        offered = self.headers.get("Authorization", "")
+        body = json.dumps({"error": {"message": f"Incorrect API key provided: {offered}",
+                                     "type": "invalid_request_error",
+                                     "code": "invalid_api_key"}}).encode()
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        """Silence: the test's own output is the assertion, not the access log."""
+
+
+class _RefusingServer:
+    """The handler above on a loopback port, so a real 401 travels a real socket."""
+
+    def __init__(self):
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RefusingHandler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class FirstRunFailureTests(unittest.TestCase):
+    """What somebody sees the first time they run picoagent without configuring it.
+
+    They used to see the body of an OpenAI 401: a JSON object about an ``api_key`` request
+    parameter, naming no file picoagent reads, no environment variable it looks at, and no
+    command that would fix it, because it was not written for them. The sentence in front of it
+    now says what picoagent tried, which endpoint it tried it against, and what to run.
+
+    The server's own words are kept after it rather than thrown away. They are the only part
+    that distinguishes a missing key from a revoked one or an unverified organisation, and a
+    tool that hides the actual failure is the next support ticket. What changed is which of the
+    two a reader meets first.
+    """
+
+    def setUp(self):
+        for name in ("PICOAGENT_API_KEY", "OPENAI_API_KEY"):
+            value = os.environ.pop(name, None)
+            if value is not None:
+                self.addCleanup(os.environ.__setitem__, name, value)
+        self.refusing = _RefusingServer()
+        self.addCleanup(self.refusing.close)
+
+    def _stream_error(self, provider) -> str:
+        async def collect():
+            return [event async for event in provider.stream(
+                system="s", messages=[], tools=[], model="m", max_tokens=16, thinking="off")]
+
+        events = asyncio.run(collect())
+        self.assertEqual([event.type for event in events], ["error"])
+        return events[0].error
+
+    def test_a_refused_credential_is_explained_before_the_vendors_body(self):
+        message = self._stream_error(OpenAICompatProvider(base_url=self.refusing.url + "/v1"))
+        self.assertIn("refused the credentials (HTTP 401)", message)
+        self.assertIn("picoagent setup", message)
+        self.assertLess(message.index("picoagent"), message.index("invalid_api_key"))
+
+    def test_the_servers_own_words_are_still_there(self):
+        message = self._stream_error(OpenAICompatProvider(base_url=self.refusing.url + "/v1"))
+        self.assertIn("Incorrect API key provided", message)
+
+    def test_it_names_the_endpoint_it_tried_and_the_table_that_configures_it(self):
+        message = self._stream_error(OpenAICompatProvider(base_url=self.refusing.url + "/v1"))
+        self.assertIn(self.refusing.url, message)
+        self.assertIn("[providers.openai]", message)
+
+    def test_it_names_the_provider_that_failed_not_always_openai(self):
+        """The same client is registered under other identities; the advice has to follow."""
+        message = self._stream_error(
+            OpenAICompatProvider(base_url=self.refusing.url + "/v1", name="grok"))
+        self.assertIn("'grok'", message)
+        self.assertIn("[providers.grok]", message)
+
+    def test_a_server_that_cannot_be_reached_says_that_rather_than_a_socket_error(self):
+        message = self._stream_error(
+            OpenAICompatProvider(base_url="http://127.0.0.1:9/v1", api_key="k"))
+        self.assertIn("could not be reached", message)
+        self.assertIn("picoagent setup", message)
+
+    def test_a_server_side_fault_is_left_in_the_shape_it_had(self):
+        """A 404 about a path is not a reason to send somebody to re-type a key that is fine."""
+        with FakeServer("grok") as srv:
+            message = self._stream_error(OpenAICompatProvider(base_url=srv.url, api_key="k"))
+        self.assertIn("HTTP 404", message)
+        self.assertNotIn("picoagent setup", message)
+
+    def test_a_refused_redirect_keeps_its_own_answer(self):
+        """It is a decision this client made, not a server it could not reach."""
+        gateway = _RedirectServer(routes={"/v1/chat/completions": "http://127.0.0.1:9/v1/x"})
+        self.addCleanup(gateway.close)
+        message = self._stream_error(
+            OpenAICompatProvider(base_url=gateway.url + "/v1", api_key="k"))
+        self.assertIn("a host you did not configure", message)
+        self.assertNotIn("picoagent setup", message)
+
+    def test_the_key_is_still_redacted_out_of_the_explained_failure(self):
+        """The framing runs before the scrub at every call site; it must not open a way past it.
+
+        This gateway echoes the ``Authorization`` header into its 401 body, which is the case
+        ``_scrub`` was written for. Wrapping that body in a longer sentence must not carry it
+        past the redaction on the way.
+        """
+        provider = OpenAICompatProvider(base_url=self.refusing.url + "/v1",
+                                        api_key="sk-secret-9999")
+        message = self._stream_error(provider)
+        self.assertNotIn("sk-secret-9999", message)
+        self.assertIn("[redacted]", message)
+
+    def test_list_models_gets_the_same_explanation(self):
+        """``/model list`` reaches the same wall, and used to print the same raw body."""
+        provider = OpenAICompatProvider(base_url=self.refusing.url + "/v1")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(provider.list_models())
+        self.assertIn("picoagent setup", str(caught.exception))
+
+    def test_a_scheme_refusal_is_not_reworded_as_a_configuration_hint(self):
+        """``check_base_url`` already names the setting; two sentences would be two problems."""
+        provider = OpenAICompatProvider(base_url="file:///etc", api_key="k")
+        self.assertIn("base_url must be http or https", self._stream_error(provider))
+
+
+class FailureWordingTests(unittest.TestCase):
+    """:func:`describe_model_failure` on its own, since three callers depend on its branches."""
+
+    def test_an_auth_status_is_framed(self):
+        message = describe_model_failure("openai", "http://h/v1", "no key", 401)
+        self.assertIn("refused the credentials", message)
+        self.assertIn("no key", message)
+
+    def test_a_forbidden_status_is_framed_too(self):
+        self.assertIn("refused the credentials",
+                      describe_model_failure("openai", "http://h/v1", "nope", 403))
+
+    def test_no_status_at_all_means_the_server_was_never_reached(self):
+        self.assertIn("could not be reached",
+                      describe_model_failure("openai", "http://h/v1", "ConnectionRefusedError: x"))
+
+    def test_any_other_status_keeps_the_plain_shape(self):
+        self.assertEqual(describe_model_failure("openai", "http://h/v1", "boom", 500),
+                         "HTTP 500: boom")
 
 
 if __name__ == "__main__":

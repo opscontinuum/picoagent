@@ -9,15 +9,26 @@ There is nothing to install. Clone it and run it:
 
 ```
 git clone https://github.com/opscontinuum/picoagent && cd picoagent
-export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
-export PICOAGENT_API_KEY=...                           # optional
-export PICOAGENT_MODEL=qwen2.5-coder:32b
+python3 -m picoagent setup                            # asks what to point at, writes it down
 python3 -m picoagent                                  # REPL
 python3 -m picoagent -p "explain this repo"           # one-shot
 python3 -m picoagent -p "fix the failing test" --json # JSONL event stream
 python3 -m picoagent -e ../picoagent-plugins/permission-gate    # load a plugin for one run
 python3 -m picoagent plugin add git:github.com/you/some-plugin@v0.1.0
 python3 -m picoagent plugin list
+```
+
+`setup` asks which provider, what its endpoint and key are, and which model, then writes them into
+`~/.picoagent/config.toml` and makes that file readable only by you. It asks the *provider* what it needs,
+so a dialect a plugin registered appears in the list with its own settings — Vertex asks for a project and a
+location, not for a bearer token. The last option in the list is *a new provider*: name it, pick its wire
+format, and setup writes the `[providers.<name>]` table that rebuilds it. If you would rather not be asked, the three environment variables still
+work and so does editing the file:
+
+```
+export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
+export PICOAGENT_API_KEY=...                           # optional
+export PICOAGENT_MODEL=qwen2.5-coder:32b
 ```
 
 Zero third-party dependencies means there is nothing for a package manager to resolve, so `python3 -m picoagent`
@@ -45,9 +56,16 @@ Config (`~/.picoagent/config.toml`, then `.picoagent/config.toml` in the project
 ```toml
 model = "qwen2.5-coder:32b"
 temperature = 0.0          # optional; omit to use whatever the server defaults to
-[providers.openai]
+[providers.openai]                                    # one table per provider; the table IS the provider
 base_url = "http://localhost:11434/v1"
 api_key = ""
+[providers.grok]                                      # another OpenAI-compatible endpoint, no plugin needed
+base_url = "https://api.x.ai/v1"
+api_key = "xai-..."
+[providers.vertex]                                    # the other dialect core ships
+dialect = "vertex"
+project = "my-project"
+location = "us-central1"
 [plugins]
 enabled = ["git:github.com/you/permission-gate@v0.1.0", "./tools/my-local-plugin"]
 [plugins.permission-gate]
@@ -244,8 +262,11 @@ developing a plugin, when re-approving after every edit would be noise.
 
 `examples/plugins/` holds the two provider references the docs teach with: `grok-provider`
 (an OpenAI-compatible endpoint in 12 lines) and `vertex-provider` (a different wire dialect,
-implemented whole). Everything that used to live beside them moved to its own repository when
-the examples outgrew the harness - see below.
+implemented whole). Both are now **redundant as configuration** - Grok is a `[providers.grok]`
+table and the Gemini dialect ships in `picoagent/core/vertex.py` - and both still load and work
+if you have them enabled. They are kept as the two ends of the plugin surface: the smallest
+`register(api)` there is, and a foreign wire format implemented end to end. Everything that used
+to live beside them moved to its own repository when the examples outgrew the harness - see below.
 
 ## Companion plugin repos
 
@@ -272,7 +293,7 @@ the examples outgrew the harness - see below.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v      # 85 tests, no network, ~3s
+python3 -m unittest discover -s tests        # 811 tests, no network, ~45s
 ```
 
 ## Providers
@@ -281,18 +302,52 @@ python -m unittest discover -s tests -v      # 85 tests, no network, ~3s
 `GET /models`), and `/model <name>` switches. Listing is optional on the `Provider` protocol -
 a provider that can't enumerate says so rather than pretending.
 
-Only one provider ships in core: the OpenAI-compatible chat/completions client. The others are plugins:
+**Two wire dialects ship in core, and a provider is a config table.** A dialect is code - a
+request body, a streaming format, a mapping. An endpoint is a URL. Core ships both dialects that
+matter today, so adding a provider is a table with a name on it, not a plugin:
 
-| Provider | Wire format | How |
-|---|---|---|
-| OpenAI (and any OpenAI-compatible server) | `/v1/chat/completions` SSE | built-in, `--provider openai` |
-| xAI Grok | same as OpenAI (`https://api.x.ai/v1`) | `examples/plugins/grok-provider`, `--provider grok` |
-| Google Vertex AI (Gemini) | **different**: `:streamGenerateContent?alt=sse`, `contents`/`parts`/`functionCall` | `examples/plugins/vertex-provider`, `--provider vertex` |
+```toml
+[providers.grok]                          # no dialect key = OpenAI-compatible
+base_url = "https://api.x.ai/v1"
+api_key  = "xai-..."
+
+[providers.local]                         # the same dialect, your own server
+base_url = "http://localhost:11434/v1"
+
+[providers.milgemini]                     # the other dialect, a host that is not Google's
+dialect  = "vertex"
+base_url = "https://genai.example"
+project  = "my-project"
+location = "us-gov-west1"
+```
+
+That is three providers, selectable with `--provider grok|local|milgemini`, with nothing
+installed. `picoagent setup` writes these tables for you, including inventing a new provider:
+the last option in its list is *a new provider*, which asks for a name and a wire format.
+
+| Dialect | `dialect =` | Wire format | Covers |
+|---|---|---|---|
+| OpenAI-compatible | omitted, or `"openai"` | `/v1/chat/completions` SSE | OpenAI, xAI Grok, Ollama, vLLM, llama.cpp, LM Studio, OpenRouter, Azure, most corporate gateways |
+| Gemini / Vertex | `"vertex"` | `:streamGenerateContent?alt=sse`, `contents`/`parts`/`functionCall` | Vertex AI, and any host serving the same API (government deployments, proxies) |
+
+A dialect picoagent does not have is refused by name rather than guessed at: an unknown
+`dialect` registers nothing and says which ones exist, because speaking the wrong wire format to
+an endpoint you configured on purpose is the worst available outcome.
+
+The provider seam stays open for a **third** dialect - Anthropic's messages API, Bedrock - which
+is real code and therefore a plugin: `api.register_provider(obj)` with any object implementing
+the `Provider` protocol, and a plugin's registration replaces a config table of the same name.
+See [docs/plugin-authoring.md](docs/plugin-authoring.md#writing-a-provider).
+
+Upgrading from the example provider plugins: `grok-provider` becomes the `[providers.grok]`
+table above, and `vertex-provider` becomes `dialect = "vertex"` added to your existing
+`[providers.vertex]` table. Both plugins still load and still work if you leave them enabled.
 
 ## Fakes & tests
 
-`picoagent/testing/fakes.py` has stdlib fake servers for all three dialects (they validate paths, auth
-headers, request shape, and Gemini schema restrictions, then play a scripted text → tool call → reply):
+`picoagent/testing/fakes.py` has stdlib fake servers for both wire dialects, plus a `grok` variant of
+the OpenAI one that enforces xAI's own expectations (they validate paths, auth headers, request shape,
+and Gemini schema restrictions, then play a scripted text → tool call → reply):
 
 ```
 python -m picoagent.testing.fakes --dialect openai --port 8765   # or grok | vertex
