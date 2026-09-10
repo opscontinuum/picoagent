@@ -67,6 +67,17 @@ class HeadlessExitCodeTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_MODEL_ERROR)
         self.assertTrue(err.strip(), "the person at the terminal still gets the sentence")
 
+    def test_the_sentence_names_picoagents_own_way_out_of_it(self):
+        """The exit code is for the program; the person still has to be told what to do.
+
+        Both halves at once, because they answer to different readers and a change that fixed
+        the wording by turning the failure into a success would pass either test alone.
+        """
+        self._configure(f"http://127.0.0.1:{closed_port()}/v1")
+        code, _, err = self._run()
+        self.assertEqual(code, cli.EXIT_MODEL_ERROR)
+        self.assertIn("picoagent setup", err)
+
     def test_the_json_stream_carries_the_same_verdict(self):
         self._configure(f"http://127.0.0.1:{closed_port()}/v1")
         code, out, _ = self._run("--json")
