@@ -29,6 +29,7 @@ from picoagent.core.loop import Runtime
 from picoagent.core.session import Session
 from picoagent.core.toml_write import TomlEditError, apply_edits, render_key, render_value
 from picoagent.core.tools import is_windows
+from picoagent.core.vertex import VertexProvider
 from picoagent.testing.fakes import FakeServer
 
 
@@ -98,9 +99,15 @@ class WizardCase(unittest.TestCase):
         rt.frontend = frontend
         return rt
 
-    def wizard(self, answers: list) -> tuple[int, ScriptedFrontend]:
-        """Drive one whole run. Its stderr is kept on ``self.stderr`` rather than the terminal."""
-        frontend = ScriptedFrontend(answers)
+    def wizard(self, answers: list, provider: str | None = "openai") -> tuple[int, ScriptedFrontend]:
+        """Drive one whole run. Its stderr is kept on ``self.stderr`` rather than the terminal.
+
+        "Which provider?" is now always the first question - the list carries a "create a new
+        one" option, so there is no single-provider shortcut to skip it - and every script here
+        would otherwise open with the same answer. ``provider`` supplies it; pass ``None`` to
+        script that question yourself, which is what the tests about *creating* a provider do.
+        """
+        frontend = ScriptedFrontend(answers if provider is None else [provider, *answers])
         first = self.runtime({}, frontend)
         captured = io.StringIO()
         with contextlib.redirect_stderr(captured):
@@ -110,6 +117,19 @@ class WizardCase(unittest.TestCase):
 
     def written(self) -> dict:
         return tomllib.loads(self.config_file.read_text())
+
+    @staticmethod
+    def options_of(frontend: ScriptedFrontend, opening: str) -> list:
+        """The options of the first ``select`` whose prompt starts with ``opening``.
+
+        By prompt rather than by position: the wizard asks several questions from a list now -
+        which provider, which wire format, which model - and an index would silently start
+        asserting about a different question the next time one is added.
+        """
+        for kind, prompt, kw in frontend.asked:
+            if kind == "select" and prompt.startswith(opening):
+                return list(kw.get("options") or [])
+        raise AssertionError(f"the wizard never asked a select starting {opening!r}")
 
 
 class TheWizardWritesWhatItWasTold(WizardCase):
@@ -125,9 +145,9 @@ class TheWizardWritesWhatItWasTold(WizardCase):
 
     def test_the_model_list_comes_from_the_server_it_was_just_pointed_at(self):
         _, frontend = self.wizard([self.server.url + "/v1", "sk-typed", "fake-small"])
-        options = [kw.get("options") for kind, _, kw in frontend.asked if kind == "select"]
-        self.assertIn("fake-large", options[0])
-        self.assertIn("fake-small", options[0])
+        options = self.options_of(frontend, "Which model?")
+        self.assertIn("fake-large", options)
+        self.assertIn("fake-small", options)
 
     def test_the_verification_is_a_real_completion_against_the_new_endpoint(self):
         """Not a rehearsal: the provider that answers is the one a real session would build."""
@@ -425,6 +445,103 @@ class SecretsAreShownOnlyAsMuchAsTheyMustBe(unittest.TestCase):
 
     def test_an_empty_one_is_named_rather_than_shown_as_blank(self):
         self.assertEqual(setup.mask(""), "(empty)")
+
+class AProviderCanBeInventedRatherThanOnlyEdited(WizardCase):
+    """The list of registered providers can only ever be an edit, and the common case is neither.
+
+    A fresh checkout registers one provider - the built-in client - and the person running setup
+    has an xAI key, an Ollama server or a Gemini project in front of them. Before this the wizard
+    said "provider: openai (the only one registered)" and then asked them to point *that* at
+    api.x.ai, which writes the right endpoint under the wrong name and leaves ``--provider grok``
+    meaning nothing. Now the last option in the list makes a new one, asks which wire format it
+    speaks, and writes the table that rebuilds it.
+    """
+
+    def _vertex_token(self) -> None:
+        previous = os.environ.get("GOOGLE_OAUTH_ACCESS_TOKEN")
+        os.environ["GOOGLE_OAUTH_ACCESS_TOKEN"] = "ya29.test"
+        self.addCleanup(lambda: os.environ.pop("GOOGLE_OAUTH_ACCESS_TOKEN", None)
+                        if previous is None else os.environ.__setitem__(
+                            "GOOGLE_OAUTH_ACCESS_TOKEN", previous))
+
+    def new_openai(self, name: str = "grok") -> tuple[int, ScriptedFrontend]:
+        return self.wizard([setup.NEW_PROVIDER, name, "openai",
+                            self.server.url + "/v1", "xai-typed", "fake-small"], provider=None)
+
+    def new_vertex(self, server: FakeServer) -> tuple[int, ScriptedFrontend]:
+        self._vertex_token()
+        return self.wizard([setup.NEW_PROVIDER, "milgemini", "vertex",
+                            "mil-project", "us-central1", server.url, "gemini-2.5-pro"],
+                           provider=None)
+
+    def test_the_option_is_offered_even_when_one_provider_is_registered(self):
+        _, frontend = self.new_openai()
+        self.assertIn(setup.NEW_PROVIDER, self.options_of(frontend, "Which provider?"))
+
+    def test_the_new_name_is_what_the_session_will_use(self):
+        code, _ = self.new_openai()
+        self.assertEqual((code, self.written()["provider"]), (0, "grok"))
+
+    def test_its_settings_land_in_its_own_table(self):
+        self.new_openai()
+        self.assertEqual(self.written()["providers"]["grok"],
+                         {"base_url": self.server.url + "/v1", "api_key": "xai-typed"})
+
+    def test_the_default_dialect_is_not_written_out_as_a_line_saying_the_default(self):
+        self.new_openai()
+        self.assertNotIn("dialect", self.written()["providers"]["grok"])
+
+    def test_the_provider_that_already_existed_is_left_alone(self):
+        self.new_openai()
+        self.assertNotIn("openai", self.written().get("providers", {}))
+
+    def test_a_second_dialect_is_offered_by_name(self):
+        _, frontend = self.new_openai()
+        self.assertEqual(self.options_of(frontend, "Which wire format"), ["openai", "vertex"])
+
+    def test_a_vertex_provider_writes_the_dialect_that_rebuilds_it(self):
+        with FakeServer("vertex") as server:
+            self.new_vertex(server)
+        self.assertEqual(self.written()["providers"]["milgemini"]["dialect"], "vertex")
+
+    def test_a_vertex_provider_is_asked_for_vertexs_settings_not_for_a_key(self):
+        with FakeServer("vertex") as server:
+            _, frontend = self.new_vertex(server)
+        self.assertIn("Google Cloud project id", frontend.prompts())
+        self.assertNotIn("API key", frontend.prompts())
+
+    def test_a_vertex_provider_keeps_the_host_it_was_pointed_at(self):
+        with FakeServer("vertex") as server:
+            self.new_vertex(server)
+            table = self.written()["providers"]["milgemini"]
+        self.assertEqual((table["base_url"], table["project"], table["location"]),
+                         (server.url, "mil-project", "us-central1"))
+
+    def test_what_was_written_rebuilds_the_dialect_that_was_verified(self):
+        """The file is the whole record: a later session reads it and gets the same client."""
+        with FakeServer("vertex") as server:
+            self.new_vertex(server)
+        rebuilt = self.runtime({}, ScriptedFrontend([])).providers.get("milgemini")
+        self.assertIsInstance(rebuilt, VertexProvider)
+
+    def test_the_verification_really_reached_the_vertex_server(self):
+        with FakeServer("vertex") as server:
+            self.new_vertex(server)
+            self.assertTrue(server.requests)
+
+    def test_a_name_that_is_already_a_provider_is_refused_rather_than_silently_edited(self):
+        code, frontend = self.wizard([setup.NEW_PROVIDER, "openai"], provider=None)
+        self.assertEqual(code, 1)
+        self.assertIn("already a provider", frontend.text())
+
+    def test_a_refused_name_writes_nothing(self):
+        self.wizard([setup.NEW_PROVIDER, "openai"], provider=None)
+        self.assertFalse(self.config_file.exists())
+
+    def test_an_empty_name_is_refused_too(self):
+        code, frontend = self.wizard([setup.NEW_PROVIDER, "  "], provider=None)
+        self.assertEqual(code, 1)
+        self.assertIn("no name given", frontend.text())
 
 
 if __name__ == "__main__":

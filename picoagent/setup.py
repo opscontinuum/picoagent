@@ -16,6 +16,12 @@ plugin's dialect appears in this wizard the day it is installed, with its own vo
 provider that declares nothing is asked for ``base_url`` and ``api_key``, which is what an
 OpenAI-compatible endpoint wants and what most of them are.
 
+"Pick a provider" includes picking one that does not exist yet. Core ships two wire dialects and
+a provider is a name plus a table, so adding ``grok``, ``local`` or ``milgemini`` is a question
+this wizard can ask and a table it can write - not a plugin somebody has to find, trust and
+install. :data:`NEW_PROVIDER` is the last option in the list, always, and choosing it asks for
+the name and the dialect before handing over to exactly the same field-by-field flow.
+
 Two rules this holds to, because it is writing a credential to somebody's disk:
 
 * **Never without a person.** No terminal, or ``--non-interactive``, refuses and says so. A
@@ -32,10 +38,12 @@ import stat
 import sys
 import tempfile
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from .core.config import provider_config
+from .core.dialects import DEFAULT_DIALECT, DIALECT_KEY, DIALECTS, build_provider
 from .core.loop import Runtime
 from .core.provider import SetupField
 from .core.session import restrict_to_owner
@@ -52,6 +60,12 @@ DEFAULT_FIELDS: tuple[SetupField, ...] = (
     SetupField("base_url", "Endpoint URL", "https://api.openai.com/v1"),
     SetupField("api_key", "API key", secret=True),
 )
+
+#: The option that turns "which of these?" into "a new one, please". Always offered, because a
+#: list of what is already registered can only ever be an edit: the first provider somebody adds
+#: beyond the built-in one has no entry to pick, and a wizard that can only edit sends them to
+#: the config file to write the table by hand - which is the thing this command exists to avoid.
+NEW_PROVIDER = "(a new provider)"
 
 #: The option that lets somebody name a model the server did not list. A server's ``/models`` is
 #: not always complete - a gateway that proxies several backends often lists none of them - and a
@@ -93,22 +107,99 @@ def mask(value: str) -> str:
     return f"{value[:3]}...{value[-KEEP_TAIL:]}"
 
 
-async def choose_provider(rt: Runtime) -> str | None:
-    """Which registered provider to configure, or ``None`` if the answer was not one.
+@dataclass(frozen=True)
+class Chosen:
+    """The provider this run is about, and the settings choosing it already decided.
 
-    The list is the live registry, so a dialect a plugin registered is offered beside the
-    built-in one and neither this function nor the wizard around it knows the difference. A
-    single-provider install is told which one it is rather than asked to pick from a list of one.
+    ``values`` is empty for a provider that already exists, and carries ``dialect`` for one the
+    user has just invented, because that is the key which tells the next session how to rebuild
+    what was registered here. It travels with the name rather than being looked up later: the
+    provider object in the registry is the only thing that knows which dialect built it, and by
+    the time :func:`save` runs it is a second runtime's object, built from the file this run has
+    not written yet.
+    """
+    name: str
+    values: dict[str, Any] = field(default_factory=dict)
+
+
+async def choose_provider(rt: Runtime) -> Chosen | None:
+    """Which provider to configure - an existing one or a new one - or ``None`` if neither.
+
+    The list is the live registry, so every ``[providers.<name>]`` table in the config and every
+    dialect a plugin registered is offered, and neither this function nor the wizard around it
+    knows the difference between them.
+
+    :data:`NEW_PROVIDER` is always the last option, including when exactly one provider exists,
+    which is why there is no longer a shortcut for that case. The single-provider install is
+    precisely the one where the answer to "which provider?" is most often "none of these": it is
+    a fresh checkout whose only registration is the built-in client, and the person running setup
+    has an xAI key or a Gemini project in front of them.
     """
     names = sorted(rt.providers.names())
-    if not names:
-        await rt.frontend.emit("error", {"text": "no providers are registered, so there is "
-                                                 "nothing to configure"})
+    picked = await rt.frontend.ask("select", "Which provider?", options=names + [NEW_PROVIDER])
+    if picked is None:
         return None
-    if len(names) == 1:
-        await rt.frontend.emit("notice", {"text": f"provider: {names[0]} (the only one registered)"})
-        return names[0]
-    return await rt.frontend.ask("select", "Which provider?", options=names)
+    if picked != NEW_PROVIDER:
+        return Chosen(picked)
+    return await create_provider(rt)
+
+
+async def create_provider(rt: Runtime) -> Chosen | None:
+    """Invent a provider: a name, a wire format, and a live object to ask the rest of.
+
+    The object is built and registered here rather than at the end, because everything after
+    this point - the fields to ask for, the model list, the verification call - comes from
+    asking a provider, and a name with no object behind it would have to be special-cased in
+    each of them.
+
+    Only core's dialects can be created this way, and that is the honest limit rather than an
+    oversight: a plugin's provider is constructed by that plugin's ``register()`` out of settings
+    only it knows the shape of, so the way to add one is to install it, at which point it is in
+    the list above like everything else.
+    """
+    name = ((await rt.frontend.ask("input", "Name for this provider (e.g. grok, local, milgemini)")
+             ) or "").strip()
+    refusal = why_not_a_new_provider(rt, name)
+    if refusal:
+        await rt.frontend.emit("error", {"text": refusal})
+        return None
+    dialect = await choose_dialect(rt)
+    if dialect is None:
+        return None
+    rt.providers.register(build_provider(name, {DIALECT_KEY: dialect}))
+    # Only when it is not the default. A table with no `dialect` key is the OpenAI-compatible
+    # client by definition, so writing `dialect = "openai"` would add a line that says what the
+    # file already said - and the config a user reads back should be the shortest true one.
+    return Chosen(name, {DIALECT_KEY: dialect} if dialect != DEFAULT_DIALECT else {})
+
+
+def why_not_a_new_provider(rt: Runtime, name: str) -> str | None:
+    """Why ``name`` cannot be created, or ``None`` when it can.
+
+    An existing name is refused rather than quietly treated as an edit. The two are different
+    intentions and only one of them is what the user picked: somebody who typed ``openai`` at
+    "name for this provider" has either forgotten it is in the list or means to replace it, and
+    silently editing it would write over an endpoint and a key on the strength of a guess.
+    """
+    if not name:
+        return "no name given, so there is no provider to create; nothing was written"
+    if name in rt.providers.names():
+        return (f"'{name}' is already a provider. Run setup again and pick it from the list to "
+                f"change its settings; nothing was written")
+    return None
+
+
+async def choose_dialect(rt: Runtime) -> str | None:
+    """Which wire format the new provider speaks, or ``None`` if the answer was not one.
+
+    Asked rather than inferred from the endpoint, because the two guesses available are both
+    bad: a URL says nothing reliable about the format behind it (every gateway proxies somebody
+    else's), and defaulting silently is exactly the failure the dialect key exists to prevent.
+    """
+    options = sorted(DIALECTS)
+    return await rt.frontend.ask(
+        "select", f"Which wire format does it speak? ({DEFAULT_DIALECT} covers OpenAI, Ollama, "
+                  f"vLLM, xAI and most gateways)", options=options)
 
 
 def fields_of(provider: Any) -> tuple[SetupField, ...]:
@@ -316,7 +407,10 @@ async def run(rt: Runtime, rebuild: Callable[[dict], Runtime]) -> int:
     The second runtime is what makes the verification real rather than a rehearsal. The provider
     in ``rt`` was constructed at load time from the config as it stands, so it still points where
     it pointed before any of these questions were asked; asking *it* to prove the new endpoint
-    would prove the old one. Handing the answers back through ``load_config`` and loading the
+    would prove the old one. For a provider invented in this run it proves more than that: the
+    second runtime builds it from the ``dialect`` key that is about to be written, so a wire
+    format that does not survive the round trip through config.toml fails here rather than on
+    the user's first prompt. Handing the answers back through ``load_config`` and loading the
     plugins again produces the provider a real session would produce, reading the same
     ``[providers.<name>]`` keys this wizard is about to write. If a plugin reads a key by a
     different name than it declared, the verification fails here rather than on the user's first
@@ -325,11 +419,12 @@ async def run(rt: Runtime, rebuild: Callable[[dict], Runtime]) -> int:
     Wiring is the caller's, not this module's: building a runtime is what :mod:`picoagent.cli`
     does, and a wizard that imported it back would be a cycle for the sake of six lines.
     """
-    name = await choose_provider(rt)
-    if name is None:
+    chosen = await choose_provider(rt)
+    if chosen is None:
         await rt.frontend.emit("error", {"text": "no provider chosen; nothing was written"})
         return 1
-    values = await collect_fields(rt, name)
+    name = chosen.name
+    values = {**chosen.values, **await collect_fields(rt, name)}
     merged = {**provider_config(rt.cfg, name), **values}
     second = rebuild({"provider": name, "providers": {name: merged}})
     provider = second.providers.get(name)
