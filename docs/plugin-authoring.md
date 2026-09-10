@@ -417,7 +417,7 @@ Rules of thumb:
   is that, done; four shipped plugins wrote their own copy of it before it moved into core.
 * If you write files, wrap the read-modify-write in `async with file_lock(path):` so you
   cooperate with the built-in `edit`/`write` when tool calls run in parallel.
-* Registering a tool named `read`, `write`, `edit` or `shell` replaces the built-in.
+* Registering a tool named `read`, `write`, `edit`, `glob`, `grep` or `shell` replaces the built-in.
 * Take the path from `resolve_path(ctx, args["path"])`, never from `args["path"]` directly.
   It is the same resolution the built-ins use, and it is what a gate is inspecting.
 * If your tool's path argument is normally the model's own construction rather than something

@@ -15,7 +15,7 @@ in `picoagent/testing/fakes.py`.
 | File | Covers |
 |---|---|
 | `test_events.py` | ordering, patching, blocking, fault isolation |
-| `test_tools.py` | read/write/edit/bash, truncation, the per-file lock |
+| `test_tools.py` | read/write/edit/glob/grep/shell, glob-pattern translation, truncation, the per-file lock |
 | `test_skills_session_config.py` | SKILL.md parsing, session tree + compaction, config layering, command parsing |
 | `test_loop_and_plugins.py` | the loop end-to-end with a scripted model; plugin loading and trust |
 | `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, where a redirect may take a credentialed request, and what a failed model call says to somebody who has not configured anything yet |
