@@ -95,22 +95,51 @@ recognise it as the wrong answer when a search result offers it.
 
 ## Point it at a model
 
-Three environment variables are enough for a first run:
+```bash
+picoagent setup
+```
+
+It asks which provider, what that provider needs, and which model, then makes one real call to
+check the answers before writing them into `~/.picoagent/config.toml`. Run it again to change
+something: every value it already has is offered back as the default, so a second run is an edit
+rather than a retype, and a stored key is shown only as its last few characters. Nothing else in
+the file moves — your comments, your ordering and settings this command has never heard of are
+left exactly as they were.
+
+It asks the provider what it needs rather than carrying a list of vendors, so a dialect a plugin
+registered turns up in the list the day you install it, asking for its own settings. Vertex wants
+a project and a location; an OpenAI-compatible endpoint wants a URL and a key.
+
+`setup` needs a terminal, since it is questions. In a script or a container, write the file
+yourself — that is all it is doing:
+
+```toml
+model = "qwen2.5-coder:32b"
+provider = "openai"
+
+[providers.openai]
+base_url = "http://localhost:11434/v1"
+api_key = ""
+```
+
+`[providers.<name>]` is where every provider's endpoint lives, the built-in one and a plugin's
+alike. The dialect is code and the endpoint is a value, so the same Vertex plugin points at
+commercial Vertex AI for one person and at a government host for another with nothing forked:
+
+```toml
+[providers.vertex]
+project = "my-project"
+location = "us-gov-west1"
+base_url = "https://genai.mil"
+```
+
+Three environment variables still work, and are the quickest way to try a different server for
+one run:
 
 ```bash
 export PICOAGENT_BASE_URL=http://localhost:11434/v1   # e.g. Ollama
 export PICOAGENT_MODEL=qwen2.5-coder:32b
 export PICOAGENT_API_KEY=                             # empty is fine for local servers
-```
-
-Or write the same thing once in `~/.picoagent/config.toml`:
-
-```toml
-model = "qwen2.5-coder:32b"
-
-[providers.openai]
-base_url = "http://localhost:11434/v1"
-api_key = ""
 ```
 
 That file can hold a key, so picoagent makes it readable only by your account the first time it

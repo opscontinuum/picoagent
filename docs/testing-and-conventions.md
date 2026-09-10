@@ -18,7 +18,9 @@ in `picoagent/testing/fakes.py`.
 | `test_tools.py` | read/write/edit/bash, truncation, the per-file lock |
 | `test_skills_session_config.py` | SKILL.md parsing, session tree + compaction, config layering, command parsing |
 | `test_loop_and_plugins.py` | the loop end-to-end with a scripted model; plugin loading and trust |
-| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, and where a redirect may take a credentialed request |
+| `test_providers.py` | the real HTTP clients against fake OpenAI / Grok / Vertex servers, the `base_url` scheme check, where a redirect may take a credentialed request, and what a failed model call says to somebody who has not configured anything yet |
+| `test_provider_endpoints.py` | `[providers.<name>]` as the one place any provider's endpoint lives: a plugin's dialect reading it, the deprecated `[plugins.<name>]` fallback still working and naming where to move to, a repository refused for every provider, and what a provider says it needs configured |
+| `test_setup_wizard.py` | `picoagent setup`: what it asks, that it edits config.toml rather than rewriting it, that nothing is replaced unasked and no stored secret is shown whole, that it refuses without a terminal, and that the file it writes a key into is owner-only |
 | `test_config_refusals.py` | config files that cannot be read - unparseable, not UTF-8, nested past the parser's stack - and `DEFAULTS` keys nothing reads |
 | `test_unreadable_manifest.py` | a hostile `plugin.toml`, and `plugin list` / `add` / `trust` carrying on around it |
 | `test_torn_state_files.py` | `trust.json` and the session log caught mid-write: the store is published by rename and reads as empty when it is damaged, a partial last line in the log is dropped and a hole in the middle is not |

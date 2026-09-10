@@ -9,15 +9,25 @@ There is nothing to install. Clone it and run it:
 
 ```
 git clone https://github.com/opscontinuum/picoagent && cd picoagent
-export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
-export PICOAGENT_API_KEY=...                           # optional
-export PICOAGENT_MODEL=qwen2.5-coder:32b
+python3 -m picoagent setup                            # asks what to point at, writes it down
 python3 -m picoagent                                  # REPL
 python3 -m picoagent -p "explain this repo"           # one-shot
 python3 -m picoagent -p "fix the failing test" --json # JSONL event stream
 python3 -m picoagent -e ../picoagent-plugins/permission-gate    # load a plugin for one run
 python3 -m picoagent plugin add git:github.com/you/some-plugin@v0.1.0
 python3 -m picoagent plugin list
+```
+
+`setup` asks which provider, what its endpoint and key are, and which model, then writes them into
+`~/.picoagent/config.toml` and makes that file readable only by you. It asks the *provider* what it needs,
+so a dialect a plugin registered appears in the list with its own settings — Vertex asks for a project and a
+location, not for a bearer token. If you would rather not be asked, the three environment variables still
+work and so does editing the file:
+
+```
+export PICOAGENT_BASE_URL=http://localhost:11434/v1   # any OpenAI-compatible server (Ollama, vLLM, OpenAI, gateway)
+export PICOAGENT_API_KEY=...                           # optional
+export PICOAGENT_MODEL=qwen2.5-coder:32b
 ```
 
 Zero third-party dependencies means there is nothing for a package manager to resolve, so `python3 -m picoagent`
@@ -45,9 +55,12 @@ Config (`~/.picoagent/config.toml`, then `.picoagent/config.toml` in the project
 ```toml
 model = "qwen2.5-coder:32b"
 temperature = 0.0          # optional; omit to use whatever the server defaults to
-[providers.openai]
+[providers.openai]                                    # one table per provider, core's and a plugin's alike
 base_url = "http://localhost:11434/v1"
 api_key = ""
+[providers.vertex]                                    # a plugin's dialect, pointed wherever you need it
+project = "my-project"
+location = "us-central1"
 [plugins]
 enabled = ["git:github.com/you/permission-gate@v0.1.0", "./tools/my-local-plugin"]
 [plugins.permission-gate]

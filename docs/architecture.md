@@ -16,6 +16,7 @@ table is written against the module list below and has to keep matching it.
 ```
 picoagent/
   cli.py                 argument parsing; wires everything below together
+  setup.py               the `picoagent setup` wizard: ask, verify, write config.toml
   core/
     loop.py              AgentLoop (control flow) + Runtime (shared registries)
     provider.py          Provider protocol + built-in OpenAI-compatible client
@@ -26,6 +27,7 @@ picoagent/
     commands.py          slash-command registry
     events.py            the event bus
     config.py            layered TOML config
+    toml_write.py        editing settings back into a TOML file (tomllib only reads)
     text.py              untrusted text made safe to show a person
     types.py             dataclasses shared by everything
   plugins/
@@ -113,6 +115,14 @@ from that - see T23 in [the threat model](security/threat-model.md).
 the blocking HTTP read runs in a thread that feeds an `asyncio.Queue`. A provider with a
 different dialect (Vertex/Gemini in `examples/plugins/vertex-provider`) implements the
 same generator and maps messages itself.
+
+Every provider reads its endpoint from `[providers.<name>]`, core's and a plugin's alike -
+`config.provider_config`, reached by plugins as `api.provider_config(name)`. The dialect is
+code and the endpoint is a value, so the same Vertex plugin points at commercial Vertex AI for
+one user and at a government host for another. The table is in `USER_ONLY`, so a repository
+never chooses where a credential goes. Two members of the protocol are optional and checked
+with `hasattr`: `list_models`, and `setup_fields`, which is how a provider tells
+`picoagent setup` what to ask for.
 
 ## Frontends
 

@@ -222,11 +222,42 @@ session, which is the outcome the catch exists to prevent.
 
 ```python
 api.register_provider(MyProvider())              # then --provider myprovider
+api.provider_config("myprovider")                # [providers.myprovider] from config.toml
 await api.set_model("gpt-4.1", provider="openai")
 api.set_thinking("high")
 api.set_active_tools(["read", "shell"])          # read-only mode; None restores all
 api.get_active_tools()                           # what is offered now; all_tools() is everything
 ```
+
+**Your provider's endpoint goes in `[providers.<name>]`, not in your plugin's own table.** That is
+the same table core reads for its built-in `openai` client, so "where does my endpoint go?" has one
+answer whether the dialect shipped in core or arrived with you. What belongs in it is yours to
+decide: Vertex needs `project` and `location` beside a URL, and there is no fixed schema.
+
+The reason it is that table and not `[plugins.<your plugin>]` is `USER_ONLY`. `providers` is in it,
+so a repository's `.picoagent/config.toml` cannot reach the table at all. A repository that could
+set `base_url` while leaving the user's `api_key` alone is handed that key on the first turn — the
+attack `USER_ONLY` closed for `providers.openai.base_url`, which stayed open for as long as provider
+plugins read their endpoints out of a plugin table. If your plugin used to read them from
+`[plugins.<your plugin>]`, `provider_config` still hands those values over and says on stderr where
+to move them, so nobody's config breaks on the day you migrate.
+
+Tell `picoagent setup` what to ask for by declaring `setup_fields` on your provider. It is optional
+in the same way `list_models` is — callers check with `hasattr`, and a provider without it is asked
+for `base_url` and `api_key`:
+
+```python
+from picoagent.core.provider import SetupField
+
+class MyProvider:
+    name = "myprovider"
+    setup_fields = (SetupField("base_url", "Endpoint URL", "https://api.example/v1"),
+                    SetupField("api_key", "API key", secret=True))
+```
+
+`key` is the `[providers.<name>]` key the answer is written to, so the wizard reads back exactly what
+it wrote. `secret` keeps the value off the screen as it is typed and shows only its last characters
+when it is already stored.
 
 Read the active set before you narrow it. `api.set_active_tools(["read"])` replaces whatever
 another plugin set, so a plugin that only wants `shell` gone should subtract from what is there:
@@ -268,6 +299,7 @@ So queue a `steer` only when the guidance still reads sensibly one prompt later,
 api.append_entry("todo", {"items": [...]})       # saved in the session, never sent to the model
 for entry in api.entries("todo"): ...
 api.plugin_config()                              # [plugins.my-plugin] from config.toml
+api.provider_config("myprovider")                # [providers.myprovider] - endpoints live here
 ```
 
 **Run things**
