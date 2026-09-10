@@ -20,12 +20,12 @@ import contextlib
 import io
 import textwrap
 import unittest
-from pathlib import Path
 
 from helpers import ROOT, ScriptedProvider, make_runtime, run, temp_dir, text
 from picoagent import cli
 from picoagent.core.config import provider_config
 from picoagent.core.provider import OpenAICompatProvider, SetupField
+from picoagent.core.vertex import VertexProvider
 from picoagent.plugins import loader
 from picoagent.plugins.api import PluginAPI
 from picoagent.setup import DEFAULT_FIELDS, fields_of
@@ -233,29 +233,17 @@ class WhatAProviderSaysItNeeds(unittest.TestCase):
         self.assertFalse(hasattr(_NoFields(), "setup_fields"))
 
     def test_the_vertex_dialect_asks_for_what_vertex_needs(self):
-        module = loader_module()
-        provider = module.VertexProvider(project="p", location="us-central1")
+        provider = VertexProvider(project="p", location="us-central1")
         self.assertEqual([f.key for f in fields_of(provider)], ["project", "location", "base_url"])
 
     def test_no_field_asks_vertex_for_a_key_it_would_have_to_store(self):
         """Its credential is an OAuth token minted per call; a stored one expires within the hour."""
-        module = loader_module()
-        provider = module.VertexProvider(project="p", location="us-central1")
+        provider = VertexProvider(project="p", location="us-central1")
         self.assertEqual([f.key for f in fields_of(provider) if f.secret], [])
 
     def test_a_field_says_what_it_writes_and_what_to_ask(self):
         field = SetupField("api_key", "API key", secret=True)
         self.assertEqual((field.key, field.default, field.secret), ("api_key", "", True))
-
-
-def loader_module():
-    """The vertex plugin as a module, loaded from its file the way the other tests load it."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "vertex_provider_fields", ROOT / "examples/plugins/vertex-provider/vertex_provider.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 if __name__ == "__main__":

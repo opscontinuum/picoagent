@@ -1,10 +1,15 @@
-"""Model providers.
+"""Model providers: the protocol, the registry, and the OpenAI-compatible dialect.
 
-The core ships exactly one: an OpenAI-compatible ``/chat/completions`` client written
-with ``urllib`` (no third-party packages). That single dialect covers OpenAI, xAI Grok,
-Ollama, vLLM, llama.cpp, LM Studio, OpenRouter, Azure and most corporate gateways.
-Providers with their own wire format (Vertex/Gemini, Bedrock) are plugins
-that implement the same :class:`Provider` protocol.
+Core ships two wire dialects and no more. This module holds the first - an OpenAI-compatible
+``/chat/completions`` client written with ``urllib`` (no third-party packages), covering OpenAI,
+xAI Grok, Ollama, vLLM, llama.cpp, LM Studio, OpenRouter, Azure and most corporate gateways.
+:mod:`picoagent.core.vertex` holds the second, Gemini's ``:streamGenerateContent``.
+
+Two, because a dialect is code and an endpoint is a value. Everything that once needed a plugin
+to "add a provider" but spoke OpenAI's format was a name and a URL wearing a module: it is a
+``[providers.<name>]`` table now, and :mod:`picoagent.core.dialects` builds it. The seam stays
+open for a genuinely different wire format - Anthropic, Bedrock - which is a plugin registering
+an object with the same :class:`Provider` protocol.
 
 Streaming design: ``urllib`` is blocking, so the HTTP read runs in a daemon thread
 that pushes parsed SSE chunks onto an ``asyncio.Queue``; the async generator drains it.
@@ -333,6 +338,11 @@ class OpenAICompatProvider:
     Pass ``name`` to register the same client under another identity (e.g. ``grok``).
     """
     name = "openai"
+
+    #: Which ``dialect`` value in a ``[providers.<name>]`` table selects this class, and the one
+    #: a table that names no dialect gets. Read by ``picoagent setup`` when it is creating a
+    #: *new* provider, so the table it writes says how to rebuild what it just registered.
+    dialect = "openai"
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None,
                  extra_headers: dict[str, str] | None = None, name: str | None = None):
