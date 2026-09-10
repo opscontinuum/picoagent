@@ -47,8 +47,12 @@ log = logging.getLogger("picoagent.config")
 
 DEFAULTS: dict[str, Any] = {
     "model": os.environ.get("PICOAGENT_MODEL", "gpt-4o-mini"),
-    "provider": "openai",            # the built-in OpenAI-compatible client; others come from plugins
-    "providers": {"openai": {}},     # per-provider overrides: base_url / api_key / headers
+    "provider": "openai",            # which [providers.<name>] table this session talks to
+    # One table per provider, and one provider per table. A table names its wire format with
+    # `dialect` ("openai" or "vertex"); leaving it out means OpenAI-compatible, which is what
+    # this empty default is - the built-in client, under the name it has always had, configured
+    # by nothing. Add `[providers.grok] base_url = "https://api.x.ai/v1"` and there are two.
+    "providers": {"openai": {}},
     "max_tokens": 8192,
     "temperature": None,             # None leaves sampling to the server; 0.0 is a value, not "unset"
     "thinking": "off",               # off | low | medium | high - each provider maps this to its own knob

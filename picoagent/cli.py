@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import Iterator
 
 from .core.config import HARDENED_USER_FILES_KEY, UNREADABLE_PROJECT_CONFIG_KEY, load_config
+from .core.dialects import providers_from_config
 from .core.loop import AgentLoop, Runtime
-from .core.provider import OpenAICompatProvider
+from .core.provider import SETUP_COMMAND
 from .core.session import Session, restrict_to_owner
 from .core.text import describe_exception, safe_for_display
 from .core.tools import BUILTIN_TOOLS
@@ -48,16 +49,18 @@ from . import setup as setup_mod
 #: carry no mark, so the one line worth stopping for does not look like the rest.
 URGENT_MARK = "!!"
 
-#: Exit codes for the two startup refusals the plugin loader raises, and for a headless run whose
-#: model call failed. They are separate from each other, and from 1 (every other failure,
-#: ``open_session``'s ``SystemExit`` refusals included) and 2 (argparse's usage error), because the
-#: answers differ and a wrapper should not have to read English to tell them apart: 3 means a
-#: control someone approved is not going to run and a person has to look at it, 4 means a config
-#: file could not be read so no plugin decision was made at all, 5 means the session started but
-#: the model was never reached - a key, a URL or the network, none of which the prompt can fix.
+#: Exit codes for the two startup refusals the plugin loader raises, for a session whose selected
+#: provider does not exist, and for a headless run whose model call failed. They are separate from
+#: each other, and from 1 (every other failure, ``open_session``'s ``SystemExit`` refusals
+#: included) and 2 (argparse's usage error), because the answers differ and a wrapper should not
+#: have to read English to tell them apart: 3 means a control someone approved is not going to run
+#: and a person has to look at it, 4 means a config file could not be read so no plugin decision
+#: was made at all, 5 means the session started but the model was never reached - a key, a URL or
+#: the network, none of which the prompt can fix - and 6 means there was nothing to reach it with.
 EXIT_REQUIRED_PLUGIN = 3
 EXIT_PLUGIN_PROVENANCE = 4
 EXIT_MODEL_ERROR = 5
+EXIT_NO_SUCH_PROVIDER = 6
 
 #: How much of the project path goes into a session directory's name before the digest. Long
 #: enough to recognise a checkout, short enough that a deep path stays under the 255-byte
@@ -186,11 +189,25 @@ def looks_like_session(path: Path) -> bool:
 
 
 def register_core(rt: Runtime) -> None:
-    """Built-in provider, tools, skills and commands - the part plugins can override."""
-    provider_cfg = rt.cfg.get("providers", {}).get("openai", {})
-    rt.providers.register(OpenAICompatProvider(base_url=provider_cfg.get("base_url"),
-                                               api_key=provider_cfg.get("api_key"),
-                                               extra_headers=provider_cfg.get("headers")))
+    """Built-in providers, tools, skills and commands - the part plugins can override.
+
+    One provider per ``[providers.<name>]`` table, built by :mod:`picoagent.core.dialects` from
+    the dialect that table names. ``DEFAULTS`` carries ``providers = {"openai": {}}``, so an
+    install that has configured nothing still gets the built-in OpenAI-compatible client under
+    the name it has always had; a config with four tables gets four providers, all of them
+    selectable with ``--provider``, none of them requiring a plugin.
+
+    Refusals are printed rather than raised. A dialect nobody has - a ``[providers.experimental]``
+    somebody is halfway through configuring - must not stop the tool starting for the provider
+    they actually meant to use, and it must not silently become an OpenAI client either. So the
+    name goes unregistered, the reason goes to stderr where the other startup notices go, and
+    ``--provider experimental`` then fails with the registry's own list of what does exist.
+    """
+    providers, refusals = providers_from_config(rt.cfg)
+    for provider in providers:
+        rt.providers.register(provider)
+    for refusal in refusals:
+        print(f"picoagent: {refusal}", file=sys.stderr)
     for tool_class in BUILTIN_TOOLS:
         rt.tools.register(tool_class())
     for directory in rt.cfg["skill_dirs"]:
@@ -301,9 +318,39 @@ def build_runtime_or_refuse(args: argparse.Namespace) -> Runtime:
     frames are where a plugin author finds the actual fault, so ``--verbose`` keeps them.
     """
     try:
-        return build_runtime(args)
+        rt = build_runtime(args)
     except (loader.RequiredPluginError, loader.PluginProvenanceError) as exc:
         raise startup_refusal(exc) from None
+    refusal = why_the_provider_is_unusable(rt)
+    if refusal:
+        sys.stderr.write(f"picoagent: {refusal}\n")
+        raise SystemExit(EXIT_NO_SUCH_PROVIDER)
+    return rt
+
+
+def why_the_provider_is_unusable(rt: Runtime) -> str | None:
+    """Why this session cannot reach a model at all, or ``None`` when it can.
+
+    The one thing every session needs and the one failure worth stopping for before the terminal
+    opens: ``provider`` naming something no table built and no plugin registered. Left alone it
+    surfaced as a ``KeyError`` traceback out of ``AgentLoop._model_turn`` on the first prompt -
+    after the REPL had drawn, after the user had typed - and the frames named a registry rather
+    than the config line that chose the name.
+
+    Two ways to arrive here, and one answer suits both because the fix is the same: a typo in
+    ``--provider`` or in ``provider =``, and a ``[providers.<name>]`` table whose ``dialect``
+    :mod:`picoagent.core.dialects` refused to build. The second is why this check exists at all -
+    a refusal that is honest about not registering the provider owes the user something better
+    than a stack trace when they then select it. That refusal has already been printed by
+    :func:`register_core`, so this line does not repeat it; it says what is missing and lists
+    what is there.
+    """
+    if rt.provider_name in rt.providers.names():
+        return None
+    available = ", ".join(sorted(rt.providers.names())) or "none"
+    return (f"no provider called '{rt.provider_name}' is registered, so this session has nothing "
+            f"to send a prompt to. Registered: {available}. Run `{SETUP_COMMAND}`, or check the "
+            f"provider name in your config.toml against its [providers.<name>] table.")
 
 
 def startup_refusal(exc: Exception) -> SystemExit:
@@ -917,7 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("-p", "--prompt", help="non-interactive: run one prompt ('-' reads stdin)")
     ap.add_argument("--json", action="store_true", help="emit JSONL events (use with -p)")
     ap.add_argument("-m", "--model")
-    ap.add_argument("--provider", help="provider name (built-in: openai; others from plugins)")
+    ap.add_argument("--provider", help="provider name: any [providers.<name>] table, or one a plugin registered")
     ap.add_argument("--thinking", choices=["off", "low", "medium", "high"])
     ap.add_argument("--temperature", type=float,
                     help="sampling temperature (omit to use the server's own default)")
