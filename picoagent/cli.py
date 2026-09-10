@@ -5,6 +5,7 @@
     picoagent -p "prompt" --json   one-shot; JSONL event stream
     picoagent -r                   resume the most recent session for this directory
     picoagent -e ./my-plugin       load a plugin directory for this run
+    picoagent setup                ask what to point at, then write it into config.toml
     picoagent plugin add|trust|untrust|list
 
 The heavy lifting is delegated: :func:`build_runtime` wires registries and plugins,
@@ -21,6 +22,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Iterator
@@ -36,6 +38,7 @@ from .frontends.print import PrintFrontend
 from .plugins import loader
 from .plugins import upgrade as upgrade_mod
 from .plugins.manifest import ManifestError
+from . import setup as setup_mod
 
 
 # ---------------------------------------------------------------------------- wiring
@@ -299,13 +302,26 @@ def build_runtime_or_refuse(args: argparse.Namespace) -> Runtime:
     """
     try:
         return build_runtime(args)
-    except loader.RequiredPluginError as exc:
+    except (loader.RequiredPluginError, loader.PluginProvenanceError) as exc:
+        raise startup_refusal(exc) from None
+
+
+def startup_refusal(exc: Exception) -> SystemExit:
+    """One of the loader's startup refusals as the line and the code the CLI answers it with.
+
+    Shared by every entry point that builds a runtime, because the refusal is about the session
+    and not about which verb asked for one: ``picoagent setup`` cannot list a plugin's provider
+    if the plugin was refused, and a user who reads a different sentence depending on which
+    command they typed learns that there are two problems.
+    """
+    if isinstance(exc, loader.RequiredPluginError):
+        # For the other subclass: a required plugin whose `register()` raised carries that
+        # exception as its cause, and those frames are where a plugin author finds the actual
+        # fault, so `--verbose` keeps them.
         logging.getLogger("picoagent").debug("required plugin refusal", exc_info=exc)
-        sys.stderr.write(f"picoagent: {exc}\n")
-        raise SystemExit(EXIT_REQUIRED_PLUGIN) from None
-    except loader.PluginProvenanceError as exc:
-        sys.stderr.write(f"picoagent: {exc}\n")
-        raise SystemExit(EXIT_PLUGIN_PROVENANCE) from None
+    sys.stderr.write(f"picoagent: {exc}\n")
+    return SystemExit(EXIT_REQUIRED_PLUGIN if isinstance(exc, loader.RequiredPluginError)
+                      else EXIT_PLUGIN_PROVENANCE)
 
 
 def _report_skipped(report: loader.LoadReport) -> None:
@@ -537,6 +553,61 @@ def report_available_upgrades(rt: Runtime) -> None:
         sys.stderr.write(f"picoagent: {status.describe()}\n")
     if outdated:
         sys.stderr.write("picoagent: run `picoagent upgrade` to update plugins.\n")
+
+
+def build_setup_runtime(args: argparse.Namespace, overrides: dict, scratch: Path) -> Runtime:
+    """A runtime for ``picoagent setup``: the same wiring as a session, without being one.
+
+    Everything the wizard needs comes from a fully wired runtime - the provider registry with
+    every plugin's dialect in it, the config layered the way a real run layers it - so this
+    builds one. What it does not do is open a session, and that is the point of the separate
+    function. ``open_session`` writes a log under the project's session directory, and a
+    configuration command that left a one-line conversation behind would put itself at the front
+    of ``-r last``: the next ``picoagent -r`` would resume the empty session setup created
+    instead of the work the user was doing. So the log goes to a scratch directory the caller
+    throws away.
+
+    ``overrides`` are the answers the wizard has collected, layered where a config file's values
+    would go, so the second runtime it builds holds providers constructed from what the user just
+    typed rather than from what the file still says.
+    """
+    cwd = Path(args.cwd or ".").resolve()
+    cfg = load_config(cwd, {"model": args.model, "provider": args.provider, **overrides})
+    report_hardened_user_files(cfg)
+    rt = Runtime(cfg, cwd, Session(scratch / "setup.jsonl", cwd))
+    register_core(rt)
+    rt.frontend = PlainFrontend()
+    rt.load_report = loader.load_all(rt, extra_paths=args.extension,
+                                     allow_untrusted=args.dangerously_trust_all)
+    return rt
+
+
+def setup_command(args: argparse.Namespace) -> int:
+    """``picoagent setup`` - the wizard in :mod:`picoagent.setup`, wired to a runtime.
+
+    The split is deliberate: building runtimes is this module's job and asking questions is that
+    one's, so the wizard is handed a runtime and a way to make another rather than importing the
+    wiring and taking a circular dependency for six lines.
+
+    Refusing without a terminal happens before anything is built, because the answer does not
+    depend on the config, the plugins or the registry - there is nobody to ask, and reading
+    somebody's config to tell them that would be work done for nothing.
+    """
+    refusal = setup_mod.refusal_without_a_terminal(args.non_interactive)
+    if refusal:
+        sys.stderr.write(f"picoagent: {refusal}\n")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="picoagent-setup-") as scratch:
+        try:
+            first = build_setup_runtime(args, {}, Path(scratch))
+        except (loader.RequiredPluginError, loader.PluginProvenanceError) as exc:
+            raise startup_refusal(exc) from None
+        _report_skipped(first.load_report)
+
+        def rebuild(overrides: dict) -> Runtime:
+            return build_setup_runtime(args, overrides, Path(scratch))
+
+        return asyncio.run(setup_mod.run(first, rebuild))
 
 
 def plugin_command(args: argparse.Namespace) -> int:
@@ -861,6 +932,9 @@ def build_parser() -> argparse.ArgumentParser:
     plugin.add_argument("spec", nargs="?",
                         help="git:host/user/repo@ref, a local path, or for untrust an approved name")
     plugin.add_argument("--project", action="store_true", help="install under the project instead of the user dir")
+    setup_p = sub.add_parser("setup", help="point picoagent at a model and store the key")
+    setup_p.add_argument("--non-interactive", action="store_true",
+                         help="refuse rather than prompt (setup has nothing to do without a person)")
     upgrade_p = sub.add_parser("upgrade", help="check for and apply plugin updates")
     upgrade_p.add_argument("ucmd", nargs="?",
                            help="'check' to only report, a plugin name, or omit for all")
@@ -905,6 +979,8 @@ def main(argv: list[str] | None = None) -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(SafeLogFormatter("%(name)s: %(message)s"))
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, handlers=[handler])
+    if args.cmd == "setup":
+        sys.exit(setup_command(args))
     if args.cmd == "plugin":
         sys.exit(plugin_command(args))
     if args.cmd == "upgrade":
